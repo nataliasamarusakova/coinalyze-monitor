@@ -505,8 +505,12 @@ def run_once():
         append_history(rec)
         history.append(rec)
 
-        prev = state.get(symbol, {"streak": 0, "streak_snapshots": [], "last_verdict": None})
-
+       raw_prev = state.get(symbol, {})
+prev = {
+    "streak": raw_prev.get("streak", 0),
+    "streak_snapshots": raw_prev.get("streak_snapshots", []),
+    "last_verdict": raw_prev.get("last_verdict"),
+}
         # Жёсткое условие для входа в счётчик: ворота пройдены + минимальное
         # качество (score>=3), иначе это не "успешный анализ", а мусор.
         if profile is not None and score >= 3:
