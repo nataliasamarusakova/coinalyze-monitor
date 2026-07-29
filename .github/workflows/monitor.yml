@@ -2,11 +2,16 @@ name: Coinalyze Monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # каждые 15 минут (UTC время, best-effort у GitHub)
-  workflow_dispatch: {}       # позволяет запускать вручную для теста
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      use_sample:
+        description: 'Тестовый режим (true/false)'
+        required: false
+        default: 'false'
 
 permissions:
-  contents: write             # нужно, чтобы коммитить snapshots.jsonl обратно
+  contents: write
 
 jobs:
   run:
@@ -20,13 +25,28 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
       - name: Run monitor
         env:
           COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          USE_SAMPLE_HTML: ${{ github.event.inputs.use_sample || 'false' }}
         run: python monitor.py
+
+      - name: Upload debug screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            debug_screenshot.png
+            debug_page.html
+          if-no-files-found: ignore
 
       - name: Commit snapshot log
         run: |
