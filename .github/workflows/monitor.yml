@@ -1,10 +1,8 @@
 name: Coinalyze Monitor
 
 on:
-  repository_dispatch:
-    types: [run_monitor]
   schedule:
-    - cron: '2-59/5 * * * *'   # резервный запуск, если внешний cron-сервис не сработает
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       use_sample:
@@ -22,6 +20,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +39,6 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
           USE_SAMPLE_HTML: ${{ github.event.inputs.use_sample || 'false' }}
         run: python monitor.py
 
