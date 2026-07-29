@@ -21,7 +21,7 @@ except ImportError:
           "продолжаю без stealth-маскировки.")
     STEALTH_AVAILABLE = False
     def stealth_sync(page):
-        pass  # no-op заглушка
+        pass
 
 # ============ НАСТРОЙКИ ============
 
@@ -31,7 +31,7 @@ COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-PROXY_URL = os.environ.get("PROXY_URL", "")  # формат: http://user:pass@host:port
+PROXY_URL = os.environ.get("PROXY_URL", "")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -51,6 +51,8 @@ def check_env():
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
         sys.exit(1)
     print("Все переменные окружения на месте.")
+    print(f"Длина p_sid: {len(COINALYZE_P_SID)} символов")
+    print(f"Длина chat_sid: {len(COINALYZE_CHAT_SID)} символов")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -71,13 +73,26 @@ def parse_number(raw):
         return None
 
 
+def check_login_indicators(html_text):
+    """Диагностика: залогинен ли пользователь по косвенным признакам."""
+    lower = html_text.lower()
+    signals = {
+        "содержит 'log in' / 'sign in'": ("log in" in lower or "sign in" in lower),
+        "содержит 'log out' / 'sign out' / 'logout'": (
+            "log out" in lower or "sign out" in lower or "logout" in lower),
+        "содержит 'upgrade' (обычно для неавторизованных/free)": "upgrade" in lower,
+    }
+    for label, val in signals.items():
+        print(f"  Индикатор [{label}]: {val}")
+    return signals
+
+
 def fetch_rows_from_html(html_text):
     soup = BeautifulSoup(html_text, "lxml")
     rows_found = soup.select("tbody tr")
     print(f"Найдено строк: {len(rows_found)}")
 
     if rows_found:
-        # Диагностика: покажем длину tds и значения первых 3 строк
         for i, tr in enumerate(rows_found[:3]):
             tds = tr.find_all("td")
             symbol = tr.get("data-coin")
@@ -151,10 +166,16 @@ def fetch_rows_via_browser():
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             context.add_cookies([
                 {"name": "p_sid", "value": COINALYZE_P_SID,
-                 "domain": ".coinalyze.net", "path": "/"},
+                 "domain": "coinalyze.net", "path": "/", "secure": True},
                 {"name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                 "domain": ".coinalyze.net", "path": "/"},
+                 "domain": "coinalyze.net", "path": "/", "secure": True},
+                {"name": "cookies_accepted", "value": "1",
+                 "domain": "coinalyze.net", "path": "/", "secure": True},
             ])
+            # Проверка, что Playwright реально принял куки
+            applied = context.cookies("https://coinalyze.net")
+            print(f"Куки применены в контексте браузера: "
+                  f"{[c['name'] for c in applied]}")
 
         page = context.new_page()
         stealth_sync(page)
@@ -171,6 +192,10 @@ def fetch_rows_via_browser():
 
             page.wait_for_selector("tbody tr", timeout=20000)
             html = page.content()
+
+            print("Проверка признаков авторизации на странице:")
+            check_login_indicators(html)
+
         except Exception as e:
             print(f"Ошибка/таймаут при загрузке страницы: {e}")
             try:
@@ -195,7 +220,6 @@ def fetch_rows():
 
     html = fetch_rows_via_browser()
 
-    # Всегда сохраняем полученный HTML для диагностики
     with open("debug_page.html", "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -203,10 +227,11 @@ def fetch_rows():
 
     if not rows:
         print("ВНИМАНИЕ: строк с полным набором колонок (>=23 td) не найдено.")
-        print("Проверь debug_page.html и debug_screenshot.png в артефактах прогона.")
-        send_telegram("⚠️ Coinalyze monitor: страница получена, но нужный набор "
-                       "колонок не распознан (возможно, кастомные колонки не "
-                       "отобразились без полноценной авторизации). Проверь debug_page.html.")
+        print("Похоже, сессия не авторизована — кастомные колонки (CVD24/LLS24) "
+              "не отображаются. Скорее всего, куки протухли. Обнови "
+              "COINALYZE_P_SID и COINALYZE_CHAT_SID свежими значениями из браузера.")
+        send_telegram("⚠️ Coinalyze monitor: таблица получена, но без кастомных "
+                       "колонок (CVD24/LLS24) — вероятно, куки истекли. Обнови их в Secrets.")
         sys.exit(1)
 
     return rows
