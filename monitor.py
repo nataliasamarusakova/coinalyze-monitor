@@ -1,9 +1,3 @@
-"""
-coinalyze_monitor.py
-Playwright + прокси -> Cloudflare bypass -> парсинг -> скоринг/режим ->
-устойчивый к шуму Persistence Score -> дедуп алертов -> Telegram.
-"""
-
 import os
 import sys
 import time
@@ -20,48 +14,29 @@ except ImportError:
     def stealth_sync(page):
         pass
 
-# ============ НАСТРОЙКИ ============
+
+# ================== НАСТРОЙКИ ==================
 
 USE_SAMPLE = os.environ.get("USE_SAMPLE_HTML", "false").lower() == "true"
+
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
+# Более мягкий фильтр, как вы указали (без прокси, прокси убрали)
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
-       "&filter=ZV9ndF8yLjUmYl9ndF8xJmNfZ3RfMTAwMDAwMCZjbTYxNjVfZ3RfMzUmY202MTY0X2x0XzQ1"
-       "&order_by=oi_current&order_dir=desc")
+       "&filter=ZV9ndF8yLjUmYl9ndF8zJmNfZ3RfMTAwMDAwJmNtNjE2NV9ndF80MCZjbTYxNjRfbHRfNjU"
+       "&order_by=price_24hour_pchange&order_dir=desc")
 
 LOG_FILE = "snapshots.jsonl"
 STATE_FILE = "alerted_state.json"
 
-PERSISTENCE_WINDOW_HOURS = 3       # окно, в котором ищем историю для Persistence
-GRACE_SECONDS = 20 * 60            # 20 минут молчания = считать "реакселерацией", не шумом
-
-BUCKET_MAP = {
-    "Healthy Trend": "bullish",
-    "Short Squeeze Setup": "bullish",
-    "Mixed": "bullish",
-    "Weak Trend": "bullish",
-    "Capitulation": "bullish",
-    "Distribution": "warning",
-    "Exhaustion": "warning",
-    "Exhaustion (умеренная)": "warning",
-    "Extreme Exhaustion": "warning",
-    "Neutral": "neutral",
-}
-
-STAGE_LABELS = {
-    "early": "🟡 РАННИЙ СИГНАЛ (1 снимок, не подтверждён)",
-    "confirmed_3": "🟢 ПОДТВЕРЖДЕНО (устойчиво 3+ снимка)",
-    "confirmed_6": "🟢🟢 ВЫСОКАЯ УВЕРЕННОСТЬ (устойчиво 6+ снимков)",
-}
+STREAK_FOR_VERDICT = 4   # 3 успешных анализа накопились -> на 4-м даём вердикт
 
 
-def bucket_of(regime):
-    return BUCKET_MAP.get(regime, "neutral")
-
+# ================== БАЗОВЫЕ УТИЛИТЫ ==================
 
 def check_env():
     if USE_SAMPLE:
@@ -74,8 +49,6 @@ def check_env():
         sys.exit(1)
     print("Все переменные окружения на месте.")
 
-
-# ============ ПАРСИНГ ЧИСЕЛ ============
 
 def parse_number(raw):
     if raw is None:
@@ -92,6 +65,40 @@ def parse_number(raw):
     except ValueError:
         return None
 
+
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def unique_list(items):
+    return list(dict.fromkeys([x for x in items if x]))
+
+
+# ================== TELEGRAM ==================
+
+def send_telegram(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("Telegram не настроен, пропускаю отправку:", text)
+        return False
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, data={
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=15)
+        print(f"Telegram ответ: статус={resp.status_code}, тело={resp.text[:300]}")
+        if resp.status_code != 200:
+            print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"Исключение при отправке в Telegram: {e}")
+        return False
+
+
+# ================== ПОЛУЧЕНИЕ ДАННЫХ (БЕЗ ПРОКСИ) ==================
 
 def fetch_rows_from_html(html_text):
     soup = BeautifulSoup(html_text, "lxml")
@@ -137,40 +144,52 @@ def fetch_rows_from_html(html_text):
 
 def fetch_rows_via_browser():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True)  # без прокси
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
             viewport={"width": 1920, "height": 1080},
             locale="ru-RU",
         )
-        if COINALYZE_P_SID or COINALYZE_CHAT_SID:
-            context.add_cookies([
-                {"name":"p_sid","value":COINALYZE_P_SID,"domain":"coinalyze.net","path":"/","secure":True},
-                {"name":"chat_sid","value":COINALYZE_CHAT_SID,"domain":"coinalyze.net","path":"/","secure":True},
-                {"name":"cookies_accepted","value":"1","domain":"coinalyze.net","path":"/","secure":True},
-            ])
-        page=context.new_page()
+
+        context.add_cookies([
+            {"name": "p_sid", "value": COINALYZE_P_SID,
+             "domain": "coinalyze.net", "path": "/", "secure": True},
+            {"name": "chat_sid", "value": COINALYZE_CHAT_SID,
+             "domain": "coinalyze.net", "path": "/", "secure": True},
+            {"name": "cookies_accepted", "value": "1",
+             "domain": "coinalyze.net", "path": "/", "secure": True},
+        ])
+
+        page = context.new_page()
         stealth_sync(page)
-        html_content=""
+
+        html_content = ""
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
-            if "Attention Required" in page.content():
-                page.wait_for_timeout(8000)
+            page.wait_for_timeout(4000)
+            content_check = page.content()
+            if "Attention Required" in content_check:
+                print("Обнаружен Cloudflare challenge, ждём подольше...")
+                page.wait_for_timeout(9000)
             page.wait_for_selector("tbody tr", timeout=20000)
-            html_content=page.content()
+            html_content = page.content()
         except Exception as e:
-            print(f"Ошибка загрузки: {e}")
-            try: html_content=page.content()
-            except Exception: pass
-            try: page.screenshot(path="debug_screenshot.png", full_page=True)
-            except Exception: pass
+            print(f"Ошибка загрузки страницы: {e}")
+            try:
+                html_content = page.content()
+            except Exception:
+                html_content = ""
+            try:
+                page.screenshot(path="debug_screenshot.png", full_page=True)
+            except Exception:
+                pass
+
         browser.close()
         return html_content
 
-def fetch_rows():
 
+def fetch_rows():
     if USE_SAMPLE:
         with open("sample.html", "r", encoding="utf-8") as f:
             return fetch_rows_from_html(f.read())
@@ -181,13 +200,13 @@ def fetch_rows():
     rows = fetch_rows_from_html(html_content)
 
     if not rows:
-        send_telegram("⚠️ Coinalyze monitor: не получены данные (куки истекли "
-                       "или изменилась разметка). Проверь debug_page.html.")
+        send_telegram("⚠️ Coinalyze monitor: данные не получены. "
+                       "Проверь куки (могли истечь) или доступ (без прокси мог вернуться Cloudflare-блок).")
         sys.exit(1)
     return rows
 
 
-# ============ СКОРИНГ (раздел 4 промпта) ============
+# ================== СКОРИНГ — РАЗДЕЛ 4 ПРОМПТА, БЕЗ ИЗМЕНЕНИЙ ==================
 
 def score_profile_a(r):
     flags = []
@@ -203,31 +222,39 @@ def score_profile_a(r):
         if cvd > 70: score += 2
         elif cvd >= 50: score += 1
         elif cvd < 35: score -= 1; flags.append("CVD24<35")
+
     lls = r["lls24"]
     if lls is not None:
         if lls < 15: score += 2
         elif lls <= 35: score += 1
         elif lls > 50: score -= 1; flags.append("LLS24>50%")
+
     oi = r["oi_chg24_pct"]
     if oi is not None:
         if 5 <= oi <= 35: score += 1
         elif oi > 35: flags.append("экстремальный OI")
+
     pc = r["price_chg24"]
     if pc is not None:
         if 2 <= pc <= 20: score += 1
         elif pc > 20: flags.append("перегрев цены")
+
     fr = r["fr_oiw"]
     if fr is not None:
         if -0.01 <= fr <= 0.03: score += 1
         else: flags.append("Funding-дивергенция")
+
     oim = r["oi_mktcap_ratio"]
     if oim is not None and oim < 0.15: score += 1
+
     oiv = r["oi_vol_ratio"]
     if oiv is not None and 0.1 <= oiv <= 2.5: score += 1
+
     ls = r["ls_accounts"]
     if ls is not None:
         if 0.8 <= ls <= 1.5: score += 1
         elif ls > 1.5: score -= 1; flags.append("Ритейл FOMO")
+
     return True, score, flags
 
 
@@ -238,33 +265,43 @@ def score_profile_b(r):
     if not (r["price_chg24"] is not None and r["price_chg24"] < 0
             and r["oi_chg24_pct"] is not None and r["oi_chg24_pct"] < 0):
         return False, 0, flags
+
     score = 0
     pc = r["price_chg24"]
     if pc is not None:
         if pc < -8: score += 2
         elif pc <= -3: score += 1
+
     oi = r["oi_chg24_pct"]
     if oi is not None:
         if oi < -15: score += 2
         elif oi <= -5: score += 1
+
     lls = r["lls24"]
     if lls is not None:
         if lls > 50: score += 2
         elif lls >= 35: score += 1
+
     fr = r["fr_oiw"]
     if fr is not None and fr < 0: score += 1
+
     cvd = r["cvd24"]
     if cvd is not None:
         if cvd < 35: score += 1
         elif cvd > 50: score += 1; flags.append("скрытое накопление на дне")
+
     return True, score, flags
 
 
 def classify_regime(r):
-    oi, pc, cvd, lls = r["oi_chg24_pct"], r["price_chg24"], r["cvd24"], r["lls24"]
+    oi = r["oi_chg24_pct"]
+    pc = r["price_chg24"]
+    cvd = r["cvd24"]
+    lls = r["lls24"]
+
     if oi is None or pc is None:
         return "Neutral", []
-    regime = "Neutral"
+
     if oi < -5:
         regime = "Capitulation" if pc < -3 else "Distribution"
     elif -5 <= oi <= 5:
@@ -294,10 +331,11 @@ def classify_regime(r):
     ls = r["ls_accounts"]
     if ls is not None and ls > 1.5 and regime in ("Healthy Trend", "Short Squeeze Setup", "Weak Trend"):
         tags.append("Ритейл FOMO")
+
     return regime, tags
 
 
-# ============ ЛОГ СНАПШОТОВ ============
+# ================== ИСТОРИЯ ==================
 
 def load_history():
     if not os.path.exists(LOG_FILE):
@@ -323,75 +361,117 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def persistence_robust(history, symbol, current_bucket, window_hours=PERSISTENCE_WINDOW_HOURS):
+# ================== ВЕРДИКТ ПОСЛЕ 4 АНАЛИЗОВ ПОДРЯД ==================
+
+def avg(values):
+    vals = [v for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def make_verdict(streak_snapshots, current):
     """
-    Считает снимки того же 'направления' (bucket), допуская пропуски
-    (когда монета временно не прошла ворота — шум), но обрывая счёт,
-    если встретился снимок ПРОТИВОПОЛОЖНОГО направления (реальный разворот).
+    streak_snapshots — последние N (>=4) снимков подряд, где монета прошла
+    жёсткие ворота (список словарей rec, от старого к новому).
+    Возвращает (verdict, reasons).
     """
-    cutoff = int(time.time()) - window_hours * 3600
-    relevant = [h for h in reversed(history)
-                if h["symbol"] == symbol and h["ts"] > cutoff]
-    count = 0
-    for h in relevant:
-        h_bucket = bucket_of(h.get("regime"))
-        if h_bucket == current_bucket:
-            count += 1
-        elif h_bucket == "neutral":
-            continue  # нейтральный снимок — не шум и не разворот, просто пропускаем
-        else:
-            break  # встретили противоположный бакет — настоящий разворот, стоп
-    return count
+    scores = [x["score"] for x in streak_snapshots]
+    cvds = [x["cvd24"] for x in streak_snapshots]
+    llss = [x["lls24"] for x in streak_snapshots]
+    regimes = [x["regime"] for x in streak_snapshots]
+
+    first_score, last_score = scores[0], scores[-1]
+    cvd_avg = avg(cvds)
+    lls_avg = avg(llss)
+
+    warning_regimes = {"Distribution", "Exhaustion", "Extreme Exhaustion"}
+    warning_count = sum(1 for reg in regimes if reg in warning_regimes)
+
+    reasons = []
+    profile = current["profile"]
+    regime = current["regime"]
+
+    # --- Явное ухудшение за окно ---
+    degrade_reasons = []
+    if last_score < first_score - 1:
+        degrade_reasons.append(f"балл упал за окно: {first_score} -> {last_score}")
+    if cvd_avg is not None and cvd_avg < 45:
+        degrade_reasons.append(f"средний CVD24 низкий: {cvd_avg:.1f}")
+    if lls_avg is not None and lls_avg > 45:
+        degrade_reasons.append(f"средний LLS24 высокий: {lls_avg:.1f}%")
+    if warning_count >= 2:
+        degrade_reasons.append(f"{warning_count}/{len(regimes)} снимков в предупреждающем режиме")
+    if regime in warning_regimes:
+        degrade_reasons.append(f"текущий режим: {regime}")
+
+    if degrade_reasons:
+        return "NOT_SUITABLE", degrade_reasons
+
+    # --- Явное перегрев (не входить по рынку, но не "отмена", а предупреждение) ---
+    if current.get("price_chg24") is not None and current["price_chg24"] > 20:
+        reasons.append("цена перегрета (>20% за 24ч), риск входа по рынку высокий")
+    if current.get("oi_chg24_pct") is not None and current["oi_chg24_pct"] > 35:
+        reasons.append("OI вырос экстремально (>35% за 24ч) — риск позднего входа")
+
+    if reasons:
+        return "OVERHEATED", reasons
+
+    # --- Хорошая устойчивая структура ---
+    good_reasons = []
+    if last_score >= 6:
+        good_reasons.append(f"балл держится высоким: {last_score}")
+    if last_score >= first_score:
+        good_reasons.append(f"балл не падает за окно: {first_score} -> {last_score}")
+    if cvd_avg is not None and cvd_avg >= 55:
+        good_reasons.append(f"средний CVD24 хороший: {cvd_avg:.1f}")
+    if lls_avg is not None and lls_avg <= 35:
+        good_reasons.append(f"средний LLS24 в норме: {lls_avg:.1f}%")
+    if warning_count == 0:
+        good_reasons.append("ни одного предупреждающего режима за окно")
+
+    if last_score >= 6 and warning_count == 0 and (cvd_avg is None or cvd_avg >= 50):
+        return "GOOD_FOR_LONG", good_reasons
+
+    return "MIXED", ["сигналы неоднозначны, часть условий не выполнена"] + good_reasons
 
 
-# ============ TELEGRAM ============
-
-def send_telegram(text):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("Telegram не настроен, пропускаю отправку:", text)
-        return False
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, data={
-            "chat_id": TG_CHAT_ID, "text": text,
-            "parse_mode": "HTML", "disable_web_page_preview": True,
-        }, timeout=15)
-        print(f"Telegram ответ: статус={resp.status_code}, тело={resp.text[:500]}")
-        if resp.status_code != 200:
-            print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text}")
-            return False
-        data = resp.json()
-        if not data.get("ok"):
-            print(f"Telegram API вернул ok=false: {data}")
-            return False
-        print("Сообщение в Telegram успешно отправлено.")
-        return True
-    except Exception as e:
-        print(f"Исключение при отправке в Telegram: {e}")
-        return False
+VERDICT_LABELS = {
+    "GOOD_FOR_LONG": "✅ МОЖНО РАССМАТРИВАТЬ В ЛОНГ",
+    "NOT_SUITABLE": "❌ НЕ ПОДХОДИТ (структура ослабла)",
+    "OVERHEATED": "⚠️ ПЕРЕГРЕТО — не входить по рынку",
+    "MIXED": "⏳ СМЕШАННО / ЖДАТЬ ЕЩЁ ПОДТВЕРЖДЕНИЯ",
+}
 
 
-def esc(value):
-    return html.escape(str(value), quote=False)
+def format_window_table(streak_snapshots):
+    lines = ["время | балл | режим | price24 | oi24 | oi4h | CVD | LLS"]
+    for x in streak_snapshots:
+        t = time.strftime("%H:%M", time.localtime(x["ts"]))
+        lines.append(
+            f"{t} | {x['score']} | {x['regime']} | {x['price_chg24']} | "
+            f"{x['oi_chg24_pct']} | {x['oi_chg4h_pct']} | {x['cvd24']} | {x['lls24']}"
+        )
+    return "\n".join(lines)
 
 
-def format_alert(r, profile, score, regime, tags, pers, stage_label, reaccel=False):
-    tag_str = ", ".join(tags) if tags else "нет"
-    prefix = "🔄 РЕАКСЕЛЕРАЦИЯ ПОСЛЕ ПАУЗЫ\n" if reaccel else ""
+def format_verdict_message(current, streak_snapshots, verdict, reasons):
+    reasons_text = "\n".join(f"• {esc(r)}" for r in reasons)
+    tags = current.get("tags") or []
+    tags_text = ", ".join(tags) if tags else "нет"
+
     return (
-        f"{prefix}{stage_label}\n"
-        f"<b>{esc(r['name'])} ({esc(r['symbol'])})</b>\n"
-        f"Профиль: {esc(profile)} | Балл: {score}\n"
-        f"Режим: <b>{esc(regime)}</b>\n"
-        f"Тег: {esc(tag_str)}\n"
-        f"Persistence: {pers} снимков (окно {PERSISTENCE_WINDOW_HOURS}ч)\n"
-        f"Price: {r['price']} ({r['price_chg24']}%)\n"
-        f"OI 24H: {r['oi_chg24_pct']}% | OI 4H: {r['oi_chg4h_pct']}%\n"
-        f"FR OI-W: {r['fr_oiw']}% | CVD24: {r['cvd24']} | LLS24: {r['lls24']}%\n"
+        f"{VERDICT_LABELS.get(verdict, verdict)}\n"
+        f"<b>{esc(current['name'])} ({esc(current['symbol'])})</b>\n\n"
+        f"Профиль: {esc(current['profile'])} | Балл сейчас: {current['score']}\n"
+        f"Режим сейчас: <b>{esc(current['regime'])}</b>\n"
+        f"Тег: {esc(tags_text)}\n\n"
+        f"<b>Причины вердикта</b>\n{reasons_text}\n\n"
+        f"<b>Снимки, на которых основан вердикт ({len(streak_snapshots)} шт., "
+        f"~{len(streak_snapshots) * 5} мин)</b>\n"
+        f"<pre>{esc(format_window_table(streak_snapshots))}</pre>"
     )
 
 
-# ============ ГЛАВНЫЙ ЦИКЛ ============
+# ================== ГЛАВНЫЙ ЦИКЛ ==================
 
 def run_once():
     check_env()
@@ -399,11 +479,10 @@ def run_once():
     state = load_state()
     rows = fetch_rows()
     print(f"Получено монет: {len(rows)}")
-    now_ts = int(time.time())
-
-    seen_symbols = set()
 
     for r in rows:
+        symbol = r["symbol"]
+
         passed_a, score_a, flags_a = score_profile_a(r)
         passed_b, score_b, flags_b = score_profile_b(r)
 
@@ -413,69 +492,48 @@ def run_once():
         elif passed_b:
             profile, score, flags = "B", score_b, flags_b
 
-        symbol = r["symbol"]
-
-        if profile is None:
-            # Ворота не пройдены на этом тике — НЕ трогаем state,
-            # last_seen_ts остаётся старым => это и даёт возможность
-            # обнаружить "реакселерацию", когда монета вернётся.
-            continue
-
-        seen_symbols.add(symbol)
         regime, tags = classify_regime(r)
-        all_tags = tags + flags
-        rec = {**r, "profile": profile, "score": score,
-               "regime": regime, "tags": all_tags}
+        all_tags = unique_list(tags + flags)
+
+        rec = {
+            **r,
+            "profile": profile,
+            "score": score,
+            "regime": regime,
+            "tags": all_tags,
+        }
         append_history(rec)
         history.append(rec)
 
-        if score < 3:
-            continue  # даже самого низкого качества нет — пропускаем
+        prev = state.get(symbol, {"streak": 0, "streak_snapshots": [], "last_verdict": None})
 
-        threshold = 6 if profile == "A" else 5
-        bucket = bucket_of(regime)
-        pers = persistence_robust(history, symbol, bucket)
+        # Жёсткое условие для входа в счётчик: ворота пройдены + минимальное
+        # качество (score>=3), иначе это не "успешный анализ", а мусор.
+        if profile is not None and score >= 3:
+            streak = prev["streak"] + 1
+            streak_snaps = prev["streak_snapshots"] + [rec]
+            streak_snaps = streak_snaps[-8:]  # держим не более 8 последних для окна
+        else:
+            streak = 0
+            streak_snaps = []
 
-        print(f"[{symbol}] профиль={profile} балл={score} порог={threshold} "
-              f"режим={regime} бакет={bucket} persistence={pers} теги={all_tags}")
+        print(f"[{symbol}] streak={streak} score={score} regime={regime} profile={profile}")
 
-        prev = state.get(symbol)
+        verdict = None
+        reasons = []
 
-        # Определяем стадию только если балл достиг "качественного" порога
-        stage = None
-        if score >= threshold:
-            if pers >= 6:
-                stage = "confirmed_6"
-            elif pers >= 3:
-                stage = "confirmed_3"
-            else:
-                stage = "early"
+        if streak >= STREAK_FOR_VERDICT:
+            verdict, reasons = make_verdict(streak_snaps[-STREAK_FOR_VERDICT:], rec)
+            print(f"  -> Вердикт для {symbol}: {verdict} ({reasons})")
 
-        if stage is None:
-            # Балл 3..threshold-1 — просто наблюдаем, без алерта,
-            # но обновляем last_seen_ts, чтобы не считать это "паузой"
-            state[symbol] = {
-                "stage": prev.get("stage") if prev else None,
-                "bucket": bucket,
-                "last_seen_ts": now_ts,
-            }
-            continue
+            if verdict != prev.get("last_verdict"):
+                send_telegram(format_verdict_message(rec, streak_snaps[-STREAK_FOR_VERDICT:], verdict, reasons))
 
-        # Реакселерация: раньше уже был в state, но давно не появлялся
-        reaccel = bool(prev) and (now_ts - prev.get("last_seen_ts", now_ts) > GRACE_SECONDS)
-
-        should_alert = False
-        if reaccel:
-            should_alert = True
-        elif prev is None or prev.get("stage") != stage:
-            should_alert = True
-
-        if should_alert:
-            label = STAGE_LABELS.get(stage, stage)
-            print(f"  -> Отправляю алерт по {symbol} (стадия={stage}, реакселерация={reaccel})")
-            send_telegram(format_alert(r, profile, score, regime, all_tags, pers, label, reaccel))
-
-        state[symbol] = {"stage": stage, "bucket": bucket, "last_seen_ts": now_ts}
+        state[symbol] = {
+            "streak": streak,
+            "streak_snapshots": streak_snaps,
+            "last_verdict": verdict if verdict else prev.get("last_verdict"),
+        }
 
     save_state(state)
     print("Готово.")
