@@ -1,0 +1,37 @@
+name: Coinalyze Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # каждые 15 минут (UTC время, best-effort у GitHub)
+  workflow_dispatch: {}       # позволяет запускать вручную для теста
+
+permissions:
+  contents: write             # нужно, чтобы коммитить snapshots.jsonl обратно
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
+          COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Commit snapshot log
+        run: |
+          git config user.name "coinalyze-bot"
+          git config user.email "actions@github.com"
+          git add snapshots.jsonl
+          git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
