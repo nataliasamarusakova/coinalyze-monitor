@@ -3,8 +3,10 @@ coinalyze_monitor.py
 Playwright (реальный Chromium) + прокси -> обходим Cloudflare challenge ->
 парсим таблицу -> скоринг/режим по промпту v2.5 -> JSONL лог -> Telegram.
 """
+
 import os
 import sys
+import re
 import time
 import json
 from bs4 import BeautifulSoup
@@ -19,7 +21,7 @@ except ImportError:
           "продолжаю без stealth-маскировки.")
     STEALTH_AVAILABLE = False
     def stealth_sync(page):
-        pass  # no-op заглушка, чтобы остальной код не менять
+        pass  # no-op заглушка
 
 # ============ НАСТРОЙКИ ============
 
@@ -74,6 +76,15 @@ def fetch_rows_from_html(html_text):
     rows_found = soup.select("tbody tr")
     print(f"Найдено строк: {len(rows_found)}")
 
+    if rows_found:
+        # Диагностика: покажем длину tds и значения первых 3 строк
+        for i, tr in enumerate(rows_found[:3]):
+            tds = tr.find_all("td")
+            symbol = tr.get("data-coin")
+            print(f"  Строка {i}: symbol={symbol}, кол-во td={len(tds)}")
+            texts = [td.get_text(strip=True) for td in tds]
+            print(f"    Значения: {texts}")
+
     records = []
     for tr in rows_found:
         symbol = tr.get("data-coin")
@@ -116,9 +127,6 @@ def fetch_rows_from_html(html_text):
 def fetch_rows_via_browser():
     proxy_config = None
     if PROXY_URL:
-        # Playwright ожидает proxy отдельно от логина/пароля в структуре
-        # Формат PROXY_URL: http://user:pass@host:port
-        import re
         m = re.match(r"https?://(?:([^:]+):([^@]+)@)?([^:/]+):(\d+)", PROXY_URL)
         if m:
             user, pwd, host, port = m.groups()
@@ -143,20 +151,19 @@ def fetch_rows_via_browser():
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             context.add_cookies([
                 {"name": "p_sid", "value": COINALYZE_P_SID,
-                 "domain": "coinalyze.net", "path": "/"},
+                 "domain": ".coinalyze.net", "path": "/"},
                 {"name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                 "domain": "coinalyze.net", "path": "/"},
+                 "domain": ".coinalyze.net", "path": "/"},
             ])
 
         page = context.new_page()
         stealth_sync(page)
 
+        html = ""
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            # Даём время на Cloudflare challenge / дорисовку таблицы
             page.wait_for_timeout(5000)
 
-            # Если challenge есть - подождать подольше и попробовать ещё раз
             content_check = page.content()
             if "Attention Required" in content_check or "cf-browser-verification" in content_check:
                 print("Обнаружен Cloudflare challenge, ждём подольше...")
@@ -165,14 +172,15 @@ def fetch_rows_via_browser():
             page.wait_for_selector("tbody tr", timeout=20000)
             html = page.content()
         except Exception as e:
-            print(f"Ошибка при загрузке страницы: {e}")
-            html = page.content()
-            page.screenshot(path="debug_screenshot.png", full_page=True)
-            with open("debug_page.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            browser.close()
-            send_telegram(f"⚠️ Coinalyze monitor: ошибка загрузки страницы: {e}")
-            sys.exit(1)
+            print(f"Ошибка/таймаут при загрузке страницы: {e}")
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+            try:
+                page.screenshot(path="debug_screenshot.png", full_page=True)
+            except Exception as se:
+                print(f"Не удалось сделать скриншот: {se}")
 
         browser.close()
         return html
@@ -186,13 +194,19 @@ def fetch_rows():
         return fetch_rows_from_html(html_text)
 
     html = fetch_rows_via_browser()
+
+    # Всегда сохраняем полученный HTML для диагностики
+    with open("debug_page.html", "w", encoding="utf-8") as f:
+        f.write(html)
+
     rows = fetch_rows_from_html(html)
 
     if not rows:
-        print("Строк не найдено после полной загрузки. Сохраняю debug-артефакты.")
-        with open("debug_page.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        send_telegram("⚠️ Coinalyze monitor: таблица пустая после загрузки браузером.")
+        print("ВНИМАНИЕ: строк с полным набором колонок (>=23 td) не найдено.")
+        print("Проверь debug_page.html и debug_screenshot.png в артефактах прогона.")
+        send_telegram("⚠️ Coinalyze monitor: страница получена, но нужный набор "
+                       "колонок не распознан (возможно, кастомные колонки не "
+                       "отобразились без полноценной авторизации). Проверь debug_page.html.")
         sys.exit(1)
 
     return rows
@@ -290,6 +304,8 @@ def score_profile_b(r):
     return True, score, flags
 
 
+# ============ РЕЖИМ (раздел 5 промпта) ============
+
 def classify_regime(r):
     oi = r["oi_chg24_pct"]
     pc = r["price_chg24"]
@@ -333,7 +349,7 @@ def classify_regime(r):
     return regime, tags
 
 
-# ============ ЛОГ СНАПШОТОВ ============
+# ============ ЛОГ СНАПШОТОВ (JSONL) ============
 
 def load_history():
     if not os.path.exists(LOG_FILE):
