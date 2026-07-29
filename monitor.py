@@ -380,10 +380,16 @@ def send_telegram(text):
         resp = requests.post(url, data={
             "chat_id": TG_CHAT_ID, "text": text,
             "parse_mode": "HTML", "disable_web_page_preview": True,
-        }, timeout=10)
+        }, timeout=15)
+        print(f"Telegram ответ: статус={resp.status_code}, тело={resp.text[:500]}")
         if resp.status_code != 200:
             print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text}")
             return False
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"Telegram API вернул ok=false: {data}")
+            return False
+        print("Сообщение в Telegram успешно отправлено.")
         return True
     except Exception as e:
         print(f"Исключение при отправке в Telegram: {e}")
