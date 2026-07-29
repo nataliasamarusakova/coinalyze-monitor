@@ -3,15 +3,23 @@ coinalyze_monitor.py
 Playwright (реальный Chromium) + прокси -> обходим Cloudflare challenge ->
 парсим таблицу -> скоринг/режим по промпту v2.5 -> JSONL лог -> Telegram.
 """
-
 import os
 import sys
 import time
 import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
-import requests  # обычный requests достаточно для Telegram (не нужен обход Cloudflare)
+import requests
+
+try:
+    from playwright_stealth import stealth_sync
+    STEALTH_AVAILABLE = True
+except ImportError:
+    print("ПРЕДУПРЕЖДЕНИЕ: playwright_stealth.stealth_sync недоступен, "
+          "продолжаю без stealth-маскировки.")
+    STEALTH_AVAILABLE = False
+    def stealth_sync(page):
+        pass  # no-op заглушка, чтобы остальной код не менять
 
 # ============ НАСТРОЙКИ ============
 
