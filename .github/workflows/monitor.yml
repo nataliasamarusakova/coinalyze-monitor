@@ -2,7 +2,7 @@ name: Coinalyze Monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       use_sample:
@@ -38,7 +38,7 @@ jobs:
           USE_SAMPLE_HTML: ${{ github.event.inputs.use_sample || 'false' }}
         run: python monitor.py
 
-      - name: Upload debug screenshot
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -48,10 +48,10 @@ jobs:
             debug_page.html
           if-no-files-found: ignore
 
-      - name: Commit snapshot log
+      - name: Commit snapshot log and state
         run: |
           git config user.name "coinalyze-bot"
           git config user.email "actions@github.com"
-          git add snapshots.jsonl
+          git add snapshots.jsonl alerted_state.json
           git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push
