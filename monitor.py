@@ -9,6 +9,7 @@ import sys
 import re
 import time
 import json
+import html
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
@@ -53,6 +54,8 @@ def check_env():
     print("Все переменные окружения на месте.")
     print(f"Длина p_sid: {len(COINALYZE_P_SID)} символов")
     print(f"Длина chat_sid: {len(COINALYZE_CHAT_SID)} символов")
+    print(f"Длина TG_BOT_TOKEN: {len(TG_BOT_TOKEN)} символов")
+    print(f"TG_CHAT_ID: '{TG_CHAT_ID}'")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -74,7 +77,6 @@ def parse_number(raw):
 
 
 def check_login_indicators(html_text):
-    """Диагностика: залогинен ли пользователь по косвенным признакам."""
     lower = html_text.lower()
     signals = {
         "содержит 'log in' / 'sign in'": ("log in" in lower or "sign in" in lower),
@@ -172,7 +174,6 @@ def fetch_rows_via_browser():
                 {"name": "cookies_accepted", "value": "1",
                  "domain": "coinalyze.net", "path": "/", "secure": True},
             ])
-            # Проверка, что Playwright реально принял куки
             applied = context.cookies("https://coinalyze.net")
             print(f"Куки применены в контексте браузера: "
                   f"{[c['name'] for c in applied]}")
@@ -180,7 +181,7 @@ def fetch_rows_via_browser():
         page = context.new_page()
         stealth_sync(page)
 
-        html = ""
+        html_content = ""
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(5000)
@@ -191,24 +192,24 @@ def fetch_rows_via_browser():
                 page.wait_for_timeout(10000)
 
             page.wait_for_selector("tbody tr", timeout=20000)
-            html = page.content()
+            html_content = page.content()
 
             print("Проверка признаков авторизации на странице:")
-            check_login_indicators(html)
+            check_login_indicators(html_content)
 
         except Exception as e:
             print(f"Ошибка/таймаут при загрузке страницы: {e}")
             try:
-                html = page.content()
+                html_content = page.content()
             except Exception:
-                html = ""
+                html_content = ""
             try:
                 page.screenshot(path="debug_screenshot.png", full_page=True)
             except Exception as se:
                 print(f"Не удалось сделать скриншот: {se}")
 
         browser.close()
-        return html
+        return html_content
 
 
 def fetch_rows():
@@ -218,18 +219,15 @@ def fetch_rows():
             html_text = f.read()
         return fetch_rows_from_html(html_text)
 
-    html = fetch_rows_via_browser()
+    html_content = fetch_rows_via_browser()
 
     with open("debug_page.html", "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(html_content)
 
-    rows = fetch_rows_from_html(html)
+    rows = fetch_rows_from_html(html_content)
 
     if not rows:
         print("ВНИМАНИЕ: строк с полным набором колонок (>=23 td) не найдено.")
-        print("Похоже, сессия не авторизована — кастомные колонки (CVD24/LLS24) "
-              "не отображаются. Скорее всего, куки протухли. Обнови "
-              "COINALYZE_P_SID и COINALYZE_CHAT_SID свежими значениями из браузера.")
         send_telegram("⚠️ Coinalyze monitor: таблица получена, но без кастомных "
                        "колонок (CVD24/LLS24) — вероятно, куки истекли. Обнови их в Secrets.")
         sys.exit(1)
@@ -401,29 +399,53 @@ def persistence(history, symbol, regime, hours=48):
     return count
 
 
+# ============ TELEGRAM (с проверкой ответа!) ============
+
 def send_telegram(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("Telegram не настроен, пропускаю отправку:", text)
-        return
+        return False
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={
+        resp = requests.post(url, data={
             "chat_id": TG_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }, timeout=10)
+
+        print(f"Telegram ответ: статус={resp.status_code}, тело={resp.text[:300]}")
+
+        if resp.status_code != 200:
+            print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text}")
+            return False
+
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"Telegram API вернул ok=false: {data}")
+            return False
+
+        print("Сообщение в Telegram успешно отправлено.")
+        return True
+
     except Exception as e:
-        print(f"Не удалось отправить Telegram-сообщение: {e}")
+        print(f"Исключение при отправке в Telegram: {e}")
+        return False
+
+
+def esc(value):
+    """Экранирование HTML-спецсимволов для безопасной вставки в parse_mode=HTML."""
+    return html.escape(str(value), quote=False)
 
 
 def format_alert(r, profile, score, regime, tags, pers):
     tag_str = ", ".join(tags) if tags else "нет"
     return (
-        f"<b>{r['name']} ({r['symbol']})</b>\n"
-        f"Профиль: {profile} | Балл: {score}\n"
-        f"Режим: <b>{regime}</b>\n"
-        f"Тег: {tag_str}\n"
+        f"<b>{esc(r['name'])} ({esc(r['symbol'])})</b>\n"
+        f"Профиль: {esc(profile)} | Балл: {score}\n"
+        f"Режим: <b>{esc(regime)}</b>\n"
+        f"Тег: {esc(tag_str)}\n"
         f"Persistence: {pers} снимков\n"
         f"Price: {r['price']} ({r['price_chg24']}%)\n"
         f"OI 24H: {r['oi_chg24_pct']}% | OI 4H: {r['oi_chg4h_pct']}%\n"
@@ -435,6 +457,12 @@ def format_alert(r, profile, score, regime, tags, pers):
 
 def run_once():
     check_env()
+
+    # Тестовое сообщение в самом начале — чтобы сразу понять, работает ли Telegram вообще
+    test_ok = send_telegram("🔧 Coinalyze monitor: тестовое сообщение, старт прогона.")
+    if not test_ok:
+        print("ВНИМАНИЕ: тестовое сообщение не ушло — дальнейшие алерты тоже, скорее всего, не придут.")
+
     history = load_history()
     rows = fetch_rows()
     print(f"Получено монет: {len(rows)}")
@@ -460,9 +488,14 @@ def run_once():
         history.append(rec)
 
         threshold = 6 if profile == "A" else 5
+        print(f"[{r['symbol']}] профиль={profile} балл={score} порог={threshold} "
+              f"режим={regime} теги={all_tags}")
+
         if score >= 3:
             pers = persistence(history, r["symbol"], regime)
+            print(f"  Persistence для {r['symbol']} ({regime}): {pers}")
             if score >= threshold or pers in (3, 6):
+                print(f"  -> Отправляю алерт по {r['symbol']}")
                 send_telegram(format_alert(r, profile, score, regime, all_tags, pers))
 
     print("Готово.")
