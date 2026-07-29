@@ -1,7 +1,7 @@
 """
 coinalyze_monitor.py
-Playwright (реальный Chromium) + прокси -> обходим Cloudflare challenge ->
-парсим таблицу -> скоринг/режим по промпту v2.5 -> JSONL лог -> Telegram.
+Playwright + прокси -> Cloudflare bypass -> парсинг -> скоринг/режим ->
+устойчивый к шуму Persistence Score -> дедуп алертов -> Telegram.
 """
 
 import os
@@ -16,18 +16,14 @@ import requests
 
 try:
     from playwright_stealth import stealth_sync
-    STEALTH_AVAILABLE = True
 except ImportError:
-    print("ПРЕДУПРЕЖДЕНИЕ: playwright_stealth.stealth_sync недоступен, "
-          "продолжаю без stealth-маскировки.")
-    STEALTH_AVAILABLE = False
+    print("ПРЕДУПРЕЖДЕНИЕ: playwright_stealth недоступен, продолжаю без него.")
     def stealth_sync(page):
         pass
 
 # ============ НАСТРОЙКИ ============
 
 USE_SAMPLE = os.environ.get("USE_SAMPLE_HTML", "false").lower() == "true"
-
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
@@ -40,6 +36,33 @@ URL = ("https://coinalyze.net/"
        "&order_by=oi_current&order_dir=desc")
 
 LOG_FILE = "snapshots.jsonl"
+STATE_FILE = "alerted_state.json"
+
+PERSISTENCE_WINDOW_HOURS = 3       # окно, в котором ищем историю для Persistence
+GRACE_SECONDS = 20 * 60            # 20 минут молчания = считать "реакселерацией", не шумом
+
+BUCKET_MAP = {
+    "Healthy Trend": "bullish",
+    "Short Squeeze Setup": "bullish",
+    "Mixed": "bullish",
+    "Weak Trend": "bullish",
+    "Capitulation": "bullish",
+    "Distribution": "warning",
+    "Exhaustion": "warning",
+    "Exhaustion (умеренная)": "warning",
+    "Extreme Exhaustion": "warning",
+    "Neutral": "neutral",
+}
+
+STAGE_LABELS = {
+    "early": "🟡 РАННИЙ СИГНАЛ (1 снимок, не подтверждён)",
+    "confirmed_3": "🟢 ПОДТВЕРЖДЕНО (устойчиво 3+ снимка)",
+    "confirmed_6": "🟢🟢 ВЫСОКАЯ УВЕРЕННОСТЬ (устойчиво 6+ снимков)",
+}
+
+
+def bucket_of(regime):
+    return BUCKET_MAP.get(regime, "neutral")
 
 
 def check_env():
@@ -52,10 +75,6 @@ def check_env():
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
         sys.exit(1)
     print("Все переменные окружения на месте.")
-    print(f"Длина p_sid: {len(COINALYZE_P_SID)} символов")
-    print(f"Длина chat_sid: {len(COINALYZE_CHAT_SID)} символов")
-    print(f"Длина TG_BOT_TOKEN: {len(TG_BOT_TOKEN)} символов")
-    print(f"TG_CHAT_ID: '{TG_CHAT_ID}'")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -76,31 +95,10 @@ def parse_number(raw):
         return None
 
 
-def check_login_indicators(html_text):
-    lower = html_text.lower()
-    signals = {
-        "содержит 'log in' / 'sign in'": ("log in" in lower or "sign in" in lower),
-        "содержит 'log out' / 'sign out' / 'logout'": (
-            "log out" in lower or "sign out" in lower or "logout" in lower),
-        "содержит 'upgrade' (обычно для неавторизованных/free)": "upgrade" in lower,
-    }
-    for label, val in signals.items():
-        print(f"  Индикатор [{label}]: {val}")
-    return signals
-
-
 def fetch_rows_from_html(html_text):
     soup = BeautifulSoup(html_text, "lxml")
     rows_found = soup.select("tbody tr")
     print(f"Найдено строк: {len(rows_found)}")
-
-    if rows_found:
-        for i, tr in enumerate(rows_found[:3]):
-            tds = tr.find_all("td")
-            symbol = tr.get("data-coin")
-            print(f"  Строка {i}: symbol={symbol}, кол-во td={len(tds)}")
-            texts = [td.get_text(strip=True) for td in tds]
-            print(f"    Значения: {texts}")
 
     records = []
     for tr in rows_found:
@@ -121,9 +119,7 @@ def fetch_rows_from_html(html_text):
             "volume24": parse_number(tds[5].get_text(strip=True)),
             "oi": parse_number(tds[6].get_text(strip=True)),
             "oi_chg24_pct": parse_number(tds[7].get_text(strip=True)),
-            "oi_chg24_abs": parse_number(tds[8].get_text(strip=True)),
             "oi_chg4h_pct": parse_number(tds[9].get_text(strip=True)),
-            "oi_chg4h_abs": parse_number(tds[10].get_text(strip=True)),
             "oi_vol_ratio": parse_number(tds[11].get_text(strip=True)),
             "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
             "fr_avg": parse_number(tds[13].get_text(strip=True)),
@@ -156,7 +152,6 @@ def fetch_rows_via_browser():
         launch_kwargs = {"headless": True}
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
-
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -164,7 +159,6 @@ def fetch_rows_via_browser():
             viewport={"width": 1920, "height": 1080},
             locale="ru-RU",
         )
-
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             context.add_cookies([
                 {"name": "p_sid", "value": COINALYZE_P_SID,
@@ -174,9 +168,6 @@ def fetch_rows_via_browser():
                 {"name": "cookies_accepted", "value": "1",
                  "domain": "coinalyze.net", "path": "/", "secure": True},
             ])
-            applied = context.cookies("https://coinalyze.net")
-            print(f"Куки применены в контексте браузера: "
-                  f"{[c['name'] for c in applied]}")
 
         page = context.new_page()
         stealth_sync(page)
@@ -184,54 +175,40 @@ def fetch_rows_via_browser():
         html_content = ""
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(5000)
-
+            page.wait_for_timeout(3000)
             content_check = page.content()
-            if "Attention Required" in content_check or "cf-browser-verification" in content_check:
-                print("Обнаружен Cloudflare challenge, ждём подольше...")
-                page.wait_for_timeout(10000)
-
+            if "Attention Required" in content_check:
+                page.wait_for_timeout(8000)
             page.wait_for_selector("tbody tr", timeout=20000)
             html_content = page.content()
-
-            print("Проверка признаков авторизации на странице:")
-            check_login_indicators(html_content)
-
         except Exception as e:
-            print(f"Ошибка/таймаут при загрузке страницы: {e}")
+            print(f"Ошибка загрузки: {e}")
             try:
                 html_content = page.content()
             except Exception:
-                html_content = ""
+                pass
             try:
                 page.screenshot(path="debug_screenshot.png", full_page=True)
-            except Exception as se:
-                print(f"Не удалось сделать скриншот: {se}")
-
+            except Exception:
+                pass
         browser.close()
         return html_content
 
 
 def fetch_rows():
     if USE_SAMPLE:
-        print("РЕЖИМ ТЕСТА: читаю sample.html вместо реального запроса к Coinalyze.")
         with open("sample.html", "r", encoding="utf-8") as f:
-            html_text = f.read()
-        return fetch_rows_from_html(html_text)
+            return fetch_rows_from_html(f.read())
 
     html_content = fetch_rows_via_browser()
-
     with open("debug_page.html", "w", encoding="utf-8") as f:
         f.write(html_content)
-
     rows = fetch_rows_from_html(html_content)
 
     if not rows:
-        print("ВНИМАНИЕ: строк с полным набором колонок (>=23 td) не найдено.")
-        send_telegram("⚠️ Coinalyze monitor: таблица получена, но без кастомных "
-                       "колонок (CVD24/LLS24) — вероятно, куки истекли. Обнови их в Secrets.")
+        send_telegram("⚠️ Coinalyze monitor: не получены данные (куки истекли "
+                       "или изменилась разметка). Проверь debug_page.html.")
         sys.exit(1)
-
     return rows
 
 
@@ -250,42 +227,32 @@ def score_profile_a(r):
     if cvd is not None:
         if cvd > 70: score += 2
         elif cvd >= 50: score += 1
-        elif cvd < 35: score -= 1; flags.append("CVD24<35 внутри бычьего сетапа")
-
+        elif cvd < 35: score -= 1; flags.append("CVD24<35")
     lls = r["lls24"]
     if lls is not None:
         if lls < 15: score += 2
         elif lls <= 35: score += 1
-        elif lls > 50: score -= 1; flags.append("LLS24>50% давление на лонги")
-
+        elif lls > 50: score -= 1; flags.append("LLS24>50%")
     oi = r["oi_chg24_pct"]
     if oi is not None:
         if 5 <= oi <= 35: score += 1
-        elif oi > 35: flags.append("экстремальный выброс OI")
-
+        elif oi > 35: flags.append("экстремальный OI")
     pc = r["price_chg24"]
     if pc is not None:
         if 2 <= pc <= 20: score += 1
         elif pc > 20: flags.append("перегрев цены")
-
     fr = r["fr_oiw"]
     if fr is not None:
         if -0.01 <= fr <= 0.03: score += 1
         else: flags.append("Funding-дивергенция")
-
     oim = r["oi_mktcap_ratio"]
-    if oim is not None and oim < 0.15:
-        score += 1
-
+    if oim is not None and oim < 0.15: score += 1
     oiv = r["oi_vol_ratio"]
-    if oiv is not None and 0.1 <= oiv <= 2.5:
-        score += 1
-
+    if oiv is not None and 0.1 <= oiv <= 2.5: score += 1
     ls = r["ls_accounts"]
     if ls is not None:
         if 0.8 <= ls <= 1.5: score += 1
         elif ls > 1.5: score -= 1; flags.append("Ритейл FOMO")
-
     return True, score, flags
 
 
@@ -296,48 +263,32 @@ def score_profile_b(r):
     if not (r["price_chg24"] is not None and r["price_chg24"] < 0
             and r["oi_chg24_pct"] is not None and r["oi_chg24_pct"] < 0):
         return False, 0, flags
-
     score = 0
     pc = r["price_chg24"]
     if pc is not None:
         if pc < -8: score += 2
         elif pc <= -3: score += 1
-
     oi = r["oi_chg24_pct"]
     if oi is not None:
         if oi < -15: score += 2
         elif oi <= -5: score += 1
-
     lls = r["lls24"]
     if lls is not None:
         if lls > 50: score += 2
         elif lls >= 35: score += 1
-
     fr = r["fr_oiw"]
-    if fr is not None and fr < 0:
-        score += 1
-
+    if fr is not None and fr < 0: score += 1
     cvd = r["cvd24"]
     if cvd is not None:
         if cvd < 35: score += 1
-        elif cvd > 50:
-            score += 1
-            flags.append("возможное скрытое накопление на дне")
-
+        elif cvd > 50: score += 1; flags.append("скрытое накопление на дне")
     return True, score, flags
 
 
-# ============ РЕЖИМ (раздел 5 промпта) ============
-
 def classify_regime(r):
-    oi = r["oi_chg24_pct"]
-    pc = r["price_chg24"]
-    cvd = r["cvd24"]
-    lls = r["lls24"]
-
+    oi, pc, cvd, lls = r["oi_chg24_pct"], r["price_chg24"], r["cvd24"], r["lls24"]
     if oi is None or pc is None:
         return "Neutral", []
-
     regime = "Neutral"
     if oi < -5:
         regime = "Capitulation" if pc < -3 else "Distribution"
@@ -368,11 +319,10 @@ def classify_regime(r):
     ls = r["ls_accounts"]
     if ls is not None and ls > 1.5 and regime in ("Healthy Trend", "Short Squeeze Setup", "Weak Trend"):
         tags.append("Ритейл FOMO")
-
     return regime, tags
 
 
-# ============ ЛОГ СНАПШОТОВ (JSONL) ============
+# ============ ЛОГ СНАПШОТОВ ============
 
 def load_history():
     if not os.path.exists(LOG_FILE):
@@ -386,67 +336,74 @@ def append_history(rec):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def persistence(history, symbol, regime, hours=48):
-    cutoff = int(time.time()) - hours * 3600
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def persistence_robust(history, symbol, current_bucket, window_hours=PERSISTENCE_WINDOW_HOURS):
+    """
+    Считает снимки того же 'направления' (bucket), допуская пропуски
+    (когда монета временно не прошла ворота — шум), но обрывая счёт,
+    если встретился снимок ПРОТИВОПОЛОЖНОГО направления (реальный разворот).
+    """
+    cutoff = int(time.time()) - window_hours * 3600
     relevant = [h for h in reversed(history)
                 if h["symbol"] == symbol and h["ts"] > cutoff]
     count = 0
     for h in relevant:
-        if h["regime"] == regime:
+        h_bucket = bucket_of(h.get("regime"))
+        if h_bucket == current_bucket:
             count += 1
+        elif h_bucket == "neutral":
+            continue  # нейтральный снимок — не шум и не разворот, просто пропускаем
         else:
-            break
+            break  # встретили противоположный бакет — настоящий разворот, стоп
     return count
 
 
-# ============ TELEGRAM (с проверкой ответа!) ============
+# ============ TELEGRAM ============
 
 def send_telegram(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("Telegram не настроен, пропускаю отправку:", text)
         return False
-
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, data={
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "chat_id": TG_CHAT_ID, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": True,
         }, timeout=10)
-
-        print(f"Telegram ответ: статус={resp.status_code}, тело={resp.text[:300]}")
-
         if resp.status_code != 200:
             print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text}")
             return False
-
-        data = resp.json()
-        if not data.get("ok"):
-            print(f"Telegram API вернул ok=false: {data}")
-            return False
-
-        print("Сообщение в Telegram успешно отправлено.")
         return True
-
     except Exception as e:
         print(f"Исключение при отправке в Telegram: {e}")
         return False
 
 
 def esc(value):
-    """Экранирование HTML-спецсимволов для безопасной вставки в parse_mode=HTML."""
     return html.escape(str(value), quote=False)
 
 
-def format_alert(r, profile, score, regime, tags, pers):
+def format_alert(r, profile, score, regime, tags, pers, stage_label, reaccel=False):
     tag_str = ", ".join(tags) if tags else "нет"
+    prefix = "🔄 РЕАКСЕЛЕРАЦИЯ ПОСЛЕ ПАУЗЫ\n" if reaccel else ""
     return (
+        f"{prefix}{stage_label}\n"
         f"<b>{esc(r['name'])} ({esc(r['symbol'])})</b>\n"
         f"Профиль: {esc(profile)} | Балл: {score}\n"
         f"Режим: <b>{esc(regime)}</b>\n"
         f"Тег: {esc(tag_str)}\n"
-        f"Persistence: {pers} снимков\n"
+        f"Persistence: {pers} снимков (окно {PERSISTENCE_WINDOW_HOURS}ч)\n"
         f"Price: {r['price']} ({r['price_chg24']}%)\n"
         f"OI 24H: {r['oi_chg24_pct']}% | OI 4H: {r['oi_chg4h_pct']}%\n"
         f"FR OI-W: {r['fr_oiw']}% | CVD24: {r['cvd24']} | LLS24: {r['lls24']}%\n"
@@ -457,15 +414,13 @@ def format_alert(r, profile, score, regime, tags, pers):
 
 def run_once():
     check_env()
-
-    # Тестовое сообщение в самом начале — чтобы сразу понять, работает ли Telegram вообще
-    test_ok = send_telegram("🔧 Coinalyze monitor: тестовое сообщение, старт прогона.")
-    if not test_ok:
-        print("ВНИМАНИЕ: тестовое сообщение не ушло — дальнейшие алерты тоже, скорее всего, не придут.")
-
     history = load_history()
+    state = load_state()
     rows = fetch_rows()
     print(f"Получено монет: {len(rows)}")
+    now_ts = int(time.time())
+
+    seen_symbols = set()
 
     for r in rows:
         passed_a, score_a, flags_a = score_profile_a(r)
@@ -477,9 +432,15 @@ def run_once():
         elif passed_b:
             profile, score, flags = "B", score_b, flags_b
 
+        symbol = r["symbol"]
+
         if profile is None:
+            # Ворота не пройдены на этом тике — НЕ трогаем state,
+            # last_seen_ts остаётся старым => это и даёт возможность
+            # обнаружить "реакселерацию", когда монета вернётся.
             continue
 
+        seen_symbols.add(symbol)
         regime, tags = classify_regime(r)
         all_tags = tags + flags
         rec = {**r, "profile": profile, "score": score,
@@ -487,17 +448,55 @@ def run_once():
         append_history(rec)
         history.append(rec)
 
+        if score < 3:
+            continue  # даже самого низкого качества нет — пропускаем
+
         threshold = 6 if profile == "A" else 5
-        print(f"[{r['symbol']}] профиль={profile} балл={score} порог={threshold} "
-              f"режим={regime} теги={all_tags}")
+        bucket = bucket_of(regime)
+        pers = persistence_robust(history, symbol, bucket)
 
-        if score >= 3:
-            pers = persistence(history, r["symbol"], regime)
-            print(f"  Persistence для {r['symbol']} ({regime}): {pers}")
-            if score >= threshold or pers in (3, 6):
-                print(f"  -> Отправляю алерт по {r['symbol']}")
-                send_telegram(format_alert(r, profile, score, regime, all_tags, pers))
+        print(f"[{symbol}] профиль={profile} балл={score} порог={threshold} "
+              f"режим={regime} бакет={bucket} persistence={pers} теги={all_tags}")
 
+        prev = state.get(symbol)
+
+        # Определяем стадию только если балл достиг "качественного" порога
+        stage = None
+        if score >= threshold:
+            if pers >= 6:
+                stage = "confirmed_6"
+            elif pers >= 3:
+                stage = "confirmed_3"
+            else:
+                stage = "early"
+
+        if stage is None:
+            # Балл 3..threshold-1 — просто наблюдаем, без алерта,
+            # но обновляем last_seen_ts, чтобы не считать это "паузой"
+            state[symbol] = {
+                "stage": prev.get("stage") if prev else None,
+                "bucket": bucket,
+                "last_seen_ts": now_ts,
+            }
+            continue
+
+        # Реакселерация: раньше уже был в state, но давно не появлялся
+        reaccel = bool(prev) and (now_ts - prev.get("last_seen_ts", now_ts) > GRACE_SECONDS)
+
+        should_alert = False
+        if reaccel:
+            should_alert = True
+        elif prev is None or prev.get("stage") != stage:
+            should_alert = True
+
+        if should_alert:
+            label = STAGE_LABELS.get(stage, stage)
+            print(f"  -> Отправляю алерт по {symbol} (стадия={stage}, реакселерация={reaccel})")
+            send_telegram(format_alert(r, profile, score, regime, all_tags, pers, label, reaccel))
+
+        state[symbol] = {"stage": stage, "bucket": bucket, "last_seen_ts": now_ts}
+
+    save_state(state)
     print("Готово.")
 
 
