@@ -6,7 +6,6 @@ Playwright + прокси -> Cloudflare bypass -> парсинг -> скорин
 
 import os
 import sys
-import re
 import time
 import json
 import html
@@ -28,7 +27,6 @@ COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-PROXY_URL = os.environ.get("PROXY_URL", "")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -138,21 +136,8 @@ def fetch_rows_from_html(html_text):
 
 
 def fetch_rows_via_browser():
-    proxy_config = None
-    if PROXY_URL:
-        m = re.match(r"https?://(?:([^:]+):([^@]+)@)?([^:/]+):(\d+)", PROXY_URL)
-        if m:
-            user, pwd, host, port = m.groups()
-            proxy_config = {"server": f"http://{host}:{port}"}
-            if user and pwd:
-                proxy_config["username"] = user
-                proxy_config["password"] = pwd
-
     with sync_playwright() as p:
-        launch_kwargs = {"headless": True}
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
-        browser = p.chromium.launch(**launch_kwargs)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -161,41 +146,31 @@ def fetch_rows_via_browser():
         )
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             context.add_cookies([
-                {"name": "p_sid", "value": COINALYZE_P_SID,
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
-                {"name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
-                {"name": "cookies_accepted", "value": "1",
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
+                {"name":"p_sid","value":COINALYZE_P_SID,"domain":"coinalyze.net","path":"/","secure":True},
+                {"name":"chat_sid","value":COINALYZE_CHAT_SID,"domain":"coinalyze.net","path":"/","secure":True},
+                {"name":"cookies_accepted","value":"1","domain":"coinalyze.net","path":"/","secure":True},
             ])
-
-        page = context.new_page()
+        page=context.new_page()
         stealth_sync(page)
-
-        html_content = ""
+        html_content=""
         try:
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)
-            content_check = page.content()
-            if "Attention Required" in content_check:
+            if "Attention Required" in page.content():
                 page.wait_for_timeout(8000)
             page.wait_for_selector("tbody tr", timeout=20000)
-            html_content = page.content()
+            html_content=page.content()
         except Exception as e:
             print(f"Ошибка загрузки: {e}")
-            try:
-                html_content = page.content()
-            except Exception:
-                pass
-            try:
-                page.screenshot(path="debug_screenshot.png", full_page=True)
-            except Exception:
-                pass
+            try: html_content=page.content()
+            except Exception: pass
+            try: page.screenshot(path="debug_screenshot.png", full_page=True)
+            except Exception: pass
         browser.close()
         return html_content
 
-
 def fetch_rows():
+
     if USE_SAMPLE:
         with open("sample.html", "r", encoding="utf-8") as f:
             return fetch_rows_from_html(f.read())
