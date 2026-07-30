@@ -9,6 +9,8 @@ on:
         description: 'Тестовый режим (true/false)'
         required: false
         default: 'false'
+  repository_dispatch:
+    types: [run_monitor]
 
 permissions:
   contents: write
@@ -20,19 +22,14 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - run: pip install -r requirements.txt
-
       - name: Install Playwright browsers
         run: playwright install --with-deps chromium
-
       - name: Run monitor
         env:
           COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
@@ -41,7 +38,6 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           USE_SAMPLE_HTML: ${{ github.event.inputs.use_sample || 'false' }}
         run: python monitor.py
-
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -51,7 +47,6 @@ jobs:
             debug_screenshot.png
             debug_page.html
           if-no-files-found: ignore
-
       - name: Commit snapshot log and state
         run: |
           git config user.name "coinalyze-bot"
