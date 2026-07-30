@@ -2,10 +2,11 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков -> сборка мини-истории по кандидатам ->
-LLM-анализ (по промпту целиком, раздел 0-13) -> Telegram.
+LLM-анализ через Google Gemini (структурированный JSON) -> Telegram.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -28,8 +29,8 @@ COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -40,11 +41,12 @@ LOG_FILE = "snapshots.jsonl"
 LLM_STATE_FILE = "llm_state.json"
 PROMPT_FILE = "analyst_prompt.md"
 
-MIN_SCORE_TO_WATCH = 3          # раздел 11 промпта: анализируем всех с баллом >=3
-MIN_SNAPSHOTS_FOR_ANALYSIS = 3   # минимум точек, прежде чем звать LLM
-ANALYSIS_WINDOW_MINUTES = 20     # окно, в котором ищем снимки для анализа
-REANALYSIS_COOLDOWN_MINUTES = 30 # не дёргаем LLM по той же монете чаще этого
-MAX_LLM_CALLS_PER_RUN = 5        # защита от исчерпания бесплатной квоты
+MIN_SCORE_TO_WATCH = 3
+MIN_SNAPSHOTS_FOR_ANALYSIS = 3
+ANALYSIS_WINDOW_MINUTES = 20
+REANALYSIS_COOLDOWN_MINUTES = 30
+MAX_LLM_CALLS_PER_RUN = 8          # у Gemini Flash щедрый лимит, можно больше
+SLEEP_BETWEEN_LLM_CALLS = 4        # секунд, небольшая пауза для аккуратности
 
 BUCKET_MAP = {
     "Healthy Trend": "bullish", "Short Squeeze Setup": "bullish",
@@ -64,7 +66,7 @@ def check_env():
         print("Режим теста — проверка переменных окружения пропущена.")
         return
     required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "GROQ_API_KEY"]
+                "TG_CHAT_ID", "GEMINI_API_KEY"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -375,44 +377,162 @@ def format_full_metrics(r):
     )
 
 
-# ============ LLM (Groq, бесплатный API) ============
-
 def load_system_prompt():
     with open(PROMPT_FILE, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def call_llm(system_prompt, user_message):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+# ============ GEMINI API (структурированный JSON-вывод) ============
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "signal": {"type": "STRING", "enum": ["Бычий", "Медвежий", "Нейтральный", "Смешанный"]},
+        "regime": {"type": "STRING"},
+        "tag": {"type": "STRING"},
+        "score_comment": {"type": "STRING"},
+        "confidence": {"type": "STRING", "enum": ["Низкая", "Средняя", "Высокая"]},
+        "persistence_snapshots": {"type": "INTEGER"},
+        "persistence_comment": {"type": "STRING"},
+        "pros": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "cons": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "pattern": {"type": "STRING"},
+        "dynamics": {"type": "STRING"},
+        "risks": {"type": "STRING"},
+        "heatmap": {"type": "STRING"},
+        "next_check": {"type": "STRING"},
+        "verdict": {"type": "STRING", "enum": ["НЕ ВХОДИТЬ", "НАБЛЮДАТЬ", "РАССМАТРИВАТЬ"]},
+        "verdict_reason": {"type": "STRING"},
+    },
+    "required": [
+        "signal", "regime", "tag", "score_comment", "confidence",
+        "persistence_snapshots", "persistence_comment", "pros", "cons",
+        "pattern", "dynamics", "risks", "heatmap", "next_check",
+        "verdict", "verdict_reason",
+    ],
+}
+
+
+def call_llm_json(system_prompt, user_message, max_retries=2):
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+
     payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {"role": "user", "parts": [{"text": user_message}]}
         ],
-        "temperature": 0.2,
-        "max_tokens": 2000,
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 1500,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_RESPONSE_SCHEMA,
+        },
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        if resp.status_code != 200:
-            print(f"ОШИБКА Groq API: {resp.status_code} — {resp.text[:500]}")
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=60)
+
+            if resp.status_code == 429:
+                wait_s = 15
+                try:
+                    err = resp.json()
+                    retry_info = str(err)
+                    m = re.search(r'"retryDelay":\s*"(\d+)s"', retry_info)
+                    if m:
+                        wait_s = int(m.group(1)) + 2
+                except Exception:
+                    pass
+                print(f"429 от Gemini, жду {wait_s}с и повторяю "
+                      f"(попытка {attempt+1}/{max_retries+1})")
+                time.sleep(wait_s)
+                continue
+
+            if resp.status_code != 200:
+                print(f"ОШИБКА Gemini API: {resp.status_code} — {resp.text[:500]}")
+                return None
+
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                print(f"Gemini не вернул candidates: {data}")
+                return None
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                print(f"Gemini вернул пустой content: {candidates[0]}")
+                return None
+
+            text = parts[0].get("text", "")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                print(f"LLM вернул невалидный JSON, содержимое: {text[:400]}")
+                return None
+
+        except Exception as e:
+            print(f"Исключение при вызове Gemini API: {e}")
             return None
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"Исключение при вызове Groq API: {e}")
-        return None
+
+    print("Исчерпаны попытки после 429, пропускаю эту монету в этом прогоне.")
+    return None
 
 
 # ============ TELEGRAM ============
 
 def esc(value):
     return html.escape(str(value), quote=False)
+
+
+def safe_get(d, key, default="н/д"):
+    val = d.get(key, default)
+    if val is None or val == "":
+        return default
+    return val
+
+
+def render_verdict_message(rec, v, snaps_count):
+    r = rec
+
+    pros_list = v.get("pros") or []
+    cons_list = v.get("cons") or []
+    pros = "\n".join(f"  • {esc(p)}" for p in pros_list) or "  • нет"
+    cons = "\n".join(f"  • {esc(c)}" for c in cons_list) or "  • нет"
+
+    verdict = safe_get(v, "verdict", "НАБЛЮДАТЬ")
+    verdict_emoji = {
+        "НЕ ВХОДИТЬ": "🔴", "НАБЛЮДАТЬ": "🟡", "РАССМАТРИВАТЬ": "🟢",
+    }.get(verdict, "⚪")
+
+    pers_n = v.get("persistence_snapshots", snaps_count)
+
+    return (
+        f"{verdict_emoji} <b>{esc(r['name'])} ({esc(r['symbol'])})</b> — "
+        f"<b>{esc(verdict)}</b>\n"
+        f"Профиль: {esc(rec['profile'])} | Балл: {rec['score']} | "
+        f"Снимков в анализе: {snaps_count}\n"
+        f"—————————————\n"
+        f"<b>1. Сигнал:</b> {esc(safe_get(v, 'signal'))}\n"
+        f"<b>2. Режим:</b> {esc(safe_get(v, 'regime', rec['regime']))}\n"
+        f"<b>3. Тег:</b> {esc(safe_get(v, 'tag'))}\n"
+        f"<b>4. Балл:</b> {rec['score']} — {esc(safe_get(v, 'score_comment'))}\n"
+        f"<b>5. Уверенность:</b> {esc(safe_get(v, 'confidence'))} "
+        f"(Persistence: {pers_n} снимков) — {esc(safe_get(v, 'persistence_comment'))}\n"
+        f"<b>6. Метрики ЗА:</b>\n{pros}\n"
+        f"<b>7. Метрики ПРОТИВ:</b>\n{cons}\n"
+        f"<b>8. Паттерн:</b> {esc(safe_get(v, 'pattern'))}\n"
+        f"<b>9. Динамика:</b> {esc(safe_get(v, 'dynamics'))}\n"
+        f"<b>10. Риски:</b> {esc(safe_get(v, 'risks'))}\n"
+        f"<b>11. Тепловая карта:</b> {esc(safe_get(v, 'heatmap', 'нет данных'))}\n"
+        f"<b>12. Усилить/Опровергнуть:</b> {esc(safe_get(v, 'next_check'))}\n"
+        f"—————————————\n"
+        f"{verdict_emoji} <b>ВЕРДИКТ: {esc(verdict)}</b>\n"
+        f"Причина: {esc(safe_get(v, 'verdict_reason'))}\n\n"
+        f"<i>Анализ информационный, не финансовая рекомендация.</i>"
+    )
 
 
 def send_telegram_long(text):
@@ -422,13 +542,14 @@ def send_telegram_long(text):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
     chunks = []
-    while len(text) > 3500:
-        split_at = text.rfind("\n", 0, 3500)
+    remaining = text
+    while len(remaining) > 3500:
+        split_at = remaining.rfind("\n", 0, 3500)
         if split_at == -1:
             split_at = 3500
-        chunks.append(text[:split_at])
-        text = text[split_at:]
-    chunks.append(text)
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    chunks.append(remaining)
 
     ok_all = True
     for chunk in chunks:
@@ -439,7 +560,6 @@ def send_telegram_long(text):
             }, timeout=15)
             if resp.status_code != 200:
                 print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text[:300]}")
-                # fallback без HTML-разметки, если LLM выдал невалидный HTML
                 resp2 = requests.post(url, data={
                     "chat_id": TG_CHAT_ID, "text": chunk,
                     "disable_web_page_preview": True,
@@ -490,7 +610,6 @@ def run_once():
         if score >= MIN_SCORE_TO_WATCH:
             candidates.append(rec)
 
-    # Сортируем кандидатов по баллу — приоритет самым сильным сетапам
     candidates.sort(key=lambda c: c["score"], reverse=True)
 
     llm_calls_used = 0
@@ -529,26 +648,30 @@ def run_once():
 
         user_message = (
             "Ниже — лог последних снимков этой монеты (раздел 8.3) и полные метрики "
-            "последнего снимка. Проведи анализ строго по инструкции (разделы 0-13), "
-            "учитывая раздел 7 (методология) и раздел 8 (кросс-снимковый анализ) на "
-            "основе приведённого лога. Учти, что скоринг-балл и режим уже посчитаны "
-            "кодом точно по формулам — не пересчитывай их, используй как есть, но "
-            "оцени их устойчивость и качество тренда во времени.\n\n"
+            "последнего снимка. Скоринг-балл и режим уже посчитаны кодом точно по "
+            "формулам разделов 4-5 — не пересчитывай их, используй как готовые входные "
+            "данные. Проанализируй устойчивость и качество тренда по логу (раздел 7-8), "
+            "определи паттерн (раздел 6) и вынеси вердикт (раздел 11). Ответь строго "
+            "по заданной JSON-схеме.\n\n"
             f"[Лог снимков — {symbol}]\n{log_table}\n\n"
-            f"[Полные метрики последнего снимка]\n{full_metrics}"
+            f"[Полные метрики последнего снимка]\n{full_metrics}\n\n"
+            f"Скоринг-балл (уже посчитан кодом): {rec['score']}\n"
+            f"Режим (уже посчитан кодом): {rec['regime']}\n"
         )
 
-        llm_answer = call_llm(system_prompt, user_message)
+        verdict_json = call_llm_json(system_prompt, user_message)
         llm_calls_used += 1
 
-        if llm_answer is None:
-            print(f"  [{symbol}] LLM не ответил, пропускаю отправку в Telegram")
-            continue
+        if verdict_json is None:
+            print(f"  [{symbol}] LLM не ответил или вернул невалидный JSON, "
+                  f"пропускаю отправку в Telegram")
+        else:
+            msg = render_verdict_message(rec, verdict_json, len(snaps))
+            send_telegram_long(msg)
+            llm_state[symbol] = {"last_analysis_ts": now_ts, "last_bucket": bucket}
 
-        header = f"🤖 <b>Анализ: {esc(rec['name'])} ({esc(symbol)})</b>\n\n"
-        send_telegram_long(header + llm_answer)
-
-        llm_state[symbol] = {"last_analysis_ts": now_ts, "last_bucket": bucket}
+        if llm_calls_used < MAX_LLM_CALLS_PER_RUN:
+            time.sleep(SLEEP_BETWEEN_LLM_CALLS)
 
     save_llm_state(llm_state)
     print(f"Готово. LLM-вызовов за прогон: {llm_calls_used}")
