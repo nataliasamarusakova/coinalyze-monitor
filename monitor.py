@@ -2,7 +2,7 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков -> сборка мини-истории по кандидатам ->
-LLM-анализ через Google Gemini (структурированный JSON) -> Telegram.
+LLM-анализ через Qwen (DashScope, OpenAI-совместимый API) -> Telegram.
 """
 
 import os
@@ -29,8 +29,10 @@ COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -45,8 +47,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 3          # у Gemini Flash щедрый лимит, можно больше
-SLEEP_BETWEEN_LLM_CALLS = 10        # секунд, небольшая пауза для аккуратности
+MAX_LLM_CALLS_PER_RUN = 6
+SLEEP_BETWEEN_LLM_CALLS = 8
 
 BUCKET_MAP = {
     "Healthy Trend": "bullish", "Short Squeeze Setup": "bullish",
@@ -66,7 +68,7 @@ def check_env():
         print("Режим теста — проверка переменных окружения пропущена.")
         return
     required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "GEMINI_API_KEY"]
+                "TG_CHAT_ID", "QWEN_API_KEY"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -75,6 +77,7 @@ def check_env():
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
     print("Все переменные окружения и файл промпта на месте.")
+    print(f"Qwen base_url: {QWEN_BASE_URL} | модель: {QWEN_MODEL}")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -382,152 +385,80 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ GEMINI API (структурированный JSON-вывод) ============
+# ============ QWEN (DashScope, OpenAI-совместимый API) ============
 
-GEMINI_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "signal": {"type": "STRING", "enum": ["Бычий", "Медвежий", "Нейтральный", "Смешанный"]},
-        "regime": {"type": "STRING"},
-        "tag": {"type": "STRING"},
-        "score_comment": {"type": "STRING"},
-        "confidence": {"type": "STRING", "enum": ["Низкая", "Средняя", "Высокая"]},
-        "persistence_snapshots": {"type": "INTEGER"},
-        "persistence_comment": {"type": "STRING"},
-        "pros": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "cons": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "pattern": {"type": "STRING"},
-        "dynamics": {"type": "STRING"},
-        "risks": {"type": "STRING"},
-        "heatmap": {"type": "STRING"},
-        "next_check": {"type": "STRING"},
-        "verdict": {"type": "STRING", "enum": ["НЕ ВХОДИТЬ", "НАБЛЮДАТЬ", "РАССМАТРИВАТЬ"]},
-        "verdict_reason": {"type": "STRING"},
-    },
-    "required": [
-        "signal", "regime", "tag", "score_comment", "confidence",
-        "persistence_snapshots", "persistence_comment", "pros", "cons",
-        "pattern", "dynamics", "risks", "heatmap", "next_check",
-        "verdict", "verdict_reason",
-    ],
+VERDICT_JSON_SCHEMA_HINT = """
+Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
+строго со следующими ключами и типами:
+
+{
+  "signal": "Бычий" | "Медвежий" | "Нейтральный" | "Смешанный",
+  "regime": "точное название режима из раздела 5 промпта",
+  "tag": "название тега из раздела 5 шаг 2, или строка 'нет'",
+  "score_comment": "одно короткое предложение про качество балла, без пересчёта самого балла",
+  "confidence": "Низкая" | "Средняя" | "Высокая",
+  "persistence_snapshots": число (сколько снимков реально подтверждают сигнал по логу),
+  "persistence_comment": "одно короткое предложение, почему такая устойчивость",
+  "pros": ["метрика ЗА 1", "метрика ЗА 2"],
+  "cons": ["метрика ПРОТИВ 1", "метрика ПРОТИВ 2"],
+  "pattern": "название паттерна из раздела 6, или строка 'нет'",
+  "dynamics": "1-2 предложения о том, что изменилось между снимками в логе",
+  "risks": "1-2 предложения: ликвидность, funding, OI/MktCap, BTC-корреляция",
+  "heatmap": "строка, обычно 'нет данных'",
+  "next_check": "какой снимок или условие стоит подождать дальше",
+  "verdict": "НЕ ВХОДИТЬ" | "НАБЛЮДАТЬ" | "РАССМАТРИВАТЬ",
+  "verdict_reason": "одно короткое предложение с обоснованием вердикта"
 }
 
-
-GEMINI_MODEL_FALLBACK_CHAIN = [
-    os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-]
+Никакого текста до или после JSON. Никакого markdown-форматирования внутри строк.
+"""
 
 
-def call_llm_json(system_prompt, user_message):
-    payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {"role": "user", "parts": [{"text": user_message}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 1500,
-            "responseMimeType": "application/json",
-            "responseSchema": GEMINI_RESPONSE_SCHEMA,
-        },
+def call_llm_json(system_prompt, user_message, max_retries=2):
+    url = f"{QWEN_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {QWEN_API_KEY}",
+        "Content-Type": "application/json",
     }
-
-    for model_name in GEMINI_MODEL_FALLBACK_CHAIN:
-        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{model_name}:generateContent?key={GEMINI_API_KEY}")
-
-        try:
-            resp = requests.post(url, json=payload, timeout=60)
-
-            print(f"[{model_name}] HTTP статус: {resp.status_code}")
-
-            if resp.status_code != 200:
-                print(f"[{model_name}] ПОЛНЫЙ ТЕКСТ ОШИБКИ:")
-                print(resp.text[:2000])
-
-            if resp.status_code == 429:
-                print(f"[{model_name}] 429 — пробую следующую модель в цепочке, "
-                      f"если есть.")
-                continue
-
-            if resp.status_code != 200:
-                print(f"[{model_name}] Не 429, но и не 200 — пробую следующую модель.")
-                continue
-
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                print(f"[{model_name}] Gemini не вернул candidates: {data}")
-                continue
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                print(f"[{model_name}] Gemini вернул пустой content: {candidates[0]}")
-                continue
-
-            text = parts[0].get("text", "")
-            try:
-                result = json.loads(text)
-                print(f"[{model_name}] Успешный ответ, использую его.")
-                return result
-            except json.JSONDecodeError:
-                print(f"[{model_name}] LLM вернул невалидный JSON: {text[:400]}")
-                continue
-
-        except Exception as e:
-            print(f"[{model_name}] Исключение при вызове Gemini API: {e}")
-            continue
-
-    print("Все модели в цепочке не дали результат в этом вызове.")
-    return None
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1500,
+        "response_format": {"type": "json_object"},
+    }
 
     for attempt in range(max_retries + 1):
         try:
-            resp = requests.post(url, json=payload, timeout=60)
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+            print(f"Qwen HTTP статус: {resp.status_code}")
 
             if resp.status_code == 429:
                 wait_s = 15
-                try:
-                    err = resp.json()
-                    retry_info = str(err)
-                    m = re.search(r'"retryDelay":\s*"(\d+)s"', retry_info)
-                    if m:
-                        wait_s = int(m.group(1)) + 2
-                except Exception:
-                    pass
-                print(f"429 от Gemini, жду {wait_s}с и повторяю "
+                print(f"429 от Qwen, жду {wait_s}с и повторяю "
                       f"(попытка {attempt+1}/{max_retries+1})")
+                print(f"Текст ошибки: {resp.text[:800]}")
                 time.sleep(wait_s)
                 continue
 
             if resp.status_code != 200:
-                print(f"ОШИБКА Gemini API: {resp.status_code} — {resp.text[:500]}")
+                print(f"ОШИБКА Qwen API: {resp.status_code} — {resp.text[:800]}")
                 return None
 
             data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                print(f"Gemini не вернул candidates: {data}")
-                return None
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                print(f"Gemini вернул пустой content: {candidates[0]}")
-                return None
-
-            text = parts[0].get("text", "")
+            content = data["choices"][0]["message"]["content"]
             try:
-                return json.loads(text)
+                return json.loads(content)
             except json.JSONDecodeError:
-                print(f"LLM вернул невалидный JSON, содержимое: {text[:400]}")
+                print(f"LLM вернул невалидный JSON, содержимое: {content[:500]}")
                 return None
 
         except Exception as e:
-            print(f"Исключение при вызове Gemini API: {e}")
+            print(f"Исключение при вызове Qwen API: {e}")
             return None
 
     print("Исчерпаны попытки после 429, пропускаю эту монету в этом прогоне.")
@@ -704,8 +635,7 @@ def run_once():
             "последнего снимка. Скоринг-балл и режим уже посчитаны кодом точно по "
             "формулам разделов 4-5 — не пересчитывай их, используй как готовые входные "
             "данные. Проанализируй устойчивость и качество тренда по логу (раздел 7-8), "
-            "определи паттерн (раздел 6) и вынеси вердикт (раздел 11). Ответь строго "
-            "по заданной JSON-схеме.\n\n"
+            "определи паттерн (раздел 6) и вынеси вердикт (раздел 11).\n\n"
             f"[Лог снимков — {symbol}]\n{log_table}\n\n"
             f"[Полные метрики последнего снимка]\n{full_metrics}\n\n"
             f"Скоринг-балл (уже посчитан кодом): {rec['score']}\n"
