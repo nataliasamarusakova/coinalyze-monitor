@@ -45,8 +45,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 8          # у Gemini Flash щедрый лимит, можно больше
-SLEEP_BETWEEN_LLM_CALLS = 4        # секунд, небольшая пауза для аккуратности
+MAX_LLM_CALLS_PER_RUN = 3          # у Gemini Flash щедрый лимит, можно больше
+SLEEP_BETWEEN_LLM_CALLS = 10        # секунд, небольшая пауза для аккуратности
 
 BUCKET_MAP = {
     "Healthy Trend": "bullish", "Short Squeeze Setup": "bullish",
@@ -413,10 +413,14 @@ GEMINI_RESPONSE_SCHEMA = {
 }
 
 
-def call_llm_json(system_prompt, user_message, max_retries=2):
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+GEMINI_MODEL_FALLBACK_CHAIN = [
+    os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
 
+
+def call_llm_json(system_prompt, user_message):
     payload = {
         "system_instruction": {
             "parts": [{"text": system_prompt}]
@@ -431,6 +435,55 @@ def call_llm_json(system_prompt, user_message, max_retries=2):
             "responseSchema": GEMINI_RESPONSE_SCHEMA,
         },
     }
+
+    for model_name in GEMINI_MODEL_FALLBACK_CHAIN:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model_name}:generateContent?key={GEMINI_API_KEY}")
+
+        try:
+            resp = requests.post(url, json=payload, timeout=60)
+
+            print(f"[{model_name}] HTTP статус: {resp.status_code}")
+
+            if resp.status_code != 200:
+                print(f"[{model_name}] ПОЛНЫЙ ТЕКСТ ОШИБКИ:")
+                print(resp.text[:2000])
+
+            if resp.status_code == 429:
+                print(f"[{model_name}] 429 — пробую следующую модель в цепочке, "
+                      f"если есть.")
+                continue
+
+            if resp.status_code != 200:
+                print(f"[{model_name}] Не 429, но и не 200 — пробую следующую модель.")
+                continue
+
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                print(f"[{model_name}] Gemini не вернул candidates: {data}")
+                continue
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                print(f"[{model_name}] Gemini вернул пустой content: {candidates[0]}")
+                continue
+
+            text = parts[0].get("text", "")
+            try:
+                result = json.loads(text)
+                print(f"[{model_name}] Успешный ответ, использую его.")
+                return result
+            except json.JSONDecodeError:
+                print(f"[{model_name}] LLM вернул невалидный JSON: {text[:400]}")
+                continue
+
+        except Exception as e:
+            print(f"[{model_name}] Исключение при вызове Gemini API: {e}")
+            continue
+
+    print("Все модели в цепочке не дали результат в этом вызове.")
+    return None
 
     for attempt in range(max_retries + 1):
         try:
