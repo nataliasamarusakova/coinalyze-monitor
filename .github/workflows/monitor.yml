@@ -40,34 +40,30 @@ jobs:
           curl -L -o models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
             "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
-      - name: Cache Python site-packages
-        id: cache-venv
+      - name: Cache pip packages
         uses: actions/cache@v4
         with:
-          path: /opt/hostedtoolcache/Python/3.11.15/x64/lib/python3.11/site-packages
-          key: pysite-${{ runner.os }}-py3.11-${{ hashFiles('requirements.txt') }}-v1
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Install Python dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Install Python dependencies (даёт CLI-команду playwright)
         run: |
           pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
-      - name: Cache Playwright browsers
-        id: cache-playwright
+      - name: Cache Playwright browser binaries
+        id: cache-playwright-browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-v1
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Install Playwright browser + OS deps
-        run: |
-          if [ "${{ steps.cache-playwright.outputs.cache-hit }}" == "true" ]; then
-            echo "Chromium уже в кеше, ставлю только системные зависимости..."
-            playwright install-deps chromium
-          else
-            echo "Chromium не найден в кеше, скачиваю с нуля..."
-            playwright install --with-deps chromium
-          fi
+      - name: Install Playwright Chromium (полная установка, если кеша нет)
+        if: steps.cache-playwright-browsers.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install only system deps (браузер уже в кеше)
+        if: steps.cache-playwright-browsers.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
 
       - name: Run monitor
         env:
@@ -87,6 +83,7 @@ jobs:
             debug_page.html
             debug_screenshot.png
           retention-days: 3
+          if-no-files-found: ignore
 
       - name: Commit snapshot log and state
         run: |
