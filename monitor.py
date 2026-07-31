@@ -311,7 +311,7 @@ VERDICT_JSON_SCHEMA_HINT = """
 }
 """
 
-# ============ QWEN API (ПРЯМОЙ ЗАПРОС ЧЕРЕЗ REQUESTS С ЛОГИРОВАНИЕМ) ============
+# ============ QWEN API (ПРЯМОЙ ЗАПРОС ЧЕРЕЗ REQUESTS) ============
 
 class QwenAPIClient:
     def __init__(self):
@@ -332,19 +332,23 @@ class QwenAPIClient:
         self.session.cookies.set("ssxmod_itna", "1-Yqfx0D9Dy70QDtD8Dhx_xmqGj7qWFPiQ_IYDXDULqe7UQGcD8OD0pIgfvjR3p5_A5HYAY4x4Y3PC5D/fiAeDgDW5QDbxAfb00O7y4qeCFEgDPHfjk0PqdaQDruhrF9BRGpjOHrZ7yN_TnbbCHzMW4DHxi8DBFqqBaoDeeDtx0rD0eDPxDYDGbmDneDexDdkKfAkFceOnxDX67vDiPADmRIa4ceDD5DApYDw6_vKDDzKGjxaG0qaCLAo4a5DqD1=Y8PajoD964DsrGyKjgUs5UxI3ScOHMbaSfLDCKDjc2IDmn_DNwvAFkoq7txje1ODNAeeAo=D5HY4tDxIAxdD_NA5KBr=iOYBDNioAEdsjeDDf1Aj1GIZW_YjjbltgaNlEXOmeDRIMlvMGIKBKeDKIOIbnG1nwsee4n2cle4ChdDryiG5a0dW_Gz5bmGYAGzlDBGIveREUP4bixD", domain=".qwen.ai")
         self.session.cookies.set("ssxmod_itna2", "1-Yqfx0D9Dy70QDtD8Dhx_xmqGj7qWFPiQ_IYDXDULqe7UQGcD8OD0pIgfvjR3p5_A5HYAY4x4Y3PjeDA3PxxRxrKD7PbeAbBbpxDBuDa0YUnPFp0Wwi9QaOEkl6ZOcpNuU2SuGkAAzMf=7GsUcDCrAGCNicq=BpkvhGGRWcDDSBD=iapFarOqG7hFogPWarI=noFv_iHa7D7RmgFNWHaUPhxenP_0G3v64de_9PEIxfUjr7qjKhCFrdFaA8v0GcvV8K7qi8Gph7PibK7u23kf4yzFxHwA1h4LukevcZh61n0qA7X=yZD9gSX_5aWGUGaaKrOYczAKI/u0mr2D7ymxFGxymWP8KQBvw8K7K_sKHwSRf05yBvGl5aU7H0pCiOddF/KKw8qzK9FmwfenPnBleWKVK=Zg0UohBOEKAHtqG_iHfRzGq4b8Vb5fzf_GOPI35kEIKKH6_HRWaCpGRnzSwzjbsiLa7pk5gV3pxl_6IvwFdN3HF2I3gKqkKHz7xAMqZPdLKF9OOWwhvBGvHvGcCCSW/qpYwe8wlK9ZScWMHPaOyBaKa5okqyl_KaWhSRWLKfunKHeOAmaCSljbx5YfoekwuOYDcQRkFo4h2qtBNLu=x49mIfbQHYcQhCqyIA9hnzDyuRZian0qoPgoNp40xoNwEtN1c69CgaKYw8PTXll5TgcWqtHAr072WZvSQaHDCDiGwFAo7DBre9HEY=F5qzxmx4Ua4KoW3DYi2zH7EmhNGx013GV7sVGo93PGUGqqD5Ua6Rq03Gu9n3fh8prdapWhT2tQDpGY3_=0tnqViiiDNiimdVBb_eIGxYDD", domain=".qwen.ai")
         
-        # Заголовки
+        # Заголовки (включая Accept-Encoding, который requests распакует автоматически)
         self.session.headers.update({
-            "Accept": "*/*", "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "ru-RU,ru;q=0.9",
             "Cache-Control": "no-cache", "Origin": "https://chat.qwen.ai", "Pragma": "no-cache",
-            "Referer": "https://chat.qwen.ai/", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+            "Referer": "https://chat.qwen.ai/c/guest", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Version": "0.2.81", "X-Accel-Buffering": "no", "bx-v": "2.5.37",
+            "Timezone": "Fri Jul 31 2026 12:19:48 GMT+0300",
+            "Version": "0.2.81", "X-Accel-Buffering": "no", "bx-v": "2.5.37", "source": "web",
             "sec-ch-ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
-            "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"', "source": "web"
+            "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"'
         })
         
-        self.chat_id = str(uuid.uuid4())
+        # ИСПРАВЛЕНИЕ: Используем конкретный chat_id из твоего рабочего PowerShell-скрипта
+        self.chat_id = "5bed1f3b-f915-4e58-87d1-86c8c0c0f808"
         self.url = f"https://chat.qwen.ai/api/v2/chat/completions?chat_id={self.chat_id}"
 
     def start(self):
@@ -355,22 +359,53 @@ class QwenAPIClient:
         print("QwenAPIClient: сессия закрыта.")
 
     def ask(self, full_prompt, tag="query"):
+        # Генерируем новые ID только для конкретного сообщения, но chat_id оставляем фиксированным
         fid = str(uuid.uuid4())
         children_id = str(uuid.uuid4())
+        current_ts = int(time.time())
         
+        # Payload точно как в твоем рабочем PowerShell скрипте
         payload = {
-            "stream": True, "version": "2.1", "incremental_output": True,
-            "chatId": self.chat_id, "parentId": "", "chat_id": self.chat_id,
-            "chat_mode": "guest", "model": "qwen3.7-plus", "parent_id": None,
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chatId": self.chat_id,
+            "parentId": "",
+            "chat_id": self.chat_id,
+            "chat_mode": "guest",
+            "model": "qwen3.7-plus",
+            "parent_id": None,
             "messages": [{
-                "id": None, "fid": fid, "parentId": None, "childrenIds": [children_id],
-                "role": "user", "content": full_prompt, "user_action": "chat", "files": [],
-                "timestamp": int(time.time()), "models": ["qwen3.7-plus"], "model": "",
+                "id": None,
+                "fid": fid,
+                "parentId": None,
+                "childrenIds": [children_id],
+                "role": "user",
+                "content": full_prompt,
+                "user_action": "chat",
+                "files": [],
+                "timestamp": current_ts,
+                "models": ["qwen3.7-plus"],
+                "model": "",
                 "chat_type": "t2t",
-                "feature_config": {"thinking_enabled": True, "output_schema": "phase", "research_mode": "normal", "auto_thinking": True, "thinking_mode": "Auto", "thinking_format": "summary", "auto_search": True},
-                "extra": {"meta": {"subChatType": "t2t"}}, "sub_chat_type": "t2t", "parent_id": None
+                "feature_config": {
+                    "thinking_enabled": True,
+                    "output_schema": "phase",
+                    "research_mode": "normal",
+                    "auto_thinking": True,
+                    "thinking_mode": "Auto",
+                    "thinking_format": "summary",
+                    "auto_search": True
+                },
+                "extra": {
+                    "meta": {
+                        "subChatType": "t2t"
+                    }
+                },
+                "sub_chat_type": "t2t",
+                "parent_id": None
             }],
-            "timestamp": int(time.time())
+            "timestamp": current_ts
         }
         
         headers = {
@@ -380,13 +415,11 @@ class QwenAPIClient:
             "bx-umidtoken": "T2gA0YplAt4OSXWtLJ5t9X4uGRCWxJeFTuKIQolJakatLEF9mxE_pvyaVFmfyl-Xd4E="
         }
 
-        # Файл для сохранения сырого ответа
-        debug_file = f"debug_qwen_{tag}_{int(time.time())}.log"
+        debug_file = f"debug_qwen_{tag}_{current_ts}.log"
 
         try:
             response = self.session.post(self.url, json=payload, headers=headers, stream=True, timeout=QWEN_RESPONSE_TIMEOUT_S)
             
-            # 1. Логируем HTTP статус
             print(f"[{tag}] HTTP Status: {response.status_code}")
             if response.status_code != 200:
                 print(f"[{tag}] Ошибка сервера. Тело ответа: {response.text[:500]}")
@@ -397,7 +430,6 @@ class QwenAPIClient:
             full_text = ""
             raw_lines = []
             
-            # 2. Читаем поток и пишем в файл
             with open(debug_file, "w", encoding="utf-8") as f:
                 for line in response.iter_lines(decode_unicode=True):
                     if not line: 
@@ -417,7 +449,6 @@ class QwenAPIClient:
                                 phase = delta.get("phase", "no_phase")
                                 content = delta.get("content", "")
                                 
-                                # 3. Логируем в консоль фазу и кусочек контента
                                 if content:
                                     print(f"  [{tag}] Phase: {phase} | Content: {content[:40]}...")
                                 
@@ -428,7 +459,6 @@ class QwenAPIClient:
                         except json.JSONDecodeError:
                             pass
                             
-            # 4. Если текст пуст, выводим первые строки сырого ответа в консоль
             if not full_text:
                 print(f"[{tag}] Итоговый текст пуст. Сырой ответ сохранен в {debug_file}")
                 print(f"[{tag}] Первые 3 строки сырого ответа:")
