@@ -50,7 +50,8 @@ jobs:
         run: |
           pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
-      # ... остальные шаги (Playwright) без изменений ...
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
 
       - name: Run monitor
         env:
@@ -60,3 +61,27 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           LLM_MODEL_PATH: models/qwen3.5-4b-instruct-q4_k_m.gguf
         run: python monitor.py
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            debug_page.html
+            debug_screenshot.png
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Commit snapshot log and state
+        run: |
+          git config user.name "coinalyze-bot"
+          git config user.email "actions@github.com"
+          git config merge.ours.driver true
+          git add snapshots.jsonl heartbeat.jsonl llm_state.json
+          git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if ! git pull --rebase --autostash origin main; then
+            git rebase --abort || true
+            git pull --no-rebase -X ours origin main
+          fi
+          git push
