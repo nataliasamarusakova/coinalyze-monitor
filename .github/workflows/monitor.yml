@@ -14,7 +14,8 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,8 +25,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
+      # Кэш модели
       - name: Cache LLM model
         id: cache-model
         uses: actions/cache@v4
@@ -33,13 +35,39 @@ jobs:
           path: models/Qwen3.5-4B-Q4_K_M.gguf
           key: qwen35-4b-q4km-unsloth-v1
 
+      # Скачивание модели, если нет в кэше
       - name: Download LLM model if not cached
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          curl -L -o models/Qwen3.5-4B-Q4_K_M.gguf \
+
+          curl --fail -L \
+            -o models/Qwen3.5-4B-Q4_K_M.gguf \
             "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"
 
+      # ПРОВЕРКА МОДЕЛИ
+      - name: Verify LLM model
+        run: |
+          echo "=== MODELS DIR ==="
+          ls -lah models
+
+          echo "=== FILE SIZE ==="
+          du -h models/Qwen3.5-4B-Q4_K_M.gguf
+
+          echo "=== FILE TYPE ==="
+          file models/Qwen3.5-4B-Q4_K_M.gguf
+
+          echo "=== MAGIC BYTES ==="
+          python - <<'PY'
+          path = "models/Qwen3.5-4B-Q4_K_M.gguf"
+          with open(path, "rb") as f:
+              magic = f.read(8)
+          print("Magic:", magic)
+          if magic[:4] != b"GGUF":
+              raise SystemExit("ERROR: file is not a GGUF model")
+          PY
+
+      # Кэш pip
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -48,7 +76,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          pip install -r requirements.txt \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
       - name: Install Playwright Chromium
         run: playwright install --with-deps chromium
@@ -78,10 +107,15 @@ jobs:
           git config user.name "coinalyze-bot"
           git config user.email "actions@github.com"
           git config merge.ours.driver true
+
           git add snapshots.jsonl heartbeat.jsonl llm_state.json
-          git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          git diff --cached --quiet || \
+            git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
           if ! git pull --rebase --autostash origin main; then
             git rebase --abort || true
             git pull --no-rebase -X ours origin main
           fi
+
           git push
