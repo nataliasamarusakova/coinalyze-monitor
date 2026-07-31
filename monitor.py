@@ -34,7 +34,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
 LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "600"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "220"))
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -468,7 +468,7 @@ def get_llm():
             model_path=LLM_MODEL_PATH,
             n_ctx=LLM_N_CTX,
             n_threads=n_threads,
-            n_batch=512,
+            n_batch=1024,
             chat_format="chatml",   # ChatML-формат подходит для семейства Qwen
             use_mmap=False,         # читаем модель в RAM сразу целиком, а не лениво при инференсе
             use_mlock=False,
@@ -520,6 +520,10 @@ def call_llm_json(system_prompt, user_message, max_retries=1):
                 ],
                 temperature=0.0,
                 max_tokens=LLM_MAX_TOKENS,
+                stop=[
+                    "<|im_end|>",
+                    "```"
+                ],
             )
             elapsed = time.time() - t0
             content = result["choices"][0]["message"]["content"]
