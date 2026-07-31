@@ -508,7 +508,16 @@ def extract_json_object(text):
 
 def call_llm_json(system_prompt, user_message, max_retries=1):
     llm = get_llm()
-    full_user_message = user_message + "\n\n" + RESPONSE_SCHEMA_HINT
+    full_user_message = (
+    "ВАЖНО!\n"
+    "- Не используй <think>\n"
+    "- Не выводи ход рассуждений\n"
+    "- Не объясняй анализ\n"
+    "- Верни только JSON\n\n"
+    + user_message
+    + "\n\n"
+    + RESPONSE_SCHEMA_HINT
+    )
 
     for attempt in range(max_retries + 1):
         try:
