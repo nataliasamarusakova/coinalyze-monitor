@@ -14,7 +14,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: models/qwen2.5-1.5b-instruct-q4_k_m.gguf
-          key: qwen25-1_5b-instruct-q4km-v1
+          key: qwen25-1.5b-instruct-q4km-v1
 
       - name: Download LLM model if not cached
         if: steps.cache-model.outputs.cache-hit != 'true'
@@ -39,6 +39,12 @@ jobs:
           mkdir -p models
           curl -L -o models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
             "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
         run: |
