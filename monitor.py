@@ -2,7 +2,7 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-LLM-анализ через OpenRouter (структурированный JSON) -> Telegram.
+LLM-анализ через Google Gemini (structured JSON output) -> Telegram.
 
 Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
 """
@@ -31,10 +31,8 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
-OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://github.com")
-OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Coinalyze Monitor")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -50,8 +48,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 2          # осторожно: бесплатный лимит OpenRouter может быть 50/день
-SLEEP_BETWEEN_LLM_CALLS = 10
+MAX_LLM_CALLS_PER_RUN = 6
+SLEEP_BETWEEN_LLM_CALLS = 6
 
 RETENTION_DAYS_SNAPSHOTS = 14
 RETENTION_DAYS_HEARTBEAT = 14
@@ -72,7 +70,7 @@ def bucket_of(regime):
 
 def check_env():
     required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "OPENROUTER_API_KEY"]
+                "TG_CHAT_ID", "GEMINI_API_KEY"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -81,6 +79,7 @@ def check_env():
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
     print("Все переменные окружения и файл промпта на месте.")
+    print(f"Gemini модель: {GEMINI_MODEL}")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -439,114 +438,97 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ OPENROUTER (OpenAI-совместимый API) ============
+# ============ GEMINI (structured JSON output) ============
 
-VERDICT_JSON_SCHEMA_HINT = """
-Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
-строго со следующими ключами и типами:
-
-{
-  "signal": "Бычий" | "Медвежий" | "Нейтральный" | "Смешанный",
-  "regime": "точное название режима",
-  "tag": "название тега или строка 'нет'",
-  "score_comment": "одно короткое предложение про качество балла, без пересчёта самого балла",
-  "confidence": "Низкая" | "Средняя" | "Высокая",
-  "persistence_snapshots": число (сколько снимков реально подтверждают сигнал по логу),
-  "persistence_comment": "одно короткое предложение, почему такая устойчивость",
-  "pros": ["метрика ЗА 1", "метрика ЗА 2"],
-  "cons": ["метрика ПРОТИВ 1", "метрика ПРОТИВ 2"],
-  "pattern": "название паттерна или строка 'нет'",
-  "dynamics": "1-2 предложения о том, что изменилось между снимками в логе",
-  "risks": "1-2 предложения: ликвидность, funding, OI/MktCap, BTC-корреляция, макро-контекст",
-  "heatmap": "строка, обычно 'нет данных'",
-  "next_check": "какой снимок или условие стоит подождать дальше",
-  "verdict": "НЕ ВХОДИТЬ" | "НАБЛЮДАТЬ" | "РАССМАТРИВАТЬ",
-  "verdict_reason": "одно короткое предложение с обоснованием вердикта"
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "signal": {"type": "STRING", "enum": ["Бычий", "Медвежий", "Нейтральный", "Смешанный"]},
+        "regime": {"type": "STRING"},
+        "tag": {"type": "STRING"},
+        "score_comment": {"type": "STRING"},
+        "confidence": {"type": "STRING", "enum": ["Низкая", "Средняя", "Высокая"]},
+        "persistence_snapshots": {"type": "INTEGER"},
+        "persistence_comment": {"type": "STRING"},
+        "pros": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "cons": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "pattern": {"type": "STRING"},
+        "dynamics": {"type": "STRING"},
+        "risks": {"type": "STRING"},
+        "heatmap": {"type": "STRING"},
+        "next_check": {"type": "STRING"},
+        "verdict": {"type": "STRING", "enum": ["НЕ ВХОДИТЬ", "НАБЛЮДАТЬ", "РАССМАТРИВАТЬ"]},
+        "verdict_reason": {"type": "STRING"},
+    },
+    "required": [
+        "signal", "regime", "tag", "score_comment", "confidence",
+        "persistence_snapshots", "persistence_comment", "pros", "cons",
+        "pattern", "dynamics", "risks", "heatmap", "next_check",
+        "verdict", "verdict_reason",
+    ],
 }
-
-Никакого текста до или после JSON. Никакого markdown-форматирования внутри строк.
-"""
-
-
-def extract_json(content):
-    """Пытается распарсить JSON напрямую, при неудаче — вырезает {...} regex'ом
-    (на случай, если reasoning-модель подмешала лишний текст вокруг JSON)."""
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r'\{.*\}', content, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    return None
 
 
 def call_llm_json(system_prompt, user_message, max_retries=2):
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": OPENROUTER_SITE_NAME,
+        "X-goog-api-key": GEMINI_API_KEY,
     }
     payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT},
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {"role": "user", "parts": [{"text": user_message}]}
         ],
-        "temperature": 0.1,
-        "max_tokens": 1500,
-        "response_format": {"type": "json_object"},
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 1500,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_RESPONSE_SCHEMA,
+        },
     }
 
     for attempt in range(max_retries + 1):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
-            print(f"OpenRouter HTTP статус: {resp.status_code}")
+            print(f"Gemini HTTP статус: {resp.status_code}")
 
             if resp.status_code == 429:
-                wait_s = 20
-                try:
-                    err = resp.json()
-                    print(f"429 от OpenRouter: {err}")
-                except Exception:
-                    print(f"429 от OpenRouter: {resp.text[:500]}")
-                print(f"Жду {wait_s}с (попытка {attempt+1}/{max_retries+1}). "
-                      f"Если лимит суточный — ожидание не поможет до смены суток.")
+                wait_s = 15
+                print(f"429 от Gemini: {resp.text[:600]}")
+                m = re.search(r'"retryDelay":\s*"(\d+)s"', resp.text)
+                if m:
+                    wait_s = int(m.group(1)) + 2
+                print(f"Жду {wait_s}с и повторяю (попытка {attempt+1}/{max_retries+1})")
                 time.sleep(wait_s)
                 continue
 
             if resp.status_code != 200:
-                print(f"ОШИБКА OpenRouter API: {resp.status_code} — {resp.text[:800]}")
+                print(f"ОШИБКА Gemini API: {resp.status_code} — {resp.text[:600]}")
                 return None
 
             data = resp.json()
-            choice = data.get("choices", [{}])[0]
-            message = choice.get("message", {})
-            content = message.get("content", "") or ""
-            finish_reason = choice.get("finish_reason", "")
-
-            print(f"finish_reason: {finish_reason}, длина content: {len(content)}")
-            if finish_reason == "length":
-                print("ПРЕДУПРЕЖДЕНИЕ: ответ обрезан по лимиту токенов (finish_reason=length), "
-                      "рассмотрите увеличение max_tokens.")
-
-            if not content:
-                print(f"OpenRouter вернул пустой content. Полный ответ: {data}")
+            candidates = data.get("candidates", [])
+            if not candidates:
+                print(f"Gemini не вернул candidates: {data}")
                 return None
 
-            result = extract_json(content)
-            if result is None:
-                print(f"LLM вернул невалидный JSON, содержимое: {content[:600]}")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                print(f"Gemini вернул пустой content: {candidates[0]}")
                 return None
-            return result
+
+            text = parts[0].get("text", "")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                print(f"LLM вернул невалидный JSON: {text[:500]}")
+                return None
 
         except Exception as e:
-            print(f"Исключение при вызове OpenRouter API: {e}")
+            print(f"Исключение при вызове Gemini API: {e}")
             return None
 
     print("Исчерпаны попытки после 429, пропускаю эту монету в этом прогоне.")
