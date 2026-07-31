@@ -30,15 +30,15 @@ jobs:
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: models/qwen3.5-4b-instruct-q4_k_m.gguf
-          key: qwen35-4b-instruct-q4km-v1
+          path: models/Qwen3.5-4B-Q4_K_M.gguf
+          key: qwen35-4b-q4km-unsloth-v1
 
       - name: Download LLM model if not cached
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          curl -L -o models/qwen3.5-4b-instruct-q4_k_m.gguf \
-            "https://huggingface.co/Qwen/Qwen3.5-4B-Instruct-GGUF/resolve/main/qwen3.5-4b-instruct-q4_k_m.gguf"
+          curl -L -o models/Qwen3.5-4B-Q4_K_M.gguf \
+            "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -59,7 +59,7 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          LLM_MODEL_PATH: models/qwen3.5-4b-instruct-q4_k_m.gguf
+          LLM_MODEL_PATH: models/Qwen3.5-4B-Q4_K_M.gguf
         run: python monitor.py
 
       - name: Upload debug artifacts on failure
