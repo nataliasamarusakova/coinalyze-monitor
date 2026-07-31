@@ -2,9 +2,9 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-LLM-анализ через Groq (структурированный JSON) -> Telegram.
+LLM-анализ через OpenRouter (структурированный JSON) -> Telegram.
 
-Запускается по внешнему триггеру (cron-job.org -> GitHub Actions workflow_dispatch).
+Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
 """
 
 import os
@@ -31,8 +31,10 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
+OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://github.com")
+OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Coinalyze Monitor")
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -48,8 +50,12 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 5
-SLEEP_BETWEEN_LLM_CALLS = 15
+
+# Осторожные настройки под лимит OpenRouter free-tier без пополнения баланса
+# (20 запросов/мин, 50 запросов/день). Если баланс пополнен на $10+ —
+# увеличьте MAX_LLM_CALLS_PER_RUN и уменьшите REANALYSIS_COOLDOWN_MINUTES.
+MAX_LLM_CALLS_PER_RUN = 2
+SLEEP_BETWEEN_LLM_CALLS = 10
 
 RETENTION_DAYS_SNAPSHOTS = 14
 RETENTION_DAYS_HEARTBEAT = 14
@@ -70,7 +76,7 @@ def bucket_of(regime):
 
 def check_env():
     required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "GROQ_API_KEY"]
+                "TG_CHAT_ID", "OPENROUTER_API_KEY"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -79,6 +85,7 @@ def check_env():
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
     print("Все переменные окружения и файл промпта на месте.")
+    print(f"OpenRouter модель: {OPENROUTER_MODEL}")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -437,7 +444,7 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ GROQ (OpenAI-совместимый API) ============
+# ============ OPENROUTER (OpenAI-совместимый API) ============
 
 VERDICT_JSON_SCHEMA_HINT = """
 Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
@@ -467,13 +474,15 @@ VERDICT_JSON_SCHEMA_HINT = """
 
 
 def call_llm_json(system_prompt, user_message, max_retries=2):
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_SITE_URL,
+        "X-Title": OPENROUTER_SITE_NAME,
     }
     payload = {
-        "model": GROQ_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT},
@@ -481,37 +490,50 @@ def call_llm_json(system_prompt, user_message, max_retries=2):
         "temperature": 0.1,
         "max_tokens": 1200,
         "response_format": {"type": "json_object"},
+        "reasoning": {"enabled": False},
     }
 
     for attempt in range(max_retries + 1):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
-            print(f"Groq HTTP статус: {resp.status_code}")
+            print(f"OpenRouter HTTP статус: {resp.status_code}")
 
             if resp.status_code == 429:
                 wait_s = 20
-                m = re.search(r"try again in ([\d.]+)s", resp.text)
-                if m:
-                    wait_s = float(m.group(1)) + 2
-                print(f"429 от Groq, жду {wait_s:.1f}с "
-                      f"(попытка {attempt+1}/{max_retries+1})")
+                try:
+                    err = resp.json()
+                    print(f"429 от OpenRouter: {err}")
+                except Exception:
+                    print(f"429 от OpenRouter: {resp.text[:500]}")
+                print(f"Жду {wait_s}с (попытка {attempt+1}/{max_retries+1}). "
+                      f"Если лимит суточный (50/день без пополнения баланса) — "
+                      f"ожидание не поможет до смены суток.")
                 time.sleep(wait_s)
                 continue
 
             if resp.status_code != 200:
-                print(f"ОШИБКА Groq API: {resp.status_code} — {resp.text[:500]}")
+                print(f"ОШИБКА OpenRouter API: {resp.status_code} — {resp.text[:500]}")
                 return None
 
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            choices = data.get("choices", [])
+            if not choices:
+                print(f"OpenRouter не вернул choices: {data}")
+                return None
+
+            content = choices[0].get("message", {}).get("content", "")
+            if not content:
+                print(f"OpenRouter вернул пустой content: {data}")
+                return None
+
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
-                print(f"LLM вернул невалидный JSON: {content[:400]}")
+                print(f"LLM вернул невалидный JSON: {content[:500]}")
                 return None
 
         except Exception as e:
-            print(f"Исключение при вызове Groq API: {e}")
+            print(f"Исключение при вызове OpenRouter API: {e}")
             return None
 
     print("Исчерпаны попытки после 429, пропускаю эту монету в этом прогоне.")
