@@ -2,7 +2,8 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-LLM-анализ через Gemini (structured output, fallback по моделям) -> Telegram.
+ЛОКАЛЬНЫЙ LLM-анализ (Qwen2.5-1.5B-Instruct, GGUF, через llama-cpp-python,
+с грамматикой, гарантирующей валидный JSON) -> Telegram.
 
 Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
 """
@@ -31,16 +32,9 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-# Цепочка моделей: пробуем по порядку, пока одна не даст валидный ответ.
-# gemini-flash-latest исключён специально — сейчас указывает на gemini-3.6-flash
-# с лимитом всего 20 запросов/день на бесплатном тарифе.
-GEMINI_MODEL_CHAIN = [
-    os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-]
+LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "6144"))
+LLM_N_THREADS = int(os.environ.get("LLM_N_THREADS", "2"))
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -56,8 +50,11 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 5
-SLEEP_BETWEEN_LLM_CALLS = 6
+
+# Локальная модель на 2 CPU-ядрах — не лимиты API, а реальное время расходуем.
+# Не завышайте сразу, лучше поднять после проверки реального времени на инференс.
+MAX_LLM_CALLS_PER_RUN = 4
+SLEEP_BETWEEN_LLM_CALLS = 1
 
 RETENTION_DAYS_SNAPSHOTS = 14
 RETENTION_DAYS_HEARTBEAT = 14
@@ -77,8 +74,7 @@ def bucket_of(regime):
 
 
 def check_env():
-    required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "GEMINI_API_KEY"]
+    required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -86,8 +82,10 @@ def check_env():
     if not os.path.exists(PROMPT_FILE):
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
-    print("Все переменные окружения и файл промпта на месте.")
-    print(f"Цепочка моделей Gemini: {GEMINI_MODEL_CHAIN}")
+    if not os.path.exists(LLM_MODEL_PATH):
+        print(f"ОШИБКА: не найден файл модели {LLM_MODEL_PATH}.")
+        sys.exit(1)
+    print("Все переменные окружения, промпт и файл модели на месте.")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -446,132 +444,118 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ GEMINI (structured output, fallback по моделям) ============
+# ============ ЛОКАЛЬНАЯ LLM (Qwen2.5-1.5B-Instruct GGUF, через llama-cpp-python) ============
 
-GEMINI_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "signal": {"type": "STRING", "enum": ["Бычий", "Медвежий", "Нейтральный", "Смешанный"]},
-        "regime": {"type": "STRING"},
-        "tag": {"type": "STRING"},
-        "score_comment": {"type": "STRING"},
-        "confidence": {"type": "STRING", "enum": ["Низкая", "Средняя", "Высокая"]},
-        "persistence_snapshots": {"type": "INTEGER"},
-        "persistence_comment": {"type": "STRING"},
-        "pros": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "cons": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "pattern": {"type": "STRING"},
-        "dynamics": {"type": "STRING"},
-        "risks": {"type": "STRING"},
-        "heatmap": {"type": "STRING"},
-        "next_check": {"type": "STRING"},
-        "verdict": {"type": "STRING", "enum": ["НЕ ВХОДИТЬ", "НАБЛЮДАТЬ", "РАССМАТРИВАТЬ"]},
-        "verdict_reason": {"type": "STRING"},
-    },
-    "required": [
-        "signal", "regime", "tag", "score_comment", "confidence",
-        "persistence_snapshots", "persistence_comment", "pros", "cons",
-        "pattern", "dynamics", "risks", "heatmap", "next_check",
-        "verdict", "verdict_reason",
-    ],
+VERDICT_JSON_SCHEMA_HINT = """
+Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
+строго со следующими ключами:
+
+{
+  "signal": "Бычий | Медвежий | Нейтральный | Смешанный",
+  "regime": "точное название режима",
+  "tag": "название тега или 'нет'",
+  "score_comment": "одно короткое предложение про качество балла",
+  "confidence": "Низкая | Средняя | Высокая",
+  "persistence_snapshots": число,
+  "persistence_comment": "одно короткое предложение",
+  "pros": ["метрика ЗА 1", "метрика ЗА 2"],
+  "cons": ["метрика ПРОТИВ 1", "метрика ПРОТИВ 2"],
+  "pattern": "название паттерна или 'нет'",
+  "dynamics": "1-2 предложения о динамике между снимками",
+  "risks": "1-2 предложения о рисках",
+  "heatmap": "нет данных",
+  "next_check": "что ждать дальше",
+  "verdict": "НЕ ВХОДИТЬ | НАБЛЮДАТЬ | РАССМАТРИВАТЬ",
+  "verdict_reason": "одно предложение с обоснованием"
 }
+Никакого текста до или после JSON.
+"""
+
+# Грамматика GBNF — гарантирует синтаксически валидный JSON на выходе модели,
+# независимо от того, насколько маленькая и не всегда аккуратная модель.
+JSON_GRAMMAR_STR = r"""
+root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\"" (
+    [^"\\\x7F\x00-\x1F] |
+    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+  )* "\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9]{1,16})? ws
+
+ws ::= | " " | "\n" [ \t]{0,20}
+"""
+
+_llm_instance = None
+_llm_grammar = None
 
 
-def call_gemini_single(model_name, system_prompt, user_message):
-    """Один запрос к конкретной модели. Возвращает (result_dict_or_None, status_code_or_None, wait_hint_seconds)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY,
-    }
-    payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {"role": "user", "parts": [{"text": user_message}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 3000,
-            "responseMimeType": "application/json",
-            "responseSchema": GEMINI_RESPONSE_SCHEMA,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }
+def get_llm():
+    global _llm_instance, _llm_grammar
+    if _llm_instance is None:
+        from llama_cpp import Llama, LlamaGrammar
+        print(f"Загружаю локальную модель из {LLM_MODEL_PATH} ...")
+        t0 = time.time()
+        _llm_instance = Llama(
+            model_path=LLM_MODEL_PATH,
+            n_ctx=LLM_N_CTX,
+            n_threads=LLM_N_THREADS,
+            n_batch=512,
+            verbose=False,
+        )
+        _llm_grammar = LlamaGrammar.from_string(JSON_GRAMMAR_STR)
+        print(f"Модель загружена за {time.time() - t0:.1f}с.")
+    return _llm_instance, _llm_grammar
 
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        print(f"[{model_name}] HTTP статус: {resp.status_code}")
 
-        if resp.status_code == 200:
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                print(f"[{model_name}] Gemini не вернул candidates: {data}")
-                return None, 200, None
+def call_llm_json(system_prompt, user_message, max_retries=1):
+    llm, grammar = get_llm()
+    full_user_message = user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT
 
-            finish_reason = candidates[0].get("finishReason")
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                print(f"[{model_name}] Пустой content, finishReason={finish_reason}: {candidates[0]}")
-                return None, 200, None
-
-            text = parts[0].get("text", "")
-            if finish_reason == "MAX_TOKENS":
-                print(f"[{model_name}] Ответ обрезан по MAX_TOKENS, длина текста: {len(text)}")
+    for attempt in range(max_retries + 1):
+        try:
+            t0 = time.time()
+            result = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": full_user_message},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+                grammar=grammar,
+            )
+            elapsed = time.time() - t0
+            content = result["choices"][0]["message"]["content"]
+            print(f"Локальный инференс занял {elapsed:.1f}с, символов ответа: {len(content)}")
 
             try:
-                return json.loads(text), 200, None
+                return json.loads(content)
             except json.JSONDecodeError:
-                print(f"[{model_name}] LLM вернул невалидный/обрезанный JSON "
-                      f"(finishReason={finish_reason}): {text[:600]}")
-                return None, 200, None
+                print(f"LLM вернул невалидный JSON (попытка {attempt+1}): {content[:500]}")
+                if attempt < max_retries:
+                    continue
+                return None
 
-        wait_hint = None
-        if resp.status_code == 429:
-            m = re.search(r'"retryDelay":\s*"(\d+)s"', resp.text)
-            if not m:
-                m = re.search(r"retry in ([\d.]+)s", resp.text)
-            if m:
-                wait_hint = float(m.group(1)) + 2
-            print(f"[{model_name}] 429: {resp.text[:500]}")
-        elif resp.status_code == 503:
-            print(f"[{model_name}] 503 (модель перегружена): {resp.text[:300]}")
-        else:
-            print(f"[{model_name}] ОШИБКА {resp.status_code}: {resp.text[:500]}")
-
-        return None, resp.status_code, wait_hint
-
-    except Exception as e:
-        print(f"[{model_name}] Исключение при вызове Gemini API: {e}")
-        return None, None, None
-
-
-def call_llm_json(system_prompt, user_message):
-    """
-    Пробует модели по цепочке GEMINI_MODEL_CHAIN.
-    На 429/503 у конкретной модели — один retry с ожиданием, затем переход к следующей модели.
-    """
-    for model_name in GEMINI_MODEL_CHAIN:
-        for attempt in range(2):  # первая попытка + один retry на эту же модель
-            result, status, wait_hint = call_gemini_single(model_name, system_prompt, user_message)
-
-            if result is not None:
-                return result
-
-            if status in (429, 503) and attempt == 0:
-                wait_s = wait_hint if wait_hint else (15 if status == 429 else 8)
-                print(f"[{model_name}] Жду {wait_s:.1f}с перед повтором той же модели...")
-                time.sleep(wait_s)
+        except Exception as e:
+            print(f"Исключение при локальном инференсе: {e}")
+            if attempt < max_retries:
                 continue
+            return None
 
-            # Невалидный JSON, другая ошибка, либо повтор тоже не помог — пробуем следующую модель
-            break
-
-        print(f"Модель {model_name} не дала результат, пробую следующую в цепочке (если есть)...")
-
-    print("Все модели в цепочке не дали результат для этого запроса.")
     return None
 
 
@@ -745,7 +729,7 @@ def run_once():
                   f"отложено до следующего тика")
             continue
 
-        print(f"  [{symbol}] отправляю на LLM-анализ ({len(snaps)} снимков в истории)")
+        print(f"  [{symbol}] отправляю на локальный LLM-анализ ({len(snaps)} снимков в истории)")
 
         log_table = build_snapshot_log_table(snaps)
         full_metrics = format_full_metrics(rec)
