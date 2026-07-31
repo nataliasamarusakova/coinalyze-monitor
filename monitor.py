@@ -33,7 +33,7 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
-LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
+LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "8192"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "700"))
 
 URL = ("https://coinalyze.net/"
