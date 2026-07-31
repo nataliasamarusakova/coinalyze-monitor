@@ -1,16 +1,10 @@
-"""
-coinalyze_monitor.py
-Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
-JSONL лог снимков -> сборка мини-истории по кандидатам ->
-LLM-анализ через гостевой веб-чат chat.qwen.ai (Playwright) -> Telegram.
-"""
-
 import os
 import re
 import sys
 import time
 import json
 import html
+import uuid
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
@@ -30,8 +24,7 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-QWEN_CHAT_URL = "https://chat.qwen.ai/"
-QWEN_RESPONSE_TIMEOUT_S = 90
+QWEN_RESPONSE_TIMEOUT_S = 120 # Увеличил таймаут, так как генерация может быть долгой
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -46,7 +39,7 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 4          # браузерные вызовы медленные, не разгоняем
+MAX_LLM_CALLS_PER_RUN = 4
 SLEEP_BETWEEN_LLM_CALLS = 5
 
 BUCKET_MAP = {
@@ -74,7 +67,7 @@ def check_env():
     if not os.path.exists(PROMPT_FILE):
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
-    print("Все переменные окружения и файл промпта на месте. LLM: гостевой веб-чат Qwen.")
+    print("Все переменные окружения и файл промпта на месте. LLM: прямой API Qwen.")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -166,7 +159,7 @@ def fetch_rows_via_browser():
             page.wait_for_selector("tbody tr", timeout=20000)
             html_content = page.content()
         except Exception as e:
-            print(f"Ошибка загрузки: {e}")
+            print(f"Ошибка загрузки Coinalyze: {e}")
             try:
                 html_content = page.content()
             except Exception:
@@ -407,149 +400,170 @@ VERDICT_JSON_SCHEMA_HINT = """
 """
 
 
-# ============ QWEN — ГОСТЕВОЙ ВЕБ-ЧАТ ЧЕРЕЗ PLAYWRIGHT ============
+# ============ QWEN — ПРЯМОЙ API ЧЕРЕЗ REQUESTS ============
 
-class QwenWebClient:
-    """Управляет одним экземпляром браузера на весь прогон, чтобы не
-    перезапускать Chromium под каждую монету — это дорого по времени."""
+class QwenAPIClient:
+    """Использует requests для прямых POST-запросов к API чата Qwen."""
 
     def __init__(self):
-        self._pw = None
-        self._browser = None
+        self.session = requests.Session()
+        
+        # 1. Устанавливаем куки
+        self.session.cookies.set("x-ap", "eu-central-1", domain="chat.qwen.ai")
+        self.session.cookies.set("_bl_uid", "L5mtgn9qe3plIbkk3j0Rfatrh0X4", domain="chat.qwen.ai")
+        self.session.cookies.set("sca", "0861eb56", domain=".qwen.ai")
+        self.session.cookies.set("cna", "6KxSIoDs1ykCASXWRtXdA0XL", domain=".qwen.ai")
+        self.session.cookies.set("xlly_s", "1", domain=".qwen.ai")
+        self.session.cookies.set("acw_tc", "0a06abd917854894453041498e3a1c5f6b9c38f4b7f5e20958ee98a205138f", domain="chat.qwen.ai")
+        self.session.cookies.set("qwen-theme", "light", domain="chat.qwen.ai")
+        self.session.cookies.set("qwen-locale", "ru-RU", domain="chat.qwen.ai")
+        self.session.cookies.set("atpsida", "bb80167bcc6276730aa84095_1785489588_15", domain=".qwen.ai")
+        self.session.cookies.set("tfstk", "ginZLlTnShKwdvdoUYq2T6jjwEZT4oRW0mNbnxD0C5VM6mZ4nWkV1VMjno-4tjFi1R9Ti-qtAVsb1CEqnbZ2NQtWVAHTkoAWNymaGKZT3Rb0isZ3t8E4IBqhL4kTDoAB6qvSvAhZtjsuSovUx-ycIojGSpr3H-EcjrjG-6VLnoq0o5fnK-2lj1V0ipk39-q0ij4MLkVLnoVmiocjKzaA2-UMBM3zxUsqzPPoIWSrwmyM7WK86ijmYRkUZAbAmimUQPoeHEFatPgmeznsCnSLfYu3xRlDqCqnE2k77cRPfSUqYfuq1K_YLqkm2lEPnhDUb5zobPBGbbDEn4aEALx8blVillHfUCMEbfMtYx6c-lrs8zoaq3CgG2Mr0-ovMHlrI4cmugu5MJj19m3NiZzgpJPWLp5f8GBWXWL88ZQY51yUNdvfkZUgpJPWLp7AkPHzL7998", domain=".qwen.ai")
+        self.session.cookies.set("isg", "BMjIrwGSNofWcVmkjIBDspwwmTbacSx7Hy_TNoJ8l8M3XW7HJoVwC9gb1S0t7eRT", domain=".qwen.ai")
+        self.session.cookies.set("ssxmod_itna", "1-Yqfx0D9Dy70QDtD8Dhx_xmqGj7qWFPiQ_IYDXDULqe7UQGcD8OD0pIgfvjR3p5_A5HYAY4x4Y3PC5D/fiAeDgDW5QDbxAfb00O7y4qeCFEgDPHfjk0PqdaQDruhrF9BRGpjOHrZ7yN_TnbbCHzMW4DHxi8DBFqqBaoDeeDtx0rD0eDPxDYDGbmDneDexDdkKfAkFceOnxDX67vDiPADmRIa4ceDD5DApYDw6_vKDDzKGjxaG0qaCLAo4a5DqD1=Y8PajoD964DsrGyKjgUs5UxI3ScOHMbaSfLDCKDjc2IDmn_DNwvAFkoq7txje1ODNAeeAo=D5HY4tDxIAxdD_NA5KBr=iOYBDNioAEdsjeDDf1Aj1GIZW_YjjbltgaNlEXOmeDRIMlvMGIKBKeDKIOIbnG1nwsee4n2cle4ChdDryiG5a0dW_Gz5bmGYAGzlDBGIveREUP4bixD", domain=".qwen.ai")
+        self.session.cookies.set("ssxmod_itna2", "1-Yqfx0D9Dy70QDtD8Dhx_xmqGj7qWFPiQ_IYDXDULqe7UQGcD8OD0pIgfvjR3p5_A5HYAY4x4Y3PjeDA3PxxRxrKD7PbeAbBbpxDBuDa0YUnPFp0Wwi9QaOEkl6ZOcpNuU2SuGkAAzMf=7GsUcDCrAGCNicq=BpkvhGGRWcDDSBD=iapFarOqG7hFogPWarI=noFv_iHa7D7RmgFNWHaUPhxenP_0G3v64de_9PEIxfUjr7qjKhCFrdFaA8v0GcvV8K7qi8Gph7PibK7u23kf4yzFxHwA1h4LukevcZh61n0qA7X=yZD9gSX_5aWGUGaaKrOYczAKI/u0mr2D7ymxFGxymWP8KQBvw8K7K_sKHwSRf05yBvGl5aU7H0pCiOddF/KKw8qzK9FmwfenPnBleWKVK=Zg0UohBOEKAHtqG_iHfRzGq4b8Vb5fzf_GOPI35kEIKKH6_HRWaCpGRnzSwzjbsiLa7pk5gV3pxl_6IvwFdN3HF2I3gKqkKHz7xAMqZPdLKF9OOWwhvBGvHvGcCCSW/qpYwe8wlK9ZScWMHPaOyBaKa5okqyl_KaWhSRWLKfunKHeOAmaCSljbx5YfoekwuOYDcQRkFo4h2qtBNLu=x49mIfbQHYcQhCqyIA9hnzDyuRZian0qoPgoNp40xoNwEtN1c69CgaKYw8PTXll5TgcWqtHAr072WZvSQaHDCDiGwFAo7DBre9HEY=F5qzxmx4Ua4KoW3DYi2zH7EmhNGx013GV7sVGo93PGUGqqD5Ua6Rq03Gu9n3fh8prdapWhT2tQDpGY3_=0tnqViiiDNiimdVBb_eIGxYDD", domain=".qwen.ai")
+        
+        # 2. Устанавливаем заголовки
+        self.session.headers.update({
+            "Accept": "*/*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Origin": "https://chat.qwen.ai",
+            "Pragma": "no-cache",
+            "Referer": "https://chat.qwen.ai/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Version": "0.2.81",
+            "X-Accel-Buffering": "no",
+            "bx-v": "2.5.37",
+            "sec-ch-ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "source": "web"
+        })
+        
+        self.chat_id = str(uuid.uuid4())
+        self.parent_id = ""
+        self.url = f"https://chat.qwen.ai/api/v2/chat/completions?chat_id={self.chat_id}"
 
     def start(self):
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=True)
-        print("QwenWebClient: браузер запущен.")
+        print("QwenAPIClient: сессия requests инициализирована (без браузера).")
 
     def stop(self):
-        try:
-            if self._browser:
-                self._browser.close()
-        finally:
-            if self._pw:
-                self._pw.stop()
-        print("QwenWebClient: браузер остановлен.")
-
-    def _find_input_box(self, page):
-        selectors = [
-            "textarea[placeholder]",
-            "textarea",
-            "div[contenteditable='true']",
-        ]
-        for sel in selectors:
-            try:
-                loc = page.locator(sel).first
-                loc.wait_for(state="visible", timeout=8000)
-                return loc
-            except Exception:
-                continue
-        return None
-
-    def _dismiss_popups(self, page):
-        for text in ["Accept", "Принять", "Got it", "Понятно", "Close", "Закрыть"]:
-            try:
-                btn = page.get_by_text(text, exact=False)
-                if btn.count() > 0:
-                    btn.first.click(timeout=1500)
-            except Exception:
-                pass
-
-    def _submit(self, page, input_box, full_prompt):
-        input_box.click()
-        input_box.fill(full_prompt)
-        page.wait_for_timeout(300)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(1200)
-
-        still_there = ""
-        try:
-            still_there = input_box.input_value()
-        except Exception:
-            try:
-                still_there = input_box.inner_text()
-            except Exception:
-                still_there = ""
-
-        if still_there and full_prompt[:15] in still_there:
-            for sel in ["button[aria-label*='Send']", "button[aria-label*='Отправить']",
-                        "button[type='submit']", "[data-testid*='send']"]:
-                try:
-                    btn = page.locator(sel).first
-                    btn.click(timeout=3000)
-                    break
-                except Exception:
-                    continue
-
-    def _wait_for_completion(self, page, timeout_s):
-        deadline = time.time() + timeout_s
-        last_text = ""
-        stable_ticks = 0
-        while time.time() < deadline:
-            candidates = page.locator(
-                "div[class*='markdown'], div[class*='message-content'], "
-                "div[class*='assistant']"
-            )
-            count = candidates.count()
-            if count == 0:
-                time.sleep(1.5)
-                continue
-            try:
-                current = candidates.nth(count - 1).inner_text()
-            except Exception:
-                current = ""
-            if current and current == last_text:
-                stable_ticks += 1
-            else:
-                stable_ticks = 0
-            last_text = current
-            if stable_ticks >= 3 and current.strip():
-                return current
-            time.sleep(1.5)
-        return last_text or None
+        self.session.close()
+        print("QwenAPIClient: сессия закрыта.")
 
     def ask(self, full_prompt, tag="query"):
-        context = self._browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
-            viewport={"width": 1400, "height": 900},
-            locale="ru-RU",
-        )
-        page = context.new_page()
-        stealth_sync(page)
+        fid = str(uuid.uuid4())
+        children_id = str(uuid.uuid4())
+        
+        # Тело запроса (JSON)
+        payload = {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chatId": self.chat_id,
+            "parentId": self.parent_id,
+            "chat_id": self.chat_id,
+            "chat_mode": "guest",
+            "model": "qwen3.7-plus",
+            "parent_id": self.parent_id if self.parent_id else None,
+            "messages": [
+                {
+                    "id": None,
+                    "fid": fid,
+                    "parentId": None,
+                    "childrenIds": [children_id],
+                    "role": "user",
+                    "content": full_prompt,
+                    "user_action": "chat",
+                    "files": [],
+                    "timestamp": int(time.time()),
+                    "models": ["qwen3.7-plus"],
+                    "model": "",
+                    "chat_type": "t2t",
+                    "feature_config": {
+                        "thinking_enabled": True,
+                        "output_schema": "phase",
+                        "research_mode": "normal",
+                        "auto_thinking": True,
+                        "thinking_mode": "Auto",
+                        "thinking_format": "summary",
+                        "auto_search": True
+                    },
+                    "extra": {
+                        "meta": {
+                            "subChatType": "t2t"
+                        }
+                    },
+                    "sub_chat_type": "t2t",
+                    "parent_id": None
+                }
+            ],
+            "timestamp": int(time.time())
+        }
+        
+        # Специфичные заголовки для запроса
+        headers = {
+            "Content-Type": "application/json",
+            "X-Request-Id": str(uuid.uuid4()),
+            # Эти токены нужны для обхода защиты. Если API начнет их жестко валидировать 
+            # на каждый запрос (они могут протухать), их нужно будет генерировать или убрать.
+            "bx-ua": "231!5k/3K4mU+Uz+jm84K1UYZk8FEl2ZWfPwIPF92lBLek2KxVW/XJ2EwruCiDOX5b/I+qgf53/a7+p5Du93W+Q285toB9wbOgRQ4wYEFTV5DnVyEay11Qpk036jS7iTS5zUMSx2nDgB49mJtUTvY/F2cIT7vh49C03zGRPF3xHu2f4rH7lo9mgSDjD+uw8e+Zd++6WF1cCXuggpHJBh+++j+ygU3+jOKs0IRCiTFkk3+ROkk0mkkM1V6AO6B2qI6onY80ojLtD4RxJqpm2tFtWivVUkPo/J/t1cuHLm1d8JoniRtWMaV/4qKrQ1iwVg7/PDFVIbG9UQXRcznRq37HkLYTurOe0RDne2R+eSHQipd+D0Ts6BXp/2V0knfi1JHFeAOVM0Kg+IEGsFUgl2Q4keQw9TkvmbD5f/KeR8KIN3BuvPDDtEoHaIPoTnICb2FGvq54ZyL1t3COmIJJ54lC6wG4ZhIHr6/5+2EfJIuJ7T3MeZp7LwgViJrdQlsbLXA41aCEFUMVbrANyQD4OgOq7bTL95DqWv8jALQM73bruZ7hT0ZN/2IuPcgiHUADPirY50JsvwNeMf8eVInIzkqrRjNpXC9bfR5McTqPAnpeGT0VGT5CvFie/1EoBTs/OITbk6vhPQPcttlCHcjTrq7I21oqZUZft+T1+Zgcdr1YpW4kzGvnPo9bGx6EytZwUoLWoSnPKTYid5oNg7BehMoND/dXGnKuTiDJWaANWboqlQj4BrvChTX/x1HOBbKkYsfxPNXrh5Q5oaqeCYeJEyQvRI/ANFHsTTH40EBgPGQHYr4tbxRTK5lgx5WmIkOdg7/vt1tjPLW//XXQ7DphX7db/g2tYFsTTzrSiUgsA7DxwnV821Ii5fS07iTv5TChWhSXwcRFcYjXVwK8tZBsDrCxEeH01CHXFfDq3CsIsP2nzXtBclsU1ppmsbYBz/XBQZV0kIjHJhSZFgrBrrP1Lropf9NrHWagbzeWCFR/5PEDwhKfRYlLesXsFdB3PYrejFkFZfGKYUmzRMBJ5ax2IJClhVP7RNvB+dx4alaL6EQ4k/8coD1wffz2uWn/fOtrUmC0Em9dOSk+Vyld/P6BUcx9IRTx6bpvfsHmf39mPr5h4wYi/Y4MzVRX+TGXoV8RRQuuLhlzxfgJkHOshSpaJeqRkxArkt3cuzZJLsvIFKLbY2s5SE2qNxe6YIKYPhKQFgjiYerWAh8MxNQjEhwDo06fVNftkYiB5Z+rWO8y90wqFk9I4IllnhNzzLuxqClaw4cYo1dHNJi/WA/sc3twj5y8HmMM46pzfsOvvGYIB7TImesp12k5vNug53Eq8VUJd9eAKhO7gDrLLvA8KI1dqE3Ce40igWHD+vTFPfFOdE7uZTBL7Za5ZT7E/CwhZ3H2H5dAcHhl61w7LKlrJg66x8NhD6DBv/xlXG/rf0fX+9jqKPmBVKlJHsKmlRuL0fDGbkPACb0RFq3wVba1fOdpPrKSlbJokgftLk6GFf3aRLzEkN2wZ7xGJ8XiQAihgISsHVswVF0XijYWS=",
+            "bx-umidtoken": "T2gA0YplAt4OSXWtLJ5t9X4uGRCWxJeFTuKIQolJakatLEF9mxE_pvyaVFmfyl-Xd4E="
+        }
+
         try:
-            page.goto(QWEN_CHAT_URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(2500)
-            self._dismiss_popups(page)
-
-            input_box = self._find_input_box(page)
-            if input_box is None:
-                print(f"[{tag}] Не найдено поле ввода чата — вероятно, изменилась "
-                      f"разметка страницы или сработала защита. См. debug-файлы.")
-                page.screenshot(path=f"debug_qwen_{tag}_no_input.png", full_page=True)
-                with open(f"debug_qwen_{tag}_no_input.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                return None
-
-            self._submit(page, input_box, full_prompt)
-            answer = self._wait_for_completion(page, QWEN_RESPONSE_TIMEOUT_S)
-
-            if not answer:
-                print(f"[{tag}] Не удалось получить ответ от чата за "
-                      f"{QWEN_RESPONSE_TIMEOUT_S}с. Сохраняю debug-скриншот.")
-                page.screenshot(path=f"debug_qwen_{tag}_timeout.png", full_page=True)
-
-            return answer
-
+            # stream=True важен, так как сервер отдает Server-Sent Events (SSE)
+            response = self.session.post(
+                self.url,
+                json=payload,
+                headers=headers,
+                stream=True,
+                timeout=QWEN_RESPONSE_TIMEOUT_S
+            )
+            response.raise_for_status()
+            
+            full_text = ""
+            # Читаем поток SSE
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                    
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        # Qwen обычно кладет текст либо в "content", либо в "choices"
+                        if "content" in chunk:
+                            full_text += chunk["content"]
+                        elif "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                full_text += delta["content"]
+                    except json.JSONDecodeError:
+                        pass
+                elif line.startswith("{"):
+                    # Фоллбек на случай, если сервер вдруг вернет обычный JSON построчно
+                    try:
+                        chunk = json.loads(line)
+                        if "content" in chunk:
+                            full_text += chunk["content"]
+                    except:
+                        pass
+                        
+            if not full_text:
+                print(f"[{tag}] Пустой ответ от API.")
+                
+            return full_text
+            
         except Exception as e:
-            print(f"[{tag}] Ошибка при работе с chat.qwen.ai: {e}")
-            try:
-                page.screenshot(path=f"debug_qwen_{tag}_error.png", full_page=True)
-            except Exception:
-                pass
+            print(f"[{tag}] Ошибка API requests: {e}")
             return None
-        finally:
-            context.close()
 
 
 def extract_json_from_text(text):
@@ -753,10 +767,10 @@ def run_once():
             continue
 
         if qwen_client is None:
-            qwen_client = QwenWebClient()
+            qwen_client = QwenAPIClient()
             qwen_client.start()
 
-        print(f"  [{symbol}] отправляю на LLM-анализ через веб-чат "
+        print(f"  [{symbol}] отправляю на LLM-анализ через прямой API "
               f"({len(snaps)} снимков в истории)")
 
         log_table = build_snapshot_log_table(snaps)
