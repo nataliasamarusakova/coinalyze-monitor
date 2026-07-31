@@ -2,7 +2,7 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-Локальный LLM-анализ (llama-cpp-python, Qwen2.5, ChatML) -> Telegram.
+Локальный LLM-анализ (llama-cpp-python, Qwen3.5-4B, ChatML) -> Telegram.
 
 Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
 """
@@ -34,7 +34,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
 LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "600"))
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -50,8 +50,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 3
-SLEEP_BETWEEN_LLM_CALLS = 1  # локально нет rate limit, пауза почти не нужна
+MAX_LLM_CALLS_PER_RUN = 2          # снижено под более медленную 4B модель на CPU
+SLEEP_BETWEEN_LLM_CALLS = 1
 
 RETENTION_DAYS_SNAPSHOTS = 14
 RETENTION_DAYS_HEARTBEAT = 14
@@ -432,7 +432,7 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ ЛОКАЛЬНЫЙ LLM (llama-cpp-python, Qwen2.5, ChatML) ============
+# ============ ЛОКАЛЬНЫЙ LLM (llama-cpp-python, Qwen3.5-4B, ChatML) ============
 
 _llm_instance = None
 
@@ -468,15 +468,14 @@ def get_llm():
             model_path=LLM_MODEL_PATH,
             n_ctx=LLM_N_CTX,
             n_threads=n_threads,
-            n_batch=256,
-            chat_format="chatml",   # критично для Qwen2.5 — без этого модель обрывает ответы
+            n_batch=512,
+            chat_format="chatml",   # ChatML-формат подходит для семейства Qwen
             use_mmap=False,         # читаем модель в RAM сразу целиком, а не лениво при инференсе
             use_mlock=False,
             verbose=False,
         )
         print(f"Модель загружена за {time.time() - t0:.1f}с (включая полное чтение с диска).")
 
-        # Прогревочный вызов — трогает все веса/кеши один раз, не считается в бюджет анализа
         t0 = time.time()
         _llm_instance.create_chat_completion(
             messages=[{"role": "user", "content": "Привет"}],
@@ -519,7 +518,7 @@ def call_llm_json(system_prompt, user_message, max_retries=1):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": full_user_message},
                 ],
-                temperature=0.0,   # детерминированная генерация — меньше шансов "заблудиться"
+                temperature=0.0,
                 max_tokens=LLM_MAX_TOKENS,
             )
             elapsed = time.time() - t0
