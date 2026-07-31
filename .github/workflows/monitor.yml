@@ -14,7 +14,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,9 +26,23 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache LLM model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+          key: qwen25-1_5b-instruct-q4km-v1
+
+      - name: Download LLM model if not cached
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -L -o models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+            "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
           playwright install --with-deps chromium
 
       - name: Run monitor
@@ -37,7 +51,7 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_MODEL_PATH: models/qwen2.5-1.5b-instruct-q4_k_m.gguf
         run: python monitor.py
 
       - name: Upload debug artifacts on failure
