@@ -2,7 +2,7 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков -> сборка мини-истории по кандидатам ->
-LLM-анализ через Qwen (DashScope, OpenAI-совместимый API) -> Telegram.
+LLM-анализ через гостевой веб-чат chat.qwen.ai (Playwright) -> Telegram.
 """
 
 import os
@@ -30,9 +30,8 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
+QWEN_CHAT_URL = "https://chat.qwen.ai/"
+QWEN_RESPONSE_TIMEOUT_S = 90
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -47,8 +46,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 6
-SLEEP_BETWEEN_LLM_CALLS = 8
+MAX_LLM_CALLS_PER_RUN = 4          # браузерные вызовы медленные, не разгоняем
+SLEEP_BETWEEN_LLM_CALLS = 5
 
 BUCKET_MAP = {
     "Healthy Trend": "bullish", "Short Squeeze Setup": "bullish",
@@ -67,8 +66,7 @@ def check_env():
     if USE_SAMPLE:
         print("Режим теста — проверка переменных окружения пропущена.")
         return
-    required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN",
-                "TG_CHAT_ID", "QWEN_API_KEY"]
+    required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ОШИБКА: не заданы переменные окружения: {missing}")
@@ -76,8 +74,7 @@ def check_env():
     if not os.path.exists(PROMPT_FILE):
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
-    print("Все переменные окружения и файл промпта на месте.")
-    print(f"Qwen base_url: {QWEN_BASE_URL} | модель: {QWEN_MODEL}")
+    print("Все переменные окружения и файл промпта на месте. LLM: гостевой веб-чат Qwen.")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -385,11 +382,9 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ QWEN (DashScope, OpenAI-совместимый API) ============
-
 VERDICT_JSON_SCHEMA_HINT = """
-Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
-строго со следующими ключами и типами:
+Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON, без текста
+до или после), строго со следующими ключами:
 
 {
   "signal": "Бычий" | "Медвежий" | "Нейтральный" | "Смешанный",
@@ -397,71 +392,202 @@ VERDICT_JSON_SCHEMA_HINT = """
   "tag": "название тега из раздела 5 шаг 2, или строка 'нет'",
   "score_comment": "одно короткое предложение про качество балла, без пересчёта самого балла",
   "confidence": "Низкая" | "Средняя" | "Высокая",
-  "persistence_snapshots": число (сколько снимков реально подтверждают сигнал по логу),
-  "persistence_comment": "одно короткое предложение, почему такая устойчивость",
+  "persistence_snapshots": число,
+  "persistence_comment": "одно короткое предложение",
   "pros": ["метрика ЗА 1", "метрика ЗА 2"],
   "cons": ["метрика ПРОТИВ 1", "метрика ПРОТИВ 2"],
-  "pattern": "название паттерна из раздела 6, или строка 'нет'",
+  "pattern": "название паттерна из раздела 6, или 'нет'",
   "dynamics": "1-2 предложения о том, что изменилось между снимками в логе",
-  "risks": "1-2 предложения: ликвидность, funding, OI/MktCap, BTC-корреляция",
+  "risks": "1-2 предложения",
   "heatmap": "строка, обычно 'нет данных'",
   "next_check": "какой снимок или условие стоит подождать дальше",
   "verdict": "НЕ ВХОДИТЬ" | "НАБЛЮДАТЬ" | "РАССМАТРИВАТЬ",
-  "verdict_reason": "одно короткое предложение с обоснованием вердикта"
+  "verdict_reason": "одно короткое предложение"
 }
-
-Никакого текста до или после JSON. Никакого markdown-форматирования внутри строк.
 """
 
 
-def call_llm_json(system_prompt, user_message, max_retries=2):
-    url = f"{QWEN_BASE_URL.rstrip('/')}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {QWEN_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": QWEN_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1500,
-        "response_format": {"type": "json_object"},
-    }
+# ============ QWEN — ГОСТЕВОЙ ВЕБ-ЧАТ ЧЕРЕЗ PLAYWRIGHT ============
 
-    for attempt in range(max_retries + 1):
+class QwenWebClient:
+    """Управляет одним экземпляром браузера на весь прогон, чтобы не
+    перезапускать Chromium под каждую монету — это дорого по времени."""
+
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+
+    def start(self):
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=True)
+        print("QwenWebClient: браузер запущен.")
+
+    def stop(self):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if self._browser:
+                self._browser.close()
+        finally:
+            if self._pw:
+                self._pw.stop()
+        print("QwenWebClient: браузер остановлен.")
 
-            print(f"Qwen HTTP статус: {resp.status_code}")
-
-            if resp.status_code == 429:
-                wait_s = 15
-                print(f"429 от Qwen, жду {wait_s}с и повторяю "
-                      f"(попытка {attempt+1}/{max_retries+1})")
-                print(f"Текст ошибки: {resp.text[:800]}")
-                time.sleep(wait_s)
-                continue
-
-            if resp.status_code != 200:
-                print(f"ОШИБКА Qwen API: {resp.status_code} — {resp.text[:800]}")
-                return None
-
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+    def _find_input_box(self, page):
+        selectors = [
+            "textarea[placeholder]",
+            "textarea",
+            "div[contenteditable='true']",
+        ]
+        for sel in selectors:
             try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                print(f"LLM вернул невалидный JSON, содержимое: {content[:500]}")
+                loc = page.locator(sel).first
+                loc.wait_for(state="visible", timeout=8000)
+                return loc
+            except Exception:
+                continue
+        return None
+
+    def _dismiss_popups(self, page):
+        for text in ["Accept", "Принять", "Got it", "Понятно", "Close", "Закрыть"]:
+            try:
+                btn = page.get_by_text(text, exact=False)
+                if btn.count() > 0:
+                    btn.first.click(timeout=1500)
+            except Exception:
+                pass
+
+    def _submit(self, page, input_box, full_prompt):
+        input_box.click()
+        input_box.fill(full_prompt)
+        page.wait_for_timeout(300)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1200)
+
+        still_there = ""
+        try:
+            still_there = input_box.input_value()
+        except Exception:
+            try:
+                still_there = input_box.inner_text()
+            except Exception:
+                still_there = ""
+
+        if still_there and full_prompt[:15] in still_there:
+            for sel in ["button[aria-label*='Send']", "button[aria-label*='Отправить']",
+                        "button[type='submit']", "[data-testid*='send']"]:
+                try:
+                    btn = page.locator(sel).first
+                    btn.click(timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+    def _wait_for_completion(self, page, timeout_s):
+        deadline = time.time() + timeout_s
+        last_text = ""
+        stable_ticks = 0
+        while time.time() < deadline:
+            candidates = page.locator(
+                "div[class*='markdown'], div[class*='message-content'], "
+                "div[class*='assistant']"
+            )
+            count = candidates.count()
+            if count == 0:
+                time.sleep(1.5)
+                continue
+            try:
+                current = candidates.nth(count - 1).inner_text()
+            except Exception:
+                current = ""
+            if current and current == last_text:
+                stable_ticks += 1
+            else:
+                stable_ticks = 0
+            last_text = current
+            if stable_ticks >= 3 and current.strip():
+                return current
+            time.sleep(1.5)
+        return last_text or None
+
+    def ask(self, full_prompt, tag="query"):
+        context = self._browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+            viewport={"width": 1400, "height": 900},
+            locale="ru-RU",
+        )
+        page = context.new_page()
+        stealth_sync(page)
+        try:
+            page.goto(QWEN_CHAT_URL, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2500)
+            self._dismiss_popups(page)
+
+            input_box = self._find_input_box(page)
+            if input_box is None:
+                print(f"[{tag}] Не найдено поле ввода чата — вероятно, изменилась "
+                      f"разметка страницы или сработала защита. См. debug-файлы.")
+                page.screenshot(path=f"debug_qwen_{tag}_no_input.png", full_page=True)
+                with open(f"debug_qwen_{tag}_no_input.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
                 return None
+
+            self._submit(page, input_box, full_prompt)
+            answer = self._wait_for_completion(page, QWEN_RESPONSE_TIMEOUT_S)
+
+            if not answer:
+                print(f"[{tag}] Не удалось получить ответ от чата за "
+                      f"{QWEN_RESPONSE_TIMEOUT_S}с. Сохраняю debug-скриншот.")
+                page.screenshot(path=f"debug_qwen_{tag}_timeout.png", full_page=True)
+
+            return answer
 
         except Exception as e:
-            print(f"Исключение при вызове Qwen API: {e}")
+            print(f"[{tag}] Ошибка при работе с chat.qwen.ai: {e}")
+            try:
+                page.screenshot(path=f"debug_qwen_{tag}_error.png", full_page=True)
+            except Exception:
+                pass
             return None
+        finally:
+            context.close()
 
-    print("Исчерпаны попытки после 429, пропускаю эту монету в этом прогоне.")
+
+def extract_json_from_text(text):
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(json)?", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    json_str = cleaned[start:end + 1]
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+
+
+def call_llm_json(qwen_client, system_prompt, user_message, tag, max_retries=1):
+    full_prompt = (
+        system_prompt.strip() +
+        "\n\n=== ДАННЫЕ ДЛЯ АНАЛИЗА ===\n" +
+        user_message.strip() +
+        "\n\n" + VERDICT_JSON_SCHEMA_HINT
+    )
+
+    for attempt in range(max_retries + 1):
+        raw_text = qwen_client.ask(full_prompt, tag=tag)
+        if raw_text is None:
+            print(f"  [{tag}] попытка {attempt+1}: пустой ответ от веб-чата.")
+            continue
+        parsed = extract_json_from_text(raw_text)
+        if parsed is not None:
+            return parsed
+        print(f"  [{tag}] попытка {attempt+1}: не удалось извлечь JSON. "
+              f"Начало ответа: {raw_text[:300]}")
+
     return None
 
 
@@ -597,6 +723,7 @@ def run_once():
     candidates.sort(key=lambda c: c["score"], reverse=True)
 
     llm_calls_used = 0
+    qwen_client = None
 
     for rec in candidates:
         symbol = rec["symbol"]
@@ -625,7 +752,12 @@ def run_once():
                   f"отложено до следующего тика")
             continue
 
-        print(f"  [{symbol}] отправляю на LLM-анализ ({len(snaps)} снимков в истории)")
+        if qwen_client is None:
+            qwen_client = QwenWebClient()
+            qwen_client.start()
+
+        print(f"  [{symbol}] отправляю на LLM-анализ через веб-чат "
+              f"({len(snaps)} снимков в истории)")
 
         log_table = build_snapshot_log_table(snaps)
         full_metrics = format_full_metrics(rec)
@@ -642,7 +774,7 @@ def run_once():
             f"Режим (уже посчитан кодом): {rec['regime']}\n"
         )
 
-        verdict_json = call_llm_json(system_prompt, user_message)
+        verdict_json = call_llm_json(qwen_client, system_prompt, user_message, tag=symbol)
         llm_calls_used += 1
 
         if verdict_json is None:
@@ -655,6 +787,9 @@ def run_once():
 
         if llm_calls_used < MAX_LLM_CALLS_PER_RUN:
             time.sleep(SLEEP_BETWEEN_LLM_CALLS)
+
+    if qwen_client is not None:
+        qwen_client.stop()
 
     save_llm_state(llm_state)
     print(f"Готово. LLM-вызовов за прогон: {llm_calls_used}")
