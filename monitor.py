@@ -1,4 +1,3 @@
- 
 import os
 import re
 import sys
@@ -312,7 +311,7 @@ VERDICT_JSON_SCHEMA_HINT = """
 }
 """
 
-# ============ QWEN API (ПРЯМОЙ ЗАПРОС ЧЕРЕЗ REQUESTS) ============
+# ============ QWEN API (ПРЯМОЙ ЗАПРОС ЧЕРЕЗ REQUESTS С ЛОГИРОВАНИЕМ) ============
 
 class QwenAPIClient:
     def __init__(self):
@@ -355,7 +354,7 @@ class QwenAPIClient:
         self.session.close()
         print("QwenAPIClient: сессия закрыта.")
 
-        def ask(self, full_prompt, tag="query"):
+    def ask(self, full_prompt, tag="query"):
         fid = str(uuid.uuid4())
         children_id = str(uuid.uuid4())
         
@@ -607,4 +606,3 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
- 
