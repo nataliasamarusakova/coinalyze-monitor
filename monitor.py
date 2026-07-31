@@ -33,8 +33,8 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
-LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "8192"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "700"))
+LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -468,7 +468,7 @@ def get_llm():
             model_path=LLM_MODEL_PATH,
             n_ctx=LLM_N_CTX,
             n_threads=n_threads,
-            n_batch=512,
+            n_batch=256,
             chat_format="chatml",   # критично для Qwen2.5 — без этого модель обрывает ответы
             use_mmap=False,         # читаем модель в RAM сразу целиком, а не лениво при инференсе
             use_mlock=False,
