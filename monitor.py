@@ -355,7 +355,7 @@ class QwenAPIClient:
         self.session.close()
         print("QwenAPIClient: сессия закрыта.")
 
-    def ask(self, full_prompt, tag="query"):
+        def ask(self, full_prompt, tag="query"):
         fid = str(uuid.uuid4())
         children_id = str(uuid.uuid4())
         
@@ -381,32 +381,65 @@ class QwenAPIClient:
             "bx-umidtoken": "T2gA0YplAt4OSXWtLJ5t9X4uGRCWxJeFTuKIQolJakatLEF9mxE_pvyaVFmfyl-Xd4E="
         }
 
+        # Файл для сохранения сырого ответа
+        debug_file = f"debug_qwen_{tag}_{int(time.time())}.log"
+
         try:
             response = self.session.post(self.url, json=payload, headers=headers, stream=True, timeout=QWEN_RESPONSE_TIMEOUT_S)
+            
+            # 1. Логируем HTTP статус
+            print(f"[{tag}] HTTP Status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"[{tag}] Ошибка сервера. Тело ответа: {response.text[:500]}")
+                return None
+                
             response.raise_for_status()
             
             full_text = ""
-            # Парсим SSE поток
-            for line in response.iter_lines(decode_unicode=True):
-                if not line: continue
-                if line.startswith("data:"):
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]": break
-                    try:
-                        chunk = json.loads(data_str)
-                        if "choices" in chunk and len(chunk["choices"]) > 0:
-                            delta = chunk["choices"][0].get("delta", {})
+            raw_lines = []
+            
+            # 2. Читаем поток и пишем в файл
+            with open(debug_file, "w", encoding="utf-8") as f:
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line: 
+                        continue
+                    
+                    f.write(line + "\n")
+                    raw_lines.append(line)
+                    
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]": 
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            if "choices" in chunk and len(chunk["choices"]) > 0:
+                                delta = chunk["choices"][0].get("delta", {})
+                                phase = delta.get("phase", "no_phase")
+                                content = delta.get("content", "")
+                                
+                                # 3. Логируем в консоль фазу и кусочек контента
+                                if content:
+                                    print(f"  [{tag}] Phase: {phase} | Content: {content[:40]}...")
+                                
+                                # Собираем ТОЛЬКО фазу answer
+                                if phase == "answer" and content:
+                                    full_text += content
+                                    
+                        except json.JSONDecodeError:
+                            pass
                             
-                            # КЛЮЧЕВАЯ ФИЛЬТРАЦИЯ: берем текст ТОЛЬКО из фазы "answer"
-                            if delta.get("phase") == "answer" and "content" in delta:
-                                full_text += delta["content"]
-                    except json.JSONDecodeError:
-                        pass
+            # 4. Если текст пуст, выводим первые строки сырого ответа в консоль
             if not full_text:
-                print(f"[{tag}] Пустой ответ от API (возможно, только thinking).")
+                print(f"[{tag}] Итоговый текст пуст. Сырой ответ сохранен в {debug_file}")
+                print(f"[{tag}] Первые 3 строки сырого ответа:")
+                for i, chunk in enumerate(raw_lines[:3]):
+                    print(f"  -> {chunk[:250]}")
+                    
             return full_text
+            
         except Exception as e:
-            print(f"[{tag}] Ошибка API requests: {e}")
+            print(f"[{tag}] Критическая ошибка API requests: {e}")
             return None
 
 def extract_json_from_text(text):
