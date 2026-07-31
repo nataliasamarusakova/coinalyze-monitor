@@ -1,14 +1,6 @@
 name: Coinalyze Monitor
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-    inputs:
-      use_sample:
-        description: 'Тестовый режим (true/false)'
-        required: false
-        default: 'false'
   repository_dispatch:
     types: [run_monitor]
 
@@ -20,19 +12,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          fetch-depth: 1
 
-      - run: pip install -r requirements.txt
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: Run monitor
         env:
@@ -40,34 +37,28 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-          QWEN_BASE_URL: ${{ secrets.QWEN_BASE_URL }}
-          USE_SAMPLE_HTML: ${{ github.event.inputs.use_sample || 'false' }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python monitor.py
 
-      - name: Upload debug artifacts
-        if: always()
+      - name: Upload debug artifacts on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-artifacts
           path: |
-            debug_screenshot.png
             debug_page.html
-          if-no-files-found: ignore
+            debug_screenshot.png
+          retention-days: 3
 
       - name: Commit snapshot log and state
         run: |
           git config user.name "coinalyze-bot"
           git config user.email "actions@github.com"
           git config merge.ours.driver true
-
-          git add snapshots.jsonl llm_state.json
+          git add snapshots.jsonl heartbeat.jsonl llm_state.json
           git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
           if ! git pull --rebase --autostash origin main; then
-            echo "Rebase не удался, откатываю и пробую merge с приоритетом нашей версии"
             git rebase --abort || true
             git pull --no-rebase -X ours origin main
           fi
-
           git push
