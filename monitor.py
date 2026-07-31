@@ -50,11 +50,7 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-
-# Осторожные настройки под лимит OpenRouter free-tier без пополнения баланса
-# (20 запросов/мин, 50 запросов/день). Если баланс пополнен на $10+ —
-# увеличьте MAX_LLM_CALLS_PER_RUN и уменьшите REANALYSIS_COOLDOWN_MINUTES.
-MAX_LLM_CALLS_PER_RUN = 2
+MAX_LLM_CALLS_PER_RUN = 2          # осторожно: бесплатный лимит OpenRouter может быть 50/день
 SLEEP_BETWEEN_LLM_CALLS = 10
 
 RETENTION_DAYS_SNAPSHOTS = 14
@@ -85,7 +81,6 @@ def check_env():
         print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
         sys.exit(1)
     print("Все переменные окружения и файл промпта на месте.")
-    print(f"OpenRouter модель: {OPENROUTER_MODEL}")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -473,6 +468,22 @@ VERDICT_JSON_SCHEMA_HINT = """
 """
 
 
+def extract_json(content):
+    """Пытается распарсить JSON напрямую, при неудаче — вырезает {...} regex'ом
+    (на случай, если reasoning-модель подмешала лишний текст вокруг JSON)."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r'\{.*\}', content, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def call_llm_json(system_prompt, user_message, max_retries=2):
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -488,9 +499,8 @@ def call_llm_json(system_prompt, user_message, max_retries=2):
             {"role": "user", "content": user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT},
         ],
         "temperature": 0.1,
-        "max_tokens": 1200,
+        "max_tokens": 1500,
         "response_format": {"type": "json_object"},
-        "reasoning": {"enabled": False},
     }
 
     for attempt in range(max_retries + 1):
@@ -506,31 +516,34 @@ def call_llm_json(system_prompt, user_message, max_retries=2):
                 except Exception:
                     print(f"429 от OpenRouter: {resp.text[:500]}")
                 print(f"Жду {wait_s}с (попытка {attempt+1}/{max_retries+1}). "
-                      f"Если лимит суточный (50/день без пополнения баланса) — "
-                      f"ожидание не поможет до смены суток.")
+                      f"Если лимит суточный — ожидание не поможет до смены суток.")
                 time.sleep(wait_s)
                 continue
 
             if resp.status_code != 200:
-                print(f"ОШИБКА OpenRouter API: {resp.status_code} — {resp.text[:500]}")
+                print(f"ОШИБКА OpenRouter API: {resp.status_code} — {resp.text[:800]}")
                 return None
 
             data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                print(f"OpenRouter не вернул choices: {data}")
-                return None
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            content = message.get("content", "") or ""
+            finish_reason = choice.get("finish_reason", "")
 
-            content = choices[0].get("message", {}).get("content", "")
+            print(f"finish_reason: {finish_reason}, длина content: {len(content)}")
+            if finish_reason == "length":
+                print("ПРЕДУПРЕЖДЕНИЕ: ответ обрезан по лимиту токенов (finish_reason=length), "
+                      "рассмотрите увеличение max_tokens.")
+
             if not content:
-                print(f"OpenRouter вернул пустой content: {data}")
+                print(f"OpenRouter вернул пустой content. Полный ответ: {data}")
                 return None
 
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                print(f"LLM вернул невалидный JSON: {content[:500]}")
+            result = extract_json(content)
+            if result is None:
+                print(f"LLM вернул невалидный JSON, содержимое: {content[:600]}")
                 return None
+            return result
 
         except Exception as e:
             print(f"Исключение при вызове OpenRouter API: {e}")
