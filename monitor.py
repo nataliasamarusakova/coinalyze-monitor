@@ -32,7 +32,7 @@ COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/qwen3.5-4b-instruct-q4_k_m.gguf")
+LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
 LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "700"))
 
