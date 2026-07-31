@@ -2,8 +2,7 @@
 coinalyze_monitor.py
 Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
 JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-ЛОКАЛЬНЫЙ LLM-анализ (Qwen2.5-1.5B-Instruct, GGUF, через llama-cpp-python,
-с грамматикой, гарантирующей валидный JSON) -> Telegram.
+Локальный LLM-анализ (llama-cpp-python, Qwen2.5, ChatML) -> Telegram.
 
 Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
 """
@@ -14,6 +13,7 @@ import sys
 import time
 import json
 import html
+import multiprocessing
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
@@ -33,8 +33,8 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
-LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "6144"))
-LLM_N_THREADS = int(os.environ.get("LLM_N_THREADS", "2"))
+LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "700"))
 
 URL = ("https://coinalyze.net/"
        "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -50,11 +50,8 @@ MIN_SCORE_TO_WATCH = 3
 MIN_SNAPSHOTS_FOR_ANALYSIS = 3
 ANALYSIS_WINDOW_MINUTES = 20
 REANALYSIS_COOLDOWN_MINUTES = 30
-
-# Локальная модель на 2 CPU-ядрах — не лимиты API, а реальное время расходуем.
-# Не завышайте сразу, лучше поднять после проверки реального времени на инференс.
-MAX_LLM_CALLS_PER_RUN = 4
-SLEEP_BETWEEN_LLM_CALLS = 1
+MAX_LLM_CALLS_PER_RUN = 3
+SLEEP_BETWEEN_LLM_CALLS = 1  # локально нет rate limit, пауза почти не нужна
 
 RETENTION_DAYS_SNAPSHOTS = 14
 RETENTION_DAYS_HEARTBEAT = 14
@@ -85,7 +82,7 @@ def check_env():
     if not os.path.exists(LLM_MODEL_PATH):
         print(f"ОШИБКА: не найден файл модели {LLM_MODEL_PATH}.")
         sys.exit(1)
-    print("Все переменные окружения, промпт и файл модели на месте.")
+    print("Все переменные окружения, промпт и модель на месте.")
 
 
 # ============ ПАРСИНГ ЧИСЕЛ ============
@@ -392,28 +389,26 @@ def build_macro_context(heartbeat_history, symbol, days=MACRO_CONTEXT_DAYS):
     gap_desc = ""
     if max_gap_hours > 2:
         gap_desc = (f" В истории есть разрыв до {max_gap_hours:.1f}ч — монета "
-                    f"временно выпадала из наблюдения (низкая активность/не проходила фильтр).")
+                    f"временно выпадала из наблюдения.")
 
     return (
-        f"Контекст за последние {days} дн. ({len(entries)} точек наблюдения): "
-        f"текущая цена {now_price}, максимум за период {period_high} "
-        f"(сейчас на {drawdown:+.1f}% от максимума), минимум {period_low} "
-        f"(рост от минимума {rise_from_low:+.1f}%).{gap_desc}"
+        f"Контекст за {days} дн. ({len(entries)} точек): текущая цена {now_price}, "
+        f"максимум {period_high} (сейчас {drawdown:+.1f}% от максимума), "
+        f"минимум {period_low} (рост от минимума {rise_from_low:+.1f}%).{gap_desc}"
     )
 
 
 # ============ СБОРКА ДАННЫХ ДЛЯ LLM ============
 
 def build_snapshot_log_table(snaps):
-    lines = ["| № | Время (UTC) | Режим | Балл | OI24h% | OI4h% | CVD24 | LLS24 | FR_OIW% | Price% |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["№ | Время | Режим | Балл | OI24h% | OI4h% | CVD24 | LLS24 | FR_OIW% | Price%"]
     for i, s in enumerate(snaps, 1):
-        t = time.strftime("%H:%M:%S", time.gmtime(s["ts"]))
+        t = time.strftime("%H:%M", time.gmtime(s["ts"]))
         lines.append(
-            f"| {i} | {t} | {s.get('regime')} | {s.get('score')} | "
+            f"{i} | {t} | {s.get('regime')} | {s.get('score')} | "
             f"{s.get('oi_chg24_pct')} | {s.get('oi_chg4h_pct')} | "
             f"{s.get('cvd24')} | {s.get('lls24')} | {s.get('fr_oiw')} | "
-            f"{s.get('price_chg24')} |"
+            f"{s.get('price_chg24')}"
         )
     return "\n".join(lines)
 
@@ -421,21 +416,14 @@ def build_snapshot_log_table(snaps):
 def format_full_metrics(r):
     return (
         f"Coin: {r['name']} ({r['symbol']})\n"
-        f"Price: {r['price']} | Price Change % 24H: {r['price_chg24']}%\n"
-        f"Market Capitalisation: {r['mktcap']}\n"
-        f"Volume 24H: {r['volume24']}\n"
-        f"Open Interest: {r['oi']} | OI Change % 24H: {r['oi_chg24_pct']}% "
-        f"| OI Change % 4H: {r['oi_chg4h_pct']}%\n"
-        f"Open Interest / Volume 24H: {r['oi_vol_ratio']}\n"
-        f"Open Interest / Market Capitalization: {r['oi_mktcap_ratio']}\n"
-        f"Funding Rate Average: {r['fr_avg']}% | Predicted: {r['pfr_avg']}%\n"
-        f"Funding Rate Average, OI Weighted: {r['fr_oiw']}% | Predicted OI-W: {r['pfr_oiw']}%\n"
-        f"Short Liquidations 24H: {r['liq_short24']}\n"
-        f"Long Liquidations 24H: {r['liq_long24']}\n"
-        f"Long/Short Accounts Ratio (1D): {r['ls_accounts']}\n"
-        f"BTC Correlation 7D: {r['btc_corr7d']}\n"
-        f"CVD24: {r['cvd24']}\n"
-        f"LLS24: {r['lls24']}%\n"
+        f"Price: {r['price']} | Price Change 24H: {r['price_chg24']}%\n"
+        f"Volume 24H: {r['volume24']} | MktCap: {r['mktcap']}\n"
+        f"OI: {r['oi']} | OI Chg 24H: {r['oi_chg24_pct']}% | OI Chg 4H: {r['oi_chg4h_pct']}%\n"
+        f"OI/Volume: {r['oi_vol_ratio']} | OI/MktCap: {r['oi_mktcap_ratio']}\n"
+        f"Funding OI-W: {r['fr_oiw']}% | Predicted OI-W: {r['pfr_oiw']}%\n"
+        f"Short Liq 24H: {r['liq_short24']} | Long Liq 24H: {r['liq_long24']}\n"
+        f"L/S Accounts Ratio: {r['ls_accounts']} | BTC Corr 7D: {r['btc_corr7d']}\n"
+        f"CVD24: {r['cvd24']} | LLS24: {r['lls24']}%\n"
     )
 
 
@@ -444,87 +432,84 @@ def load_system_prompt():
         return f.read()
 
 
-# ============ ЛОКАЛЬНАЯ LLM (Qwen2.5-1.5B-Instruct GGUF, через llama-cpp-python) ============
-
-VERDICT_JSON_SCHEMA_HINT = """
-Верни ТОЛЬКО валидный JSON (без markdown, без ```, без пояснений вне JSON),
-строго со следующими ключами:
-
-{
-  "signal": "Бычий | Медвежий | Нейтральный | Смешанный",
-  "regime": "точное название режима",
-  "tag": "название тега или 'нет'",
-  "score_comment": "одно короткое предложение про качество балла",
-  "confidence": "Низкая | Средняя | Высокая",
-  "persistence_snapshots": число,
-  "persistence_comment": "одно короткое предложение",
-  "pros": ["метрика ЗА 1", "метрика ЗА 2"],
-  "cons": ["метрика ПРОТИВ 1", "метрика ПРОТИВ 2"],
-  "pattern": "название паттерна или 'нет'",
-  "dynamics": "1-2 предложения о динамике между снимками",
-  "risks": "1-2 предложения о рисках",
-  "heatmap": "нет данных",
-  "next_check": "что ждать дальше",
-  "verdict": "НЕ ВХОДИТЬ | НАБЛЮДАТЬ | РАССМАТРИВАТЬ",
-  "verdict_reason": "одно предложение с обоснованием"
-}
-Никакого текста до или после JSON.
-"""
-
-# Грамматика GBNF — гарантирует синтаксически валидный JSON на выходе модели,
-# независимо от того, насколько маленькая и не всегда аккуратная модель.
-JSON_GRAMMAR_STR = r"""
-root   ::= object
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
-
-object ::=
-  "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
-  )? "}" ws
-
-array  ::=
-  "[" ws (
-            value
-    ("," ws value)*
-  )? "]" ws
-
-string ::=
-  "\"" (
-    [^"\\\x7F\x00-\x1F] |
-    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-  )* "\"" ws
-
-number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9]{1,16})? ws
-
-ws ::= | " " | "\n" [ \t]{0,20}
-"""
+# ============ ЛОКАЛЬНЫЙ LLM (llama-cpp-python, Qwen2.5, ChatML) ============
 
 _llm_instance = None
-_llm_grammar = None
+
+RESPONSE_SCHEMA_HINT = """
+Ответь ТОЛЬКО валидным JSON, без markdown, без текста до/после. Ключи ровно такие:
+{
+  "signal": "Бычий/Медвежий/Нейтральный/Смешанный",
+  "regime": "название режима",
+  "tag": "тег или нет",
+  "confidence": "Низкая/Средняя/Высокая",
+  "persistence_snapshots": число,
+  "pros": "краткий список метрик ЗА через точку с запятой",
+  "cons": "краткий список метрик ПРОТИВ через точку с запятой",
+  "pattern": "название паттерна или нет",
+  "dynamics": "1 короткое предложение о динамике между снимками",
+  "risks": "1 короткое предложение о рисках",
+  "next_check": "какое условие ждать дальше",
+  "verdict": "НЕ ВХОДИТЬ/НАБЛЮДАТЬ/РАССМАТРИВАТЬ",
+  "verdict_reason": "1 короткое предложение обоснования"
+}
+Пиши кратко. Все текстовые значения — короткие фразы, не абзацы.
+"""
 
 
 def get_llm():
-    global _llm_instance, _llm_grammar
+    global _llm_instance
     if _llm_instance is None:
-        from llama_cpp import Llama, LlamaGrammar
-        print(f"Загружаю локальную модель из {LLM_MODEL_PATH} ...")
+        from llama_cpp import Llama
+        n_threads = multiprocessing.cpu_count()
+        print(f"Загружаю локальную модель из {LLM_MODEL_PATH} (n_threads={n_threads})...")
         t0 = time.time()
         _llm_instance = Llama(
             model_path=LLM_MODEL_PATH,
             n_ctx=LLM_N_CTX,
-            n_threads=LLM_N_THREADS,
+            n_threads=n_threads,
             n_batch=512,
+            chat_format="chatml",   # критично для Qwen2.5 — без этого модель обрывает ответы
+            use_mmap=False,         # читаем модель в RAM сразу целиком, а не лениво при инференсе
+            use_mlock=False,
             verbose=False,
         )
-        _llm_grammar = LlamaGrammar.from_string(JSON_GRAMMAR_STR)
-        print(f"Модель загружена за {time.time() - t0:.1f}с.")
-    return _llm_instance, _llm_grammar
+        print(f"Модель загружена за {time.time() - t0:.1f}с (включая полное чтение с диска).")
+
+        # Прогревочный вызов — трогает все веса/кеши один раз, не считается в бюджет анализа
+        t0 = time.time()
+        _llm_instance.create_chat_completion(
+            messages=[{"role": "user", "content": "Привет"}],
+            max_tokens=5,
+            temperature=0,
+        )
+        print(f"Прогрев модели занял {time.time() - t0:.1f}с.")
+    return _llm_instance
+
+
+def extract_json_object(text):
+    """Достаёт первый сбалансированный {...} блок из текста, даже если вокруг мусор."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def call_llm_json(system_prompt, user_message, max_retries=1):
-    llm, grammar = get_llm()
-    full_user_message = user_message + "\n\n" + VERDICT_JSON_SCHEMA_HINT
+    llm = get_llm()
+    full_user_message = user_message + "\n\n" + RESPONSE_SCHEMA_HINT
 
     for attempt in range(max_retries + 1):
         try:
@@ -534,27 +519,21 @@ def call_llm_json(system_prompt, user_message, max_retries=1):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": full_user_message},
                 ],
-                temperature=0.1,
-                max_tokens=800,
-                grammar=grammar,
+                temperature=0.0,   # детерминированная генерация — меньше шансов "заблудиться"
+                max_tokens=LLM_MAX_TOKENS,
             )
             elapsed = time.time() - t0
             content = result["choices"][0]["message"]["content"]
             print(f"Локальный инференс занял {elapsed:.1f}с, символов ответа: {len(content)}")
 
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                print(f"LLM вернул невалидный JSON (попытка {attempt+1}): {content[:500]}")
-                if attempt < max_retries:
-                    continue
-                return None
+            parsed = extract_json_object(content)
+            if parsed is not None:
+                return parsed
+
+            print(f"Не удалось извлечь валидный JSON (попытка {attempt+1}): {content[:300]}")
 
         except Exception as e:
             print(f"Исключение при локальном инференсе: {e}")
-            if attempt < max_retries:
-                continue
-            return None
 
     return None
 
@@ -575,11 +554,6 @@ def safe_get(d, key, default="н/д"):
 def render_verdict_message(rec, v, snaps_count):
     r = rec
 
-    pros_list = v.get("pros") or []
-    cons_list = v.get("cons") or []
-    pros = "\n".join(f"  • {esc(p)}" for p in pros_list) or "  • нет"
-    cons = "\n".join(f"  • {esc(c)}" for c in cons_list) or "  • нет"
-
     verdict = safe_get(v, "verdict", "НАБЛЮДАТЬ")
     verdict_emoji = {
         "НЕ ВХОДИТЬ": "🔴", "НАБЛЮДАТЬ": "🟡", "РАССМАТРИВАТЬ": "🟢",
@@ -596,15 +570,15 @@ def render_verdict_message(rec, v, snaps_count):
         f"<b>1. Сигнал:</b> {esc(safe_get(v, 'signal'))}\n"
         f"<b>2. Режим:</b> {esc(safe_get(v, 'regime', rec['regime']))}\n"
         f"<b>3. Тег:</b> {esc(safe_get(v, 'tag'))}\n"
-        f"<b>4. Балл:</b> {rec['score']} — {esc(safe_get(v, 'score_comment'))}\n"
+        f"<b>4. Балл:</b> {rec['score']}\n"
         f"<b>5. Уверенность:</b> {esc(safe_get(v, 'confidence'))} "
-        f"(Persistence: {pers_n} снимков) — {esc(safe_get(v, 'persistence_comment'))}\n"
-        f"<b>6. Метрики ЗА:</b>\n{pros}\n"
-        f"<b>7. Метрики ПРОТИВ:</b>\n{cons}\n"
+        f"(Persistence: {pers_n} снимков)\n"
+        f"<b>6. Метрики ЗА:</b> {esc(safe_get(v, 'pros'))}\n"
+        f"<b>7. Метрики ПРОТИВ:</b> {esc(safe_get(v, 'cons'))}\n"
         f"<b>8. Паттерн:</b> {esc(safe_get(v, 'pattern'))}\n"
         f"<b>9. Динамика:</b> {esc(safe_get(v, 'dynamics'))}\n"
         f"<b>10. Риски:</b> {esc(safe_get(v, 'risks'))}\n"
-        f"<b>11. Тепловая карта:</b> {esc(safe_get(v, 'heatmap', 'нет данных'))}\n"
+        f"<b>11. Тепловая карта:</b> нет данных\n"
         f"<b>12. Усилить/Опровергнуть:</b> {esc(safe_get(v, 'next_check'))}\n"
         f"—————————————\n"
         f"{verdict_emoji} <b>ВЕРДИКТ: {esc(verdict)}</b>\n"
@@ -653,6 +627,7 @@ def send_telegram_long(text):
 # ============ ГЛАВНЫЙ ЦИКЛ ============
 
 def run_once():
+    run_t0 = time.time()
     check_env()
     system_prompt = load_system_prompt()
     history = load_jsonl(LOG_FILE)
@@ -666,13 +641,9 @@ def run_once():
 
     for r in rows:
         append_jsonl(HEARTBEAT_FILE, {
-            "ts": r["ts"], "symbol": r["symbol"],
-            "price": r["price"], "price_chg24": r["price_chg24"],
-            "oi_chg24_pct": r["oi_chg24_pct"], "cvd24": r["cvd24"],
-        })
-        heartbeat_history.append({
             "ts": r["ts"], "symbol": r["symbol"], "price": r["price"],
         })
+        heartbeat_history.append({"ts": r["ts"], "symbol": r["symbol"], "price": r["price"]})
 
         passed_a, score_a, flags_a = score_profile_a(r)
         passed_b, score_b, flags_b = score_profile_b(r)
@@ -708,8 +679,7 @@ def run_once():
 
         snaps = recent_snapshots(history, symbol, ANALYSIS_WINDOW_MINUTES)
         if len(snaps) < MIN_SNAPSHOTS_FOR_ANALYSIS:
-            print(f"  [{symbol}] недостаточно снимков для анализа "
-                  f"({len(snaps)}/{MIN_SNAPSHOTS_FOR_ANALYSIS}), жду ещё")
+            print(f"  [{symbol}] недостаточно снимков ({len(snaps)}/{MIN_SNAPSHOTS_FOR_ANALYSIS})")
             continue
 
         prev = llm_state.get(symbol)
@@ -721,40 +691,34 @@ def run_once():
                 cooldown_ok = False
 
         if not cooldown_ok:
-            print(f"  [{symbol}] кулдаун ещё не истёк, пропускаю LLM-анализ")
+            print(f"  [{symbol}] кулдаун ещё не истёк")
             continue
 
         if llm_calls_used >= MAX_LLM_CALLS_PER_RUN:
-            print(f"  [{symbol}] достигнут лимит LLM-вызовов за прогон, "
-                  f"отложено до следующего тика")
+            print(f"  [{symbol}] достигнут лимит LLM-вызовов за прогон")
             continue
 
-        print(f"  [{symbol}] отправляю на локальный LLM-анализ ({len(snaps)} снимков в истории)")
+        print(f"  [{symbol}] отправляю на локальный LLM-анализ ({len(snaps)} снимков)")
 
         log_table = build_snapshot_log_table(snaps)
         full_metrics = format_full_metrics(rec)
         macro_context = build_macro_context(heartbeat_history, symbol)
 
         user_message = (
-            "Ниже — макро-контекст за 7 дней, лог последних снимков за 20 минут "
-            "и полные метрики последнего снимка. Скоринг-балл и режим уже посчитаны "
-            "кодом точно по формулам — не пересчитывай их, используй как готовые "
-            "входные данные. Учти макро-контекст: если текущий рост — это отскок "
-            "после сильного падения или сразу после разрыва в истории наблюдения, "
-            "снижай уверенность и явно отметь это в рисках и динамике.\n\n"
+            "Скоринг-балл и режим уже посчитаны кодом — не пересчитывай их, используй "
+            "как готовые данные. Проанализируй динамику по логу снимков и макро-контексту, "
+            "определи паттерн и вынеси вердикт.\n\n"
             f"[Макро-контекст]\n{macro_context}\n\n"
-            f"[Лог снимков за 20 минут — {symbol}]\n{log_table}\n\n"
-            f"[Полные метрики последнего снимка]\n{full_metrics}\n\n"
-            f"Скоринг-балл (уже посчитан кодом): {rec['score']}\n"
-            f"Режим (уже посчитан кодом): {rec['regime']}\n"
+            f"[Лог снимков — {symbol}]\n{log_table}\n\n"
+            f"[Метрики последнего снимка]\n{full_metrics}\n\n"
+            f"Балл: {rec['score']} | Режим: {rec['regime']}\n"
         )
 
         verdict_json = call_llm_json(system_prompt, user_message)
         llm_calls_used += 1
 
         if verdict_json is None:
-            print(f"  [{symbol}] LLM не ответил или вернул невалидный JSON, "
-                  f"пропускаю отправку в Telegram")
+            print(f"  [{symbol}] LLM не дал валидный JSON, пропускаю Telegram")
         else:
             msg = render_verdict_message(rec, verdict_json, len(snaps))
             send_telegram_long(msg)
@@ -764,11 +728,11 @@ def run_once():
             time.sleep(SLEEP_BETWEEN_LLM_CALLS)
 
     save_llm_state(llm_state)
-
     prune_jsonl_file(LOG_FILE, RETENTION_DAYS_SNAPSHOTS)
     prune_jsonl_file(HEARTBEAT_FILE, RETENTION_DAYS_HEARTBEAT)
 
-    print(f"Готово. LLM-вызовов за прогон: {llm_calls_used}")
+    print(f"Готово. LLM-вызовов за прогон: {llm_calls_used}. "
+          f"Общее время прогона: {time.time() - run_t0:.1f}с")
 
 
 if __name__ == "__main__":
