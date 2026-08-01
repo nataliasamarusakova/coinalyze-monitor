@@ -594,55 +594,51 @@ def send_telegram(text: str):
 def format_signal(symbol: str, entry: dict, cur: dict,
                   snaps: list[dict], reasons: list[str]) -> str:
     stage = entry["stage"]
-    emoji = {"CONFIRMED_LONG": "🟢", "RUNNING": "🔵",
-             "EXIT_WARNING": "🟠"}.get(stage, "⚪")
     dyn = cur.get("dynamics", {})
+    s = snaps[-1] if snaps else {}
 
-    lines_snap = []
-    for s in snaps[-5:]:
-        t = time.strftime("%H:%M", time.gmtime(s["ts"]))
-        lines_snap.append(
-            f"  {t} | P {s.get('price_chg24','?')}% | "
-            f"OI {s.get('oi_chg24_pct','?')}% | "
-            f"4h {s.get('oi_chg4h_pct','?')}% | "
-            f"CVD {s.get('cvd24','?')} | "
-            f"LLS {s.get('lls24','?')}%"
-        )
+    cfg = {
+        "CONFIRMED_LONG": ("🟢", "ЛОНГ ПОДТВЕРЖДЁН"),
+        "RUNNING":        ("🔵", "ТРЕНД АКТИВЕН"),
+        "EXIT_WARNING":   ("🟠", "ПРИЗНАКИ ВЫХОДА"),
+    }
+    emoji, label = cfg.get(stage, ("⚪", stage))
 
-    pros = "\n".join(f"  ✅ {p}" for p in cur.get("pros", [])) or "  —"
-    cons = "\n".join(f"  ⚠️ {c}" for c in cur.get("cons", [])) or "  —"
-    reas = "\n".join(f"  → {esc(r)}" for r in reasons) or "  —"
+    ar = {"up": "↑", "down": "↓", "flat": "→"}
+    oi_t  = ar.get(dyn.get("oi_trend"), "→")
+    cvd_t = ar.get(dyn.get("cvd_trend"), "→")
+    prc_t = ar.get(dyn.get("price_trend"), "→")
 
-    next_c = {
-        "CONFIRMED_LONG": "Ждём 4+ снимков и score≥7 → RUNNING",
-        "RUNNING": "Следим за OI/CVD/LLS",
-        "EXIT_WARNING": f"Без восстановления {EXIT_NO_RECOVERY} снимка → REMOVED",
-    }.get(stage, "")
+    pattern = cur.get("pattern", "Neutral")
+    pattern = "—" if pattern == "Neutral" else pattern
+
+    score = cur.get("score", 0)
+    note = dyn.get("note", "")
+    reas = " · ".join(reasons) if reasons else ""
+
+    line = "━━━━━━━━━━━━━━━━━━"
 
     msg = (
         f"{emoji} <b>{esc(cur.get('name', symbol))} ({esc(symbol)})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Стадия:</b> {stage}\n"
-        f"<b>Score:</b> {cur.get('score',0)}/10\n"
-        f"<b>Паттерн:</b> {esc(cur.get('pattern','Neutral'))}\n"
-        f"<b>Тренды:</b> OI {dyn.get('oi_trend','?')} | "
-        f"CVD {dyn.get('cvd_trend','?')} | "
-        f"Price {dyn.get('price_trend','?')}\n"
+        f"{line}\n"
+        f"Стадия: {label}\n"
+        f"Score: {score}/10\n"
+        f"Паттерн: {esc(pattern)}\n"
+        f"Тренды: OI {oi_t} | CVD {cvd_t} | Price {prc_t}\n"
+        f"{line}\n"
+        f"P {fmt_pct(s.get('price_chg24'))} | "
+        f"OI {fmt_pct(s.get('oi_chg24_pct'))} | "
+        f"4h {fmt_pct(s.get('oi_chg4h_pct'))} | "
+        f"CVD {fmt_num(s.get('cvd24'), decimals=0)} | "
+        f"LLS {fmt_num(s.get('lls24'), '%', 0)}\n"
     )
-    if dyn.get("note"):
-        msg += f"<i>{esc(dyn['note'])}</i>\n"
-    msg += (
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Снимки:</b>\n" + "\n".join(lines_snap) + "\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>ЗА:</b>\n{pros}\n"
-        f"<b>ПРОТИВ:</b>\n{cons}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Причины:</b>\n{reas}\n"
-    )
-    if next_c:
-        msg += f"\n<b>Далее:</b> {esc(next_c)}\n"
-    msg += "\n<i>Не финансовая рекомендация.</i>"
+
+    if note:
+        msg += f"{line}\n<i>{esc(note)}</i>\n"
+
+    if reas:
+        msg += f"{line}\n<i>{esc(reas)}</i>\n"
+
     return msg
 
 
