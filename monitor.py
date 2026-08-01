@@ -83,6 +83,18 @@ log = logging.getLogger("coinalyze")
 # УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════
 
+def fmt_pct(val):
+    """Форматирует число как процент с плюсом/минусом (например, +12.34%)"""
+    if val is None:
+        return "n/a"
+    return f"{val:+.2f}%"
+
+def fmt_num(val, suffix="", decimals=0):
+    """Форматирует число с заданным количеством знаков и опциональным суффиксом"""
+    if val is None:
+        return "n/a"
+    return f"{val:.{decimals}f}{suffix}"
+
 def parse_number(raw: Optional[str]) -> Optional[float]:
     if raw is None:
         return None
