@@ -1,10 +1,19 @@
 """
-coinalyze_monitor.py
-Playwright -> парсинг таблицы -> точный скоринг/режим по коду (раздел 4-5) ->
-JSONL лог снимков + heartbeat -> сборка мини-истории и макро-контекста ->
-Локальный LLM-анализ (llama-cpp-python, Qwen3.5-4B, ChatML) -> Telegram.
+coinalyze_monitor_v2.py
 
-Запускается по внешнему триггеру (cron-job.org -> GitHub repository_dispatch).
+Playwright -> Coinalyze parser ->
+Lifecycle Engine ->
+Snapshot history ->
+Candidate ranking ->
+Local LLM analysis ->
+Telegram alerts
+
+Версия v2:
+- жизненный цикл монеты
+- автоматическое снятие с наблюдения
+- защита от зависания LLM
+- ускоренный инференс
+- сохранение состояния
 """
 
 import os
@@ -14,738 +23,1189 @@ import time
 import json
 import html
 import multiprocessing
+from datetime import datetime
+
+import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-import requests
+
 
 try:
     from playwright_stealth import stealth_sync
 except ImportError:
-    print("ПРЕДУПРЕЖДЕНИЕ: playwright_stealth недоступен, продолжаю без него.")
+
     def stealth_sync(page):
         pass
 
-# ============ НАСТРОЙКИ ============
+
+# ============================================================
+# ENV
+# ============================================================
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
+
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
+
+# ============================================================
+# LLM
+# ============================================================
+
 LLM_MODEL_PATH = os.environ.get("LLM_MODEL_PATH", "models/Qwen3.5-4B-Q4_K_M.gguf")
+
 LLM_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "220"))
 
-URL = ("https://coinalyze.net/"
-       "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
-       "&filter=ZV9ndF8yLjUmYl9ndF8xJmNfZ3RfMTAwMDAwMCZjbTYxNjVfZ3RfMzUmY202MTY0X2x0XzQ1"
-       "&order_by=oi_current&order_dir=desc")
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "180"))
 
-LOG_FILE = "snapshots.jsonl"
+
+# ============================================================
+# FILES
+# ============================================================
+
+SNAPSHOT_FILE = "snapshots.jsonl"
 HEARTBEAT_FILE = "heartbeat.jsonl"
+
+STATE_FILE = "lifecycle_state.json"
 LLM_STATE_FILE = "llm_state.json"
+
 PROMPT_FILE = "analyst_prompt_condensed.md"
 
-MIN_SCORE_TO_WATCH = 3
-MIN_SNAPSHOTS_FOR_ANALYSIS = 3
-ANALYSIS_WINDOW_MINUTES = 20
-REANALYSIS_COOLDOWN_MINUTES = 30
-MAX_LLM_CALLS_PER_RUN = 2          # снижено под более медленную 4B модель на CPU
-SLEEP_BETWEEN_LLM_CALLS = 1
 
-RETENTION_DAYS_SNAPSHOTS = 14
-RETENTION_DAYS_HEARTBEAT = 14
-MACRO_CONTEXT_DAYS = 7
+# ============================================================
+# ENGINE SETTINGS
+# ============================================================
 
-BUCKET_MAP = {
-    "Healthy Trend": "bullish", "Short Squeeze Setup": "bullish",
-    "Mixed": "bullish", "Weak Trend": "bullish", "Capitulation": "bullish",
-    "Distribution": "warning", "Exhaustion": "warning",
-    "Exhaustion (умеренная)": "warning", "Extreme Exhaustion": "warning",
+MIN_SCORE = 3
+
+MIN_SNAPSHOTS = 3
+
+ANALYSIS_WINDOW_MIN = 30
+
+LLM_COOLDOWN_MIN = 45
+
+MAX_LLM_CALLS = 2
+
+
+# сколько дней хранить историю
+
+SNAPSHOT_RETENTION = 14
+HEARTBEAT_RETENTION = 14
+
+
+# ============================================================
+# LIFECYCLE
+# ============================================================
+
+LIFECYCLE = {
+    "NEW": 0,
+    "ACCUMULATION": 1,
+    "TREND": 2,
+    "ACCELERATION": 3,
+    "EXHAUSTION": 4,
+    "DISTRIBUTION": 5,
+    "INVALID": 6,
+    "EXIT": 7,
+}
+
+
+# ============================================================
+# REGIME COLORS
+# ============================================================
+
+REGIME_BUCKET = {
+    "Healthy Trend": "bullish",
+    "Short Squeeze Setup": "bullish",
+    "Accumulation": "bullish",
+    "Exhaustion": "warning",
+    "Distribution": "warning",
+    "Invalid": "danger",
     "Neutral": "neutral",
 }
 
 
 def bucket_of(regime):
-    return BUCKET_MAP.get(regime, "neutral")
+
+    return REGIME_BUCKET.get(regime, "neutral")
+
+
+# ============================================================
+# ENV CHECK
+# ============================================================
 
 
 def check_env():
+
     required = ["COINALYZE_P_SID", "COINALYZE_CHAT_SID", "TG_BOT_TOKEN", "TG_CHAT_ID"]
-    missing = [v for v in required if not os.environ.get(v)]
+
+    missing = [x for x in required if not os.environ.get(x)]
+
     if missing:
-        print(f"ОШИБКА: не заданы переменные окружения: {missing}")
+
+        print("Нет переменных:", missing)
+
         sys.exit(1)
+
     if not os.path.exists(PROMPT_FILE):
-        print(f"ОШИБКА: не найден файл {PROMPT_FILE} с текстом промпта.")
+
+        print("Нет промпта:", PROMPT_FILE)
+
         sys.exit(1)
-    if not os.path.exists(LLM_MODEL_PATH):
-        print(f"ОШИБКА: не найден файл модели {LLM_MODEL_PATH}.")
-        sys.exit(1)
-    print("Все переменные окружения, промпт и модель на месте.")
 
 
-# ============ ПАРСИНГ ЧИСЕЛ ============
+# ============================================================
+# NUM PARSER
+# ============================================================
 
-def parse_number(raw):
-    if raw is None:
+
+def parse_number(value):
+
+    if value is None:
+
         return None
-    s = raw.strip().replace("$", "").replace("%", "").replace(",", "").replace("+", "")
-    if s in ("", "n/a", "-", "—"):
+
+    s = str(value)
+
+    s = s.replace("$", "").replace("%", "").replace(",", "").replace("+", "").strip()
+
+    if s in ("", "-", "—", "n/a"):
+
         return None
+
     mult = 1
-    if s and s[-1].lower() in ("k", "m", "b", "t"):
-        mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[s[-1].lower()]
+
+    if s[-1:].lower() in ("k", "m", "b", "t"):
+
+        mult = {"k": 1000, "m": 1000000, "b": 1000000000, "t": 1000000000000}[
+            s[-1].lower()
+        ]
+
         s = s[:-1]
+
     try:
+
         return float(s) * mult
-    except ValueError:
+
+    except:
+
         return None
+
+
+# ============================================================
+# COINALYZE PARSER
+# ============================================================
+
+
+URL = (
+    "https://coinalyze.net/"
+    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
+    "&filter=ZV9ndF8yLjUmYl9ndF8xJmNfZ3RfMTAwMDAwMCZjbTYxNjVfZ3RfMzUmY202MTY0X2x0XzQ1"
+    "&order_by=oi_current"
+    "&order_dir=desc"
+)
 
 
 def fetch_rows_from_html(html_text):
+
     soup = BeautifulSoup(html_text, "lxml")
-    rows_found = soup.select("tbody tr")
-    print(f"Найдено строк: {len(rows_found)}")
 
-    records = []
-    for tr in rows_found:
+    rows = soup.select("tbody tr")
+
+    print("Найдено строк:", len(rows))
+
+    result = []
+
+    for tr in rows:
+
         symbol = tr.get("data-coin")
-        tds = tr.find_all("td")
-        if len(tds) < 23:
-            continue
-        name_spans = tds[1].find_all("span")
-        coin_name = name_spans[0].get_text(strip=True) if name_spans else symbol
 
-        rec = {
-            "ts": int(time.time()),
-            "symbol": symbol,
-            "name": coin_name,
-            "price": parse_number(tds[2].get_text(strip=True)),
-            "price_chg24": parse_number(tds[3].get_text(strip=True)),
-            "mktcap": parse_number(tds[4].get_text(strip=True)),
-            "volume24": parse_number(tds[5].get_text(strip=True)),
-            "oi": parse_number(tds[6].get_text(strip=True)),
-            "oi_chg24_pct": parse_number(tds[7].get_text(strip=True)),
-            "oi_chg4h_pct": parse_number(tds[9].get_text(strip=True)),
-            "oi_vol_ratio": parse_number(tds[11].get_text(strip=True)),
-            "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
-            "fr_avg": parse_number(tds[13].get_text(strip=True)),
-            "pfr_avg": parse_number(tds[14].get_text(strip=True)),
-            "fr_oiw": parse_number(tds[15].get_text(strip=True)),
-            "pfr_oiw": parse_number(tds[16].get_text(strip=True)),
-            "liq_short24": parse_number(tds[17].get_text(strip=True)),
-            "liq_long24": parse_number(tds[18].get_text(strip=True)),
-            "ls_accounts": parse_number(tds[19].get_text(strip=True)),
-            "btc_corr7d": parse_number(tds[20].get_text(strip=True)),
-            "cvd24": parse_number(tds[21].get_text(strip=True)),
-            "lls24": parse_number(tds[22].get_text(strip=True)),
-        }
-        records.append(rec)
-    return records
+        if not symbol:
+            continue
+
+        tds = tr.find_all("td")
+
+        if len(tds) < 23:
+
+            continue
+
+        name_spans = tds[1].find_all("span")
+
+        name = name_spans[0].get_text(strip=True) if name_spans else symbol
+
+        try:
+
+            rec = {
+                "ts": int(time.time()),
+                "symbol": symbol,
+                "name": name,
+                "price": parse_number(tds[2].get_text(strip=True)),
+                "price_chg24": parse_number(tds[3].get_text(strip=True)),
+                "mktcap": parse_number(tds[4].get_text(strip=True)),
+                "volume24": parse_number(tds[5].get_text(strip=True)),
+                "oi": parse_number(tds[6].get_text(strip=True)),
+                "oi_chg24_pct": parse_number(tds[7].get_text(strip=True)),
+                "oi_chg4h_pct": parse_number(tds[9].get_text(strip=True)),
+                "oi_vol_ratio": parse_number(tds[11].get_text(strip=True)),
+                "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
+                "fr_avg": parse_number(tds[13].get_text(strip=True)),
+                "pfr_avg": parse_number(tds[14].get_text(strip=True)),
+                "fr_oiw": parse_number(tds[15].get_text(strip=True)),
+                "pfr_oiw": parse_number(tds[16].get_text(strip=True)),
+                "liq_short24": parse_number(tds[17].get_text(strip=True)),
+                "liq_long24": parse_number(tds[18].get_text(strip=True)),
+                "ls_accounts": parse_number(tds[19].get_text(strip=True)),
+                "btc_corr7d": parse_number(tds[20].get_text(strip=True)),
+                "cvd24": parse_number(tds[21].get_text(strip=True)),
+                "lls24": parse_number(tds[22].get_text(strip=True)),
+            }
+
+            result.append(rec)
+
+        except Exception as e:
+
+            print("Ошибка парсинга строки:", e)
+
+    return result
+
+
+# ============================================================
+# PLAYWRIGHT FETCH
+# ============================================================
 
 
 def fetch_rows_via_browser():
+
     with sync_playwright() as p:
+
         browser = p.chromium.launch(headless=True)
+
         context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            user_agent=(
+                "Mozilla/5.0 " "(Windows NT 10.0; Win64; x64) " "Chrome/124 Safari/537"
+            ),
             viewport={"width": 1920, "height": 1080},
             locale="ru-RU",
         )
-        if COINALYZE_P_SID or COINALYZE_CHAT_SID:
-            context.add_cookies([
-                {"name": "p_sid", "value": COINALYZE_P_SID,
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
-                {"name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
-                {"name": "cookies_accepted", "value": "1",
-                 "domain": "coinalyze.net", "path": "/", "secure": True},
-            ])
+
+        if COINALYZE_P_SID:
+
+            context.add_cookies(
+                [
+                    {
+                        "name": "p_sid",
+                        "value": COINALYZE_P_SID,
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                    {
+                        "name": "chat_sid",
+                        "value": COINALYZE_CHAT_SID,
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                    {
+                        "name": "cookies_accepted",
+                        "value": "1",
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                ]
+            )
+
         page = context.new_page()
+
         stealth_sync(page)
+
         html_content = ""
+
         try:
+
             page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+
             page.wait_for_timeout(3000)
-            if "Attention Required" in page.content():
-                page.wait_for_timeout(8000)
+
             page.wait_for_selector("tbody tr", timeout=20000)
+
             html_content = page.content()
+
         except Exception as e:
-            print(f"Ошибка загрузки: {e}")
+
+            print("Ошибка загрузки Coinalyze:", e)
+
             try:
+
                 html_content = page.content()
-            except Exception:
+
+            except:
+
                 pass
-            try:
-                page.screenshot(path="debug_screenshot.png", full_page=True)
-            except Exception:
-                pass
+
         browser.close()
+
         return html_content
 
 
 def fetch_rows():
+
     html_content = fetch_rows_via_browser()
+
     with open("debug_page.html", "w", encoding="utf-8") as f:
+
         f.write(html_content)
+
     rows = fetch_rows_from_html(html_content)
 
     if not rows:
-        send_telegram_long("⚠️ Coinalyze monitor: не получены данные (куки истекли "
-                            "или изменилась разметка). Проверь debug_page.html.")
+
+        send_telegram_long("⚠️ Coinalyze v2: данные не получены")
+
         sys.exit(1)
+
     return rows
 
 
-# ============ СКОРИНГ (раздел 4 промпта, точный код) ============
-
-def score_profile_a(r):
-    flags = []
-    if not (r["volume24"] and r["volume24"] > 10_000_000):
-        return False, 0, flags
-    if not (r["price_chg24"] is not None and r["price_chg24"] > 0
-            and r["oi_chg24_pct"] is not None and r["oi_chg24_pct"] > 0):
-        return False, 0, flags
-
-    score = 0
-    cvd = r["cvd24"]
-    if cvd is not None:
-        if cvd > 70: score += 2
-        elif cvd >= 50: score += 1
-        elif cvd < 35: score -= 1; flags.append("CVD24<35")
-    lls = r["lls24"]
-    if lls is not None:
-        if lls < 15: score += 2
-        elif lls <= 35: score += 1
-        elif lls > 50: score -= 1; flags.append("LLS24>50%")
-    oi = r["oi_chg24_pct"]
-    if oi is not None:
-        if 5 <= oi <= 35: score += 1
-        elif oi > 35: flags.append("экстремальный OI")
-    pc = r["price_chg24"]
-    if pc is not None:
-        if 2 <= pc <= 20: score += 1
-        elif pc > 20: flags.append("перегрев цены")
-    fr = r["fr_oiw"]
-    if fr is not None:
-        if -0.01 <= fr <= 0.03: score += 1
-        else: flags.append("Funding-дивергенция")
-    oim = r["oi_mktcap_ratio"]
-    if oim is not None and oim < 0.15: score += 1
-    oiv = r["oi_vol_ratio"]
-    if oiv is not None and 0.1 <= oiv <= 2.5: score += 1
-    ls = r["ls_accounts"]
-    if ls is not None:
-        if 0.8 <= ls <= 1.5: score += 1
-        elif ls > 1.5: score -= 1; flags.append("Ритейл FOMO")
-    return True, score, flags
+# ============================================================
+# COINALYZE PARSER
+# ============================================================
 
 
-def score_profile_b(r):
-    flags = []
-    if not (r["volume24"] and r["volume24"] > 10_000_000):
-        return False, 0, flags
-    if not (r["price_chg24"] is not None and r["price_chg24"] < 0
-            and r["oi_chg24_pct"] is not None and r["oi_chg24_pct"] < 0):
-        return False, 0, flags
-    score = 0
-    pc = r["price_chg24"]
-    if pc is not None:
-        if pc < -8: score += 2
-        elif pc <= -3: score += 1
-    oi = r["oi_chg24_pct"]
-    if oi is not None:
-        if oi < -15: score += 2
-        elif oi <= -5: score += 1
-    lls = r["lls24"]
-    if lls is not None:
-        if lls > 50: score += 2
-        elif lls >= 35: score += 1
-    fr = r["fr_oiw"]
-    if fr is not None and fr < 0: score += 1
-    cvd = r["cvd24"]
-    if cvd is not None:
-        if cvd < 35: score += 1
-        elif cvd > 50: score += 1; flags.append("скрытое накопление на дне")
-    return True, score, flags
+URL = (
+    "https://coinalyze.net/"
+    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
+    "&filter=ZV9ndF8yLjUmYl9ndF8xJmNfZ3RfMTAwMDAwMCZjbTYxNjVfZ3RfMzUmY202MTY0X2x0XzQ1"
+    "&order_by=oi_current"
+    "&order_dir=desc"
+)
 
 
-def classify_regime(r):
-    oi, pc, cvd, lls = r["oi_chg24_pct"], r["price_chg24"], r["cvd24"], r["lls24"]
-    if oi is None or pc is None:
-        return "Neutral", []
-    regime = "Neutral"
-    if oi < -5:
-        regime = "Capitulation" if pc < -3 else "Distribution"
-    elif -5 <= oi <= 5:
-        regime = "Weak Trend" if (pc > 2 and cvd is not None and cvd < 50) else "Neutral"
-    elif 5 < oi <= 15:
-        if cvd is not None and cvd > 70 and lls is not None and lls < 25 and 2 <= pc <= 10:
-            regime = "Short Squeeze Setup"
-        elif cvd is not None and cvd > 50 and lls is not None and lls < 35 and 2 <= pc <= 15:
-            regime = "Healthy Trend"
-        else:
-            regime = "Mixed"
-    elif 15 < oi <= 35:
-        regime = "Exhaustion" if (pc > 15 and cvd is not None and cvd > 70) else "Exhaustion (умеренная)"
-    else:
-        regime = "Extreme Exhaustion"
+def fetch_rows_from_html(html_text):
 
-    tags = []
-    fr = r["fr_oiw"]
-    if regime in ("Healthy Trend", "Short Squeeze Setup") and fr is not None and 0 <= fr <= 0.015:
-        tags.append("Stealth Accumulation")
-    if regime in ("Healthy Trend", "Short Squeeze Setup", "Mixed") and fr is not None and fr < 0:
-        tags.append("Funding-дивергенция")
-    if regime in ("Exhaustion", "Extreme Exhaustion") and fr is not None and fr > 0.05:
-        tags.append("Euphoria")
-    if regime == "Capitulation" and cvd is not None and cvd > 50:
-        tags.append("Скрытое накопление на дне")
-    ls = r["ls_accounts"]
-    if ls is not None and ls > 1.5 and regime in ("Healthy Trend", "Short Squeeze Setup", "Weak Trend"):
-        tags.append("Ритейл FOMO")
-    return regime, tags
+    soup = BeautifulSoup(html_text, "lxml")
+
+    rows = soup.select("tbody tr")
+
+    print("Найдено строк:", len(rows))
+
+    result = []
+
+    for tr in rows:
+
+        symbol = tr.get("data-coin")
+
+        if not symbol:
+            continue
+
+        tds = tr.find_all("td")
+
+        if len(tds) < 23:
+
+            continue
+
+        name_spans = tds[1].find_all("span")
+
+        name = name_spans[0].get_text(strip=True) if name_spans else symbol
+
+        try:
+
+            rec = {
+                "ts": int(time.time()),
+                "symbol": symbol,
+                "name": name,
+                "price": parse_number(tds[2].get_text(strip=True)),
+                "price_chg24": parse_number(tds[3].get_text(strip=True)),
+                "mktcap": parse_number(tds[4].get_text(strip=True)),
+                "volume24": parse_number(tds[5].get_text(strip=True)),
+                "oi": parse_number(tds[6].get_text(strip=True)),
+                "oi_chg24_pct": parse_number(tds[7].get_text(strip=True)),
+                "oi_chg4h_pct": parse_number(tds[9].get_text(strip=True)),
+                "oi_vol_ratio": parse_number(tds[11].get_text(strip=True)),
+                "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
+                "fr_avg": parse_number(tds[13].get_text(strip=True)),
+                "pfr_avg": parse_number(tds[14].get_text(strip=True)),
+                "fr_oiw": parse_number(tds[15].get_text(strip=True)),
+                "pfr_oiw": parse_number(tds[16].get_text(strip=True)),
+                "liq_short24": parse_number(tds[17].get_text(strip=True)),
+                "liq_long24": parse_number(tds[18].get_text(strip=True)),
+                "ls_accounts": parse_number(tds[19].get_text(strip=True)),
+                "btc_corr7d": parse_number(tds[20].get_text(strip=True)),
+                "cvd24": parse_number(tds[21].get_text(strip=True)),
+                "lls24": parse_number(tds[22].get_text(strip=True)),
+            }
+
+            result.append(rec)
+
+        except Exception as e:
+
+            print("Ошибка парсинга строки:", e)
+
+    return result
 
 
-# ============ ЛОГИ: СНАПШОТЫ КАНДИДАТОВ + HEARTBEAT ВСЕХ МОНЕТ ============
+# ============================================================
+# PLAYWRIGHT FETCH
+# ============================================================
+
+
+def fetch_rows_via_browser():
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch(headless=True)
+
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 " "(Windows NT 10.0; Win64; x64) " "Chrome/124 Safari/537"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="ru-RU",
+        )
+
+        if COINALYZE_P_SID:
+
+            context.add_cookies(
+                [
+                    {
+                        "name": "p_sid",
+                        "value": COINALYZE_P_SID,
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                    {
+                        "name": "chat_sid",
+                        "value": COINALYZE_CHAT_SID,
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                    {
+                        "name": "cookies_accepted",
+                        "value": "1",
+                        "domain": "coinalyze.net",
+                        "path": "/",
+                    },
+                ]
+            )
+
+        page = context.new_page()
+
+        stealth_sync(page)
+
+        html_content = ""
+
+        try:
+
+            page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+
+            page.wait_for_timeout(3000)
+
+            page.wait_for_selector("tbody tr", timeout=20000)
+
+            html_content = page.content()
+
+        except Exception as e:
+
+            print("Ошибка загрузки Coinalyze:", e)
+
+            try:
+
+                html_content = page.content()
+
+            except:
+
+                pass
+
+        browser.close()
+
+        return html_content
+
+
+def fetch_rows():
+
+    html_content = fetch_rows_via_browser()
+
+    with open("debug_page.html", "w", encoding="utf-8") as f:
+
+        f.write(html_content)
+
+    rows = fetch_rows_from_html(html_content)
+
+    if not rows:
+
+        send_telegram_long("⚠️ Coinalyze v2: данные не получены")
+
+        sys.exit(1)
+
+    return rows
+
+
+# ============================================================
+# HISTORY STORAGE
+# ============================================================
+
 
 def load_jsonl(path):
+
     if not os.path.exists(path):
+
         return []
+
+    result = []
+
     with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
 
-
-def append_jsonl(path, rec):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def prune_jsonl_file(path, retention_days, ts_field="ts"):
-    if not os.path.exists(path):
-        return
-    cutoff = int(time.time()) - retention_days * 86400
-    kept_lines = []
-    with open(path, "r", encoding="utf-8") as f:
         for line in f:
+
             if not line.strip():
+
                 continue
-            obj = json.loads(line)
-            if obj.get(ts_field, 0) > cutoff:
-                kept_lines.append(line)
+
+            try:
+
+                result.append(json.loads(line))
+
+            except:
+
+                continue
+
+    return result
+
+
+def append_jsonl(path, obj):
+
+    with open(path, "a", encoding="utf-8") as f:
+
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def save_json(path, data):
+
     with open(path, "w", encoding="utf-8") as f:
-        f.writelines(kept_lines)
+
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def load_llm_state():
-    if not os.path.exists(LLM_STATE_FILE):
+def load_json(path):
+
+    if not os.path.exists(path):
+
         return {}
-    with open(LLM_STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+    try:
+
+        with open(path, "r", encoding="utf-8") as f:
+
+            return json.load(f)
+
+    except:
+
+        return {}
 
 
-def save_llm_state(state):
-    with open(LLM_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+# ============================================================
+# CLEAN OLD DATA
+# ============================================================
 
 
-def recent_snapshots(history, symbol, window_minutes):
-    cutoff = int(time.time()) - window_minutes * 60
-    return sorted(
-        [h for h in history if h["symbol"] == symbol and h["ts"] > cutoff],
-        key=lambda h: h["ts"]
+def prune_jsonl(path, days):
+
+    if not os.path.exists(path):
+
+        return
+
+    limit = time.time() - days * 86400
+
+    keep = []
+
+    with open(path, "r", encoding="utf-8") as f:
+
+        for line in f:
+
+            try:
+
+                obj = json.loads(line)
+
+                if obj.get("ts", 0) > limit:
+
+                    keep.append(line)
+
+            except:
+
+                pass
+
+    with open(path, "w", encoding="utf-8") as f:
+
+        f.writelines(keep)
+
+
+# ============================================================
+# SNAPSHOT WINDOW
+# ============================================================
+
+
+def get_recent_snapshots(history, symbol, minutes=30):
+
+    cutoff = time.time() - minutes * 60
+
+    result = [
+        x for x in history if (x.get("symbol") == symbol and x.get("ts", 0) > cutoff)
+    ]
+
+    return sorted(result, key=lambda x: x["ts"])
+
+
+# ============================================================
+# LIFECYCLE STATE
+# ============================================================
+
+
+def update_lifecycle_state(state, rec):
+
+    symbol = rec["symbol"]
+
+    old = state.get(symbol, {})
+
+    lifecycle = rec.get("lifecycle")
+
+    history = old.get("states", [])
+
+    history.append(
+        {
+            "ts": rec["ts"],
+            "state": lifecycle,
+            "score": rec["score"],
+            "price": rec["price"],
+        }
     )
 
+    # держим только последние 30 изменений
 
-# ============ МАКРО-КОНТЕКСТ (долгая память, дёшево по токенам) ============
+    history = history[-30:]
 
-def build_macro_context(heartbeat_history, symbol, days=MACRO_CONTEXT_DAYS):
-    cutoff = int(time.time()) - days * 86400
-    entries = sorted(
-        [h for h in heartbeat_history if h["symbol"] == symbol and h["ts"] > cutoff],
-        key=lambda h: h["ts"]
-    )
-    if not entries:
-        return "Долгосрочная история отсутствует — монета впервые попала в поле зрения."
+    state[symbol] = {
+        "current": lifecycle,
+        "score": rec["score"],
+        "last_update": rec["ts"],
+        "states": history,
+    }
 
-    prices = [e["price"] for e in entries if e.get("price") is not None]
-    if not prices:
-        return "Долгосрочная история есть, но без валидных цен."
-
-    now_price = entries[-1]["price"]
-    period_high = max(prices)
-    period_low = min(prices)
-    drawdown = (now_price - period_high) / period_high * 100 if period_high else None
-    rise_from_low = (now_price - period_low) / period_low * 100 if period_low else None
-
-    max_gap_hours = 0
-    for i in range(1, len(entries)):
-        dt_hours = (entries[i]["ts"] - entries[i - 1]["ts"]) / 3600
-        if dt_hours > max_gap_hours:
-            max_gap_hours = dt_hours
-    gap_desc = ""
-    if max_gap_hours > 2:
-        gap_desc = (f" В истории есть разрыв до {max_gap_hours:.1f}ч — монета "
-                    f"временно выпадала из наблюдения.")
-
-    return (
-        f"Контекст за {days} дн. ({len(entries)} точек): текущая цена {now_price}, "
-        f"максимум {period_high} (сейчас {drawdown:+.1f}% от максимума), "
-        f"минимум {period_low} (рост от минимума {rise_from_low:+.1f}%).{gap_desc}"
-    )
+    return state
 
 
-# ============ СБОРКА ДАННЫХ ДЛЯ LLM ============
+# ============================================================
+# STOP WATCH LOGIC
+# ============================================================
 
-def build_snapshot_log_table(snaps):
-    lines = ["№ | Время | Режим | Балл | OI24h% | OI4h% | CVD24 | LLS24 | FR_OIW% | Price%"]
+
+def should_remove_from_watch(lifecycle_state, symbol):
+
+    data = lifecycle_state.get(symbol)
+
+    if not data:
+
+        return False
+
+    current = data.get("current")
+
+    states = data.get("states", [])
+
+    # =================================================
+    # EXIT сразу удаляем
+    # =================================================
+
+    if current == "EXIT":
+
+        return True
+
+    # =================================================
+    # 3 раза подряд EXHAUSTION
+    # =================================================
+
+    if len(states) >= 3:
+
+        last3 = [x["state"] for x in states[-3:]]
+
+        if all(x == "EXHAUSTION" for x in last3):
+
+            return True
+
+    # =================================================
+    # нет обновления больше суток
+    # =================================================
+
+    if time.time() - data.get("last_update", 0) > 86400:
+
+        return True
+
+    return False
+
+
+# ============================================================
+# SNAPSHOT TABLE FOR LLM
+# ============================================================
+
+
+def build_snapshot_table(snaps):
+
+    lines = ["№ | Время | Stage | Score | Price24 | OI24 | OI4H | CVD | LLS"]
+
     for i, s in enumerate(snaps, 1):
-        t = time.strftime("%H:%M", time.gmtime(s["ts"]))
+
+        tm = datetime.fromtimestamp(s["ts"]).strftime("%H:%M")
+
         lines.append(
-            f"{i} | {t} | {s.get('regime')} | {s.get('score')} | "
-            f"{s.get('oi_chg24_pct')} | {s.get('oi_chg4h_pct')} | "
-            f"{s.get('cvd24')} | {s.get('lls24')} | {s.get('fr_oiw')} | "
-            f"{s.get('price_chg24')}"
+            f"{i} | "
+            f"{tm} | "
+            f"{s.get('lifecycle')} | "
+            f"{s.get('score')} | "
+            f"{s.get('price_chg24')} | "
+            f"{s.get('oi_chg24_pct')} | "
+            f"{s.get('oi_chg4h_pct')} | "
+            f"{s.get('cvd24')} | "
+            f"{s.get('lls24')}"
         )
+
     return "\n".join(lines)
 
 
-def format_full_metrics(r):
-    return (
-        f"Coin: {r['name']} ({r['symbol']})\n"
-        f"Price: {r['price']} | Price Change 24H: {r['price_chg24']}%\n"
-        f"Volume 24H: {r['volume24']} | MktCap: {r['mktcap']}\n"
-        f"OI: {r['oi']} | OI Chg 24H: {r['oi_chg24_pct']}% | OI Chg 4H: {r['oi_chg4h_pct']}%\n"
-        f"OI/Volume: {r['oi_vol_ratio']} | OI/MktCap: {r['oi_mktcap_ratio']}\n"
-        f"Funding OI-W: {r['fr_oiw']}% | Predicted OI-W: {r['pfr_oiw']}%\n"
-        f"Short Liq 24H: {r['liq_short24']} | Long Liq 24H: {r['liq_long24']}\n"
-        f"L/S Accounts Ratio: {r['ls_accounts']} | BTC Corr 7D: {r['btc_corr7d']}\n"
-        f"CVD24: {r['cvd24']} | LLS24: {r['lls24']}%\n"
-    )
+# ============================================================
+# LLM ENGINE
+# ============================================================
 
 
-def load_system_prompt():
+_llm = None
+
+
+def load_prompt():
+
     with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+
         return f.read()
 
 
-# ============ ЛОКАЛЬНЫЙ LLM (llama-cpp-python, Qwen3.5-4B, ChatML) ============
+def get_llm():
 
-_llm_instance = None
+    global _llm
 
-RESPONSE_SCHEMA_HINT = """
-Ответь ТОЛЬКО валидным JSON, без markdown, без текста до/после. Ключи ровно такие:
-{
-  "signal": "Бычий/Медвежий/Нейтральный/Смешанный",
-  "regime": "название режима",
-  "tag": "тег или нет",
-  "confidence": "Низкая/Средняя/Высокая",
-  "persistence_snapshots": число,
-  "pros": "краткий список метрик ЗА через точку с запятой",
-  "cons": "краткий список метрик ПРОТИВ через точку с запятой",
-  "pattern": "название паттерна или нет",
-  "dynamics": "1 короткое предложение о динамике между снимками",
-  "risks": "1 короткое предложение о рисках",
-  "next_check": "какое условие ждать дальше",
-  "verdict": "НЕ ВХОДИТЬ/НАБЛЮДАТЬ/РАССМАТРИВАТЬ",
-  "verdict_reason": "1 короткое предложение обоснования"
-}
-Пиши кратко. Все текстовые значения — короткие фразы, не абзацы.
+    if _llm is not None:
+
+        return _llm
+
+    from llama_cpp import Llama
+
+    threads = max(2, multiprocessing.cpu_count())
+
+    print("Загрузка LLM:", LLM_MODEL_PATH)
+
+    start = time.time()
+
+    _llm = Llama(
+        model_path=LLM_MODEL_PATH,
+        n_ctx=LLM_N_CTX,
+        n_threads=threads,
+        n_batch=512,
+        chat_format="chatml",
+        temperature=0,
+        verbose=False,
+        # быстрее для GitHub runner / CPU
+        use_mmap=True,
+        use_mlock=False,
+    )
+
+    print("LLM загружен за", round(time.time() - start, 1), "сек")
+
+    # короткий прогрев
+
+    try:
+
+        _llm.create_chat_completion(
+            messages=[{"role": "user", "content": "ping"}], max_tokens=2, temperature=0
+        )
+
+    except:
+
+        pass
+
+    return _llm
+
+
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
+
+
+def extract_json(text):
+
+    if not text:
+
+        return None
+
+    start = text.find("{")
+
+    if start < 0:
+
+        return None
+
+    depth = 0
+
+    for i in range(start, len(text)):
+
+        if text[i] == "{":
+
+            depth += 1
+
+        elif text[i] == "}":
+
+            depth -= 1
+
+            if depth == 0:
+
+                block = text[start : i + 1]
+
+                try:
+
+                    return json.loads(block)
+
+                except:
+
+                    return None
+
+    return None
+
+
+# ============================================================
+# LLM CALL
+# ============================================================
+
+
+def ask_llm(system, user):
+
+    llm = get_llm()
+
+    message = f"""
+ВАЖНО:
+
+- Не пиши reasoning.
+- Не используй <think>.
+- Верни только JSON.
+- Не пересчитывай score.
+- Анализируй только динамику.
+
+
+{user}
+
+
+ФОРМАТ:
+
+{{
+"signal":"",
+"confidence":"",
+"pattern":"",
+"pros":"",
+"cons":"",
+"risk":"",
+"next_check":"",
+"verdict":""
+}}
+
+"""
+
+    try:
+
+        start = time.time()
+
+        result = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": message},
+            ],
+            temperature=0,
+            max_tokens=LLM_MAX_TOKENS,
+            stop=["<|im_end|>", "</think>", "```"],
+        )
+
+        elapsed = time.time() - start
+
+        print("LLM время:", round(elapsed, 1), "сек")
+
+        text = result["choices"][0]["message"]["content"]
+
+        if "<think>" in text:
+
+            text = text.split("</think>")[-1]
+
+        return extract_json(text)
+
+    except Exception as e:
+
+        print("Ошибка LLM:", e)
+
+        return None
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+
+def escape(v):
+
+    return html.escape(str(v), quote=False)
+
+
+def send_telegram(text):
+
+    if not TG_BOT_TOKEN:
+
+        print(text)
+
+        return
+
+    url = "https://api.telegram.org/" f"bot{TG_BOT_TOKEN}/sendMessage"
+
+    try:
+
+        requests.post(
+            url,
+            data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+
+    except Exception as e:
+
+        print("Telegram error", e)
+
+
+def render_alert(rec, answer):
+
+    return f"""
+
+<b>{escape(rec['name'])} ({rec['symbol']})</b>
+
+
+Stage:
+<b>{rec['lifecycle']}</b>
+
+
+Score:
+{rec['score']}
+
+
+Signal:
+{escape(answer.get('signal'))}
+
+
+Pattern:
+{escape(answer.get('pattern'))}
+
+
+За:
+{escape(answer.get('pros'))}
+
+
+Против:
+{escape(answer.get('cons'))}
+
+
+Риск:
+{escape(answer.get('risk'))}
+
+
+Следующий контроль:
+{escape(answer.get('next_check'))}
+
+
+<b>ВЕРДИКТ:
+{escape(answer.get('verdict'))}</b>
+
+
+<i>Информационный анализ, не финансовая рекомендация.</i>
+
 """
 
 
-def get_llm():
-    global _llm_instance
-    if _llm_instance is None:
-        from llama_cpp import Llama
-        n_threads = multiprocessing.cpu_count()
-        print(f"Загружаю локальную модель из {LLM_MODEL_PATH} (n_threads={n_threads})...")
-        t0 = time.time()
-        _llm_instance = Llama(
-            model_path=LLM_MODEL_PATH,
-            n_ctx=LLM_N_CTX,
-            n_threads=n_threads,
-            n_batch=1024,
-            chat_format="chatml",   # ChatML-формат подходит для семейства Qwen
-            use_mmap=False,         # читаем модель в RAM сразу целиком, а не лениво при инференсе
-            use_mlock=False,
-            verbose=False,
-        )
-        print(f"Модель загружена за {time.time() - t0:.1f}с (включая полное чтение с диска).")
+# ============================================================
+# MAIN ENGINE
+# ============================================================
 
-        t0 = time.time()
-        _llm_instance.create_chat_completion(
-            messages=[{"role": "user", "content": "Привет"}],
-            max_tokens=5,
-            temperature=0,
-        )
-        print(f"Прогрев модели занял {time.time() - t0:.1f}с.")
-    return _llm_instance
-
-
-def extract_json_object(text):
-    """Достаёт первый сбалансированный {...} блок из текста, даже если вокруг мусор."""
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-    return None
-
-
-def call_llm_json(system_prompt, user_message, max_retries=1):
-    llm = get_llm()
-    full_user_message = (
-    "ВАЖНО!\n"
-    "- Не используй <think>\n"
-    "- Не выводи ход рассуждений\n"
-    "- Не объясняй анализ\n"
-    "- Верни только JSON\n\n"
-    + user_message
-    + "\n\n"
-    + RESPONSE_SCHEMA_HINT
-    )
-
-    for attempt in range(max_retries + 1):
-        try:
-            t0 = time.time()
-            result = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": full_user_message},
-                ],
-                temperature=0.0,
-                max_tokens=LLM_MAX_TOKENS,
-                stop=[
-                    "<|im_end|>",
-                    "```"
-                ],
-            )
-            elapsed = time.time() - t0
-            content = result["choices"][0]["message"]["content"]
-            print(f"Локальный инференс занял {elapsed:.1f}с, символов ответа: {len(content)}")
-
-            parsed = extract_json_object(content)
-            if parsed is not None:
-                return parsed
-
-            print(f"Не удалось извлечь валидный JSON (попытка {attempt+1}): {content[:300]}")
-
-        except Exception as e:
-            print(f"Исключение при локальном инференсе: {e}")
-
-    return None
-
-
-# ============ TELEGRAM ============
-
-def esc(value):
-    return html.escape(str(value), quote=False)
-
-
-def safe_get(d, key, default="н/д"):
-    val = d.get(key, default)
-    if val is None or val == "":
-        return default
-    return val
-
-
-def render_verdict_message(rec, v, snaps_count):
-    r = rec
-
-    verdict = safe_get(v, "verdict", "НАБЛЮДАТЬ")
-    verdict_emoji = {
-        "НЕ ВХОДИТЬ": "🔴", "НАБЛЮДАТЬ": "🟡", "РАССМАТРИВАТЬ": "🟢",
-    }.get(verdict, "⚪")
-
-    pers_n = v.get("persistence_snapshots", snaps_count)
-
-    return (
-        f"{verdict_emoji} <b>{esc(r['name'])} ({esc(r['symbol'])})</b> — "
-        f"<b>{esc(verdict)}</b>\n"
-        f"Профиль: {esc(rec['profile'])} | Балл: {rec['score']} | "
-        f"Снимков в анализе: {snaps_count}\n"
-        f"—————————————\n"
-        f"<b>1. Сигнал:</b> {esc(safe_get(v, 'signal'))}\n"
-        f"<b>2. Режим:</b> {esc(safe_get(v, 'regime', rec['regime']))}\n"
-        f"<b>3. Тег:</b> {esc(safe_get(v, 'tag'))}\n"
-        f"<b>4. Балл:</b> {rec['score']}\n"
-        f"<b>5. Уверенность:</b> {esc(safe_get(v, 'confidence'))} "
-        f"(Persistence: {pers_n} снимков)\n"
-        f"<b>6. Метрики ЗА:</b> {esc(safe_get(v, 'pros'))}\n"
-        f"<b>7. Метрики ПРОТИВ:</b> {esc(safe_get(v, 'cons'))}\n"
-        f"<b>8. Паттерн:</b> {esc(safe_get(v, 'pattern'))}\n"
-        f"<b>9. Динамика:</b> {esc(safe_get(v, 'dynamics'))}\n"
-        f"<b>10. Риски:</b> {esc(safe_get(v, 'risks'))}\n"
-        f"<b>11. Тепловая карта:</b> нет данных\n"
-        f"<b>12. Усилить/Опровергнуть:</b> {esc(safe_get(v, 'next_check'))}\n"
-        f"—————————————\n"
-        f"{verdict_emoji} <b>ВЕРДИКТ: {esc(verdict)}</b>\n"
-        f"Причина: {esc(safe_get(v, 'verdict_reason'))}\n\n"
-        f"<i>Анализ информационный, не финансовая рекомендация.</i>"
-    )
-
-
-def send_telegram_long(text):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("Telegram не настроен, пропускаю отправку:", text[:200])
-        return False
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-
-    chunks = []
-    remaining = text
-    while len(remaining) > 3500:
-        split_at = remaining.rfind("\n", 0, 3500)
-        if split_at == -1:
-            split_at = 3500
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:]
-    chunks.append(remaining)
-
-    ok_all = True
-    for chunk in chunks:
-        try:
-            resp = requests.post(url, data={
-                "chat_id": TG_CHAT_ID, "text": chunk,
-                "parse_mode": "HTML", "disable_web_page_preview": True,
-            }, timeout=15)
-            if resp.status_code != 200:
-                print(f"ОШИБКА Telegram API: {resp.status_code} — {resp.text[:300]}")
-                resp2 = requests.post(url, data={
-                    "chat_id": TG_CHAT_ID, "text": chunk,
-                    "disable_web_page_preview": True,
-                }, timeout=15)
-                ok_all = ok_all and resp2.status_code == 200
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"Исключение при отправке в Telegram: {e}")
-            ok_all = False
-    return ok_all
-
-
-# ============ ГЛАВНЫЙ ЦИКЛ ============
 
 def run_once():
-    run_t0 = time.time()
+
+    started = time.time()
+
     check_env()
-    system_prompt = load_system_prompt()
-    history = load_jsonl(LOG_FILE)
-    heartbeat_history = load_jsonl(HEARTBEAT_FILE)
-    llm_state = load_llm_state()
+
+    prompt = load_prompt()
+
+    snapshots = load_jsonl(SNAPSHOT_FILE)
+
+    heartbeat = load_jsonl(HEARTBEAT_FILE)
+
+    lifecycle_state = load_json(STATE_FILE)
+
+    llm_state = load_json(LLM_STATE_FILE)
+
     rows = fetch_rows()
-    print(f"Получено монет: {len(rows)}")
-    now_ts = int(time.time())
+
+    print("Получено монет:", len(rows))
 
     candidates = []
 
+    now = int(time.time())
+
     for r in rows:
-        append_jsonl(HEARTBEAT_FILE, {
-            "ts": r["ts"], "symbol": r["symbol"], "price": r["price"],
-        })
-        heartbeat_history.append({"ts": r["ts"], "symbol": r["symbol"], "price": r["price"]})
 
-        passed_a, score_a, flags_a = score_profile_a(r)
-        passed_b, score_b, flags_b = score_profile_b(r)
+        # -------------------------------------------------
+        # heartbeat всех монет
+        # -------------------------------------------------
 
-        profile, score, flags = None, 0, []
-        if passed_a and score_a >= score_b:
-            profile, score, flags = "A", score_a, flags_a
-        elif passed_b:
-            profile, score, flags = "B", score_b, flags_b
-
-        if profile is None:
-            continue
-
-        regime, tags = classify_regime(r)
-        all_tags = tags + flags
-        rec = {**r, "profile": profile, "score": score,
-               "regime": regime, "tags": all_tags}
-        append_jsonl(LOG_FILE, rec)
-        history.append(rec)
-
-        print(f"[{r['symbol']}] профиль={profile} балл={score} режим={regime} теги={all_tags}")
-
-        if score >= MIN_SCORE_TO_WATCH:
-            candidates.append(rec)
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-
-    llm_calls_used = 0
-
-    for rec in candidates:
-        symbol = rec["symbol"]
-        bucket = bucket_of(rec["regime"])
-
-        snaps = recent_snapshots(history, symbol, ANALYSIS_WINDOW_MINUTES)
-        if len(snaps) < MIN_SNAPSHOTS_FOR_ANALYSIS:
-            print(f"  [{symbol}] недостаточно снимков ({len(snaps)}/{MIN_SNAPSHOTS_FOR_ANALYSIS})")
-            continue
-
-        prev = llm_state.get(symbol)
-        cooldown_ok = True
-        if prev:
-            elapsed_min = (now_ts - prev.get("last_analysis_ts", 0)) / 60
-            same_bucket = prev.get("last_bucket") == bucket
-            if same_bucket and elapsed_min < REANALYSIS_COOLDOWN_MINUTES:
-                cooldown_ok = False
-
-        if not cooldown_ok:
-            print(f"  [{symbol}] кулдаун ещё не истёк")
-            continue
-
-        if llm_calls_used >= MAX_LLM_CALLS_PER_RUN:
-            print(f"  [{symbol}] достигнут лимит LLM-вызовов за прогон")
-            continue
-
-        print(f"  [{symbol}] отправляю на локальный LLM-анализ ({len(snaps)} снимков)")
-
-        log_table = build_snapshot_log_table(snaps)
-        full_metrics = format_full_metrics(rec)
-        macro_context = build_macro_context(heartbeat_history, symbol)
-
-        user_message = (
-            "Скоринг-балл и режим уже посчитаны кодом — не пересчитывай их, используй "
-            "как готовые данные. Проанализируй динамику по логу снимков и макро-контексту, "
-            "определи паттерн и вынеси вердикт.\n\n"
-            f"[Макро-контекст]\n{macro_context}\n\n"
-            f"[Лог снимков — {symbol}]\n{log_table}\n\n"
-            f"[Метрики последнего снимка]\n{full_metrics}\n\n"
-            f"Балл: {rec['score']} | Режим: {rec['regime']}\n"
+        append_jsonl(
+            HEARTBEAT_FILE, {"ts": r["ts"], "symbol": r["symbol"], "price": r["price"]}
         )
 
-        verdict_json = call_llm_json(system_prompt, user_message)
-        llm_calls_used += 1
+        heartbeat.append({"ts": r["ts"], "symbol": r["symbol"], "price": r["price"]})
 
-        if verdict_json is None:
-            print(f"  [{symbol}] LLM не дал валидный JSON, пропускаю Telegram")
-        else:
-            msg = render_verdict_message(rec, verdict_json, len(snaps))
-            send_telegram_long(msg)
-            llm_state[symbol] = {"last_analysis_ts": now_ts, "last_bucket": bucket}
+        # -------------------------------------------------
+        # lifecycle
+        # -------------------------------------------------
 
-        if llm_calls_used < MAX_LLM_CALLS_PER_RUN:
-            time.sleep(SLEEP_BETWEEN_LLM_CALLS)
+        stage, tags = detect_lifecycle(r, snapshots)
 
-    save_llm_state(llm_state)
-    prune_jsonl_file(LOG_FILE, RETENTION_DAYS_SNAPSHOTS)
-    prune_jsonl_file(HEARTBEAT_FILE, RETENTION_DAYS_HEARTBEAT)
+        score, flags = lifecycle_score(r)
 
-    print(f"Готово. LLM-вызовов за прогон: {llm_calls_used}. "
-          f"Общее время прогона: {time.time() - run_t0:.1f}с")
+        ok, score, extra = is_candidate(r, stage)
+
+        rec = {**r, "lifecycle": stage, "score": score, "tags": tags + flags + extra}
+
+        append_jsonl(SNAPSHOT_FILE, rec)
+
+        snapshots.append(rec)
+
+        lifecycle_state = update_lifecycle_state(lifecycle_state, rec)
+
+        print(f"[{r['symbol']}]", stage, "score", score, tags)
+
+        if ok:
+
+            candidates.append(rec)
+
+    # -----------------------------------------------------
+    # сортировка качества
+    # -----------------------------------------------------
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    print("Кандидатов:", len(candidates))
+
+    llm_calls = 0
+
+    # -----------------------------------------------------
+    # LLM анализ
+    # -----------------------------------------------------
+
+    for rec in candidates:
+
+        if llm_calls >= MAX_LLM_CALLS:
+
+            break
+
+        symbol = rec["symbol"]
+
+        if should_remove_from_watch(lifecycle_state, symbol):
+
+            print(symbol, "removed from watch")
+
+            continue
+
+        recent = get_recent_snapshots(snapshots, symbol, ANALYSIS_WINDOW_MIN)
+
+        if len(recent) < MIN_SNAPSHOTS:
+
+            print(symbol, "мало истории", len(recent))
+
+            continue
+
+        previous = llm_state.get(symbol)
+
+        if previous:
+
+            diff = (now - previous.get("ts", 0)) / 60
+
+            if diff < LLM_COOLDOWN_MIN:
+
+                print(symbol, "LLM cooldown")
+
+                continue
+
+        table = build_snapshot_table(recent)
+
+        user_message = f"""
+
+Монета:
+{rec['name']} ({symbol})
+
+
+Текущий lifecycle:
+{rec['lifecycle']}
+
+
+Score:
+{rec['score']}
+
+
+Tags:
+{rec['tags']}
+
+
+
+История:
+
+{table}
+
+
+
+Задача:
+
+Определи:
+- сохраняется ли импульс;
+- стадия движения;
+- стоит ли продолжать наблюдение;
+- главный риск.
+
+
+"""
+
+        answer = ask_llm(prompt, user_message)
+
+        llm_calls += 1
+
+        if answer:
+
+            msg = render_alert(rec, answer)
+
+            send_telegram(msg)
+
+            llm_state[symbol] = {"ts": now}
+
+    # -----------------------------------------------------
+    # SAVE
+    # -----------------------------------------------------
+
+    save_json(STATE_FILE, lifecycle_state)
+
+    save_json(LLM_STATE_FILE, llm_state)
+
+    prune_jsonl(SNAPSHOT_FILE, SNAPSHOT_RETENTION)
+
+    prune_jsonl(HEARTBEAT_FILE, HEARTBEAT_RETENTION)
+
+    print("Готово", "LLM:", llm_calls, "время:", round(time.time() - started, 1), "сек")
+
+
+# ============================================================
+# START
+# ============================================================
 
 
 if __name__ == "__main__":
+
     run_once()
