@@ -1,17 +1,12 @@
 """
 coinalyze_monitor.py
 ====================
-Автоматический внутридневной поиск качественных LONG-кандидатов на крипторынке.
+Автоматический внутридневной поиск качественных LONG-кандидатов.
 
-Жизненный цикл: обнаружение → наблюдение → подтверждение → сигнал → угасание → удаление.
+Запуск через cron каждые 5 минут:
+  */5 * * * * cd /opt/monitor && /usr/bin/python3 coinalyze_monitor.py
 
-Запуск: каждые 5 минут через cron / systemd timer / while-loop.
-
-Переменные окружения:
-  COINALYZE_P_SID, COINALYZE_CHAT_SID  — cookies Coinalyze
-  TG_BOT_TOKEN, TG_CHAT_ID             — Telegram
-  QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL — LLM (опционально)
-  ENABLE_LLM=true|false                — включать ли LLM-объяснения
+Все файлы состояния лежат в корне рядом со скриптом.
 """
 
 import os
@@ -34,19 +29,30 @@ except ImportError:
         pass
 
 # ═══════════════════════════════════════════════════════════
+# ПУТИ — всё в корне рядом со скриптом
+# ═══════════════════════════════════════════════════════════
+
+BASE_DIR = Path(__file__).resolve().parent
+
+SNAPSHOTS_FILE  = BASE_DIR / "snapshots.jsonl"
+HEARTBEAT_FILE  = BASE_DIR / "heartbeat.jsonl"
+WATCHLIST_FILE  = BASE_DIR / "watchlist.json"
+DEBUG_HTML_FILE = BASE_DIR / "debug_page.html"
+
+# ═══════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════
 
-COINALYZE_P_SID   = os.environ.get("COINALYZE_P_SID", "")
+COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
-TG_BOT_TOKEN      = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID        = os.environ.get("TG_CHAT_ID", "")
+TG_BOT_TOKEN       = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID         = os.environ.get("TG_CHAT_ID", "")
 
-ENABLE_LLM        = os.environ.get("ENABLE_LLM", "false").lower() == "true"
-QWEN_API_KEY      = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL     = os.environ.get("QWEN_BASE_URL",
-                                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-QWEN_MODEL        = os.environ.get("QWEN_MODEL", "qwen-plus")
+ENABLE_LLM    = os.environ.get("ENABLE_LLM", "false").lower() == "true"
+QWEN_API_KEY  = os.environ.get("QWEN_API_KEY", "")
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL",
+                               "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
 
 COINALYZE_URL = (
     "https://coinalyze.net/"
@@ -55,24 +61,16 @@ COINALYZE_URL = (
     "&order_by=oi_current&order_dir=desc"
 )
 
-# Файлы состояния
-DATA_DIR          = Path("data")
-SNAPSHOTS_FILE    = DATA_DIR / "snapshots.jsonl"
-HEARTBEAT_FILE    = DATA_DIR / "heartbeat.jsonl"
-WATCHLIST_FILE    = DATA_DIR / "watchlist.json"
-DEBUG_HTML_FILE   = DATA_DIR / "debug_page.html"
-
 # Сроки хранения
-SNAPSHOTS_TTL_DAYS  = 7
-HEARTBEAT_TTL_DAYS  = 3
+SNAPSHOTS_TTL_DAYS = 7
+HEARTBEAT_TTL_DAYS = 3
 
-# Lifecycle параметры
-CONFIRM_SNAPSHOTS   = 3       # мин. снимков для CONFIRMED_LONG
-CONFIRM_WINDOW_MIN  = 30      # окно для подтверждения (мин)
-RUNNING_SNAPSHOTS   = 4       # мин. снимков для RUNNING
-EXIT_NO_RECOVERY    = 3       # снимков без восстановления → REMOVED
+# Lifecycle
+CONFIRM_SNAPSHOTS  = 3
+CONFIRM_WINDOW_MIN = 30
+RUNNING_SNAPSHOTS  = 4
+EXIT_NO_RECOVERY   = 3
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -80,16 +78,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("coinalyze")
 
+
 # ═══════════════════════════════════════════════════════════
 # УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════
 
-def ensure_data_dir():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def parse_number(raw: Optional[str]) -> Optional[float]:
-    """Парсит числа вида '$1.2M', '+3.5%', 'n/a' и т.д."""
     if raw is None:
         return None
     s = raw.strip().replace("$", "").replace("%", "").replace(",", "").replace("+", "")
@@ -110,11 +104,10 @@ def now_ts() -> int:
 
 
 # ═══════════════════════════════════════════════════════════
-# 1. ИСТОЧНИК ДАННЫХ — PLAYWRIGHT
+# 1. ИСТОЧНИК ДАННЫХ
 # ═══════════════════════════════════════════════════════════
 
 def fetch_html() -> str:
-    """Открывает Coinalyze через Playwright, возвращает HTML."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -128,19 +121,13 @@ def fetch_html() -> str:
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             cookies = []
             if COINALYZE_P_SID:
-                cookies.append({
-                    "name": "p_sid", "value": COINALYZE_P_SID,
-                    "domain": "coinalyze.net", "path": "/", "secure": True,
-                })
+                cookies.append({"name": "p_sid", "value": COINALYZE_P_SID,
+                                "domain": "coinalyze.net", "path": "/", "secure": True})
             if COINALYZE_CHAT_SID:
-                cookies.append({
-                    "name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                    "domain": "coinalyze.net", "path": "/", "secure": True,
-                })
-            cookies.append({
-                "name": "cookies_accepted", "value": "1",
-                "domain": "coinalyze.net", "path": "/", "secure": True,
-            })
+                cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID,
+                                "domain": "coinalyze.net", "path": "/", "secure": True})
+            cookies.append({"name": "cookies_accepted", "value": "1",
+                            "domain": "coinalyze.net", "path": "/", "secure": True})
             context.add_cookies(cookies)
 
         page = context.new_page()
@@ -149,21 +136,19 @@ def fetch_html() -> str:
         try:
             page.goto(COINALYZE_URL, wait_until="domcontentloaded", timeout=50_000)
             page.wait_for_timeout(4000)
-            # Cloudflare challenge
             if "Attention Required" in page.content():
-                log.warning("Cloudflare challenge detected, waiting...")
+                log.warning("Cloudflare challenge, waiting...")
                 page.wait_for_timeout(10_000)
             page.wait_for_selector("tbody tr", timeout=25_000)
             html_content = page.content()
         except Exception as e:
-            log.error(f"Ошибка загрузки страницы: {e}")
+            log.error(f"Ошибка загрузки: {e}")
             try:
                 html_content = page.content()
             except Exception:
                 html_content = ""
             try:
-                page.screenshot(path=str(DEBUG_HTML_FILE).replace(".html", ".png"),
-                                full_page=True)
+                page.screenshot(path=str(BASE_DIR / "debug_screenshot.png"), full_page=True)
             except Exception:
                 pass
         finally:
@@ -173,77 +158,66 @@ def fetch_html() -> str:
 
 
 def parse_table(html_text: str) -> list[dict]:
-    """Парсит HTML-таблицу Coinalyze в список словарей."""
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
     log.info(f"Строк в таблице: {len(rows)}")
 
     records = []
     ts = now_ts()
-
     for tr in rows:
         symbol = tr.get("data-coin")
         tds = tr.find_all("td")
         if len(tds) < 23:
             continue
-
         name_spans = tds[1].find_all("span")
         coin_name = name_spans[0].get_text(strip=True) if name_spans else (symbol or "?")
 
-        rec = {
-            "ts":             ts,
-            "symbol":         symbol,
-            "name":           coin_name,
-            "price":          parse_number(tds[2].get_text(strip=True)),
-            "price_chg24":    parse_number(tds[3].get_text(strip=True)),
-            "mktcap":         parse_number(tds[4].get_text(strip=True)),
-            "volume24":       parse_number(tds[5].get_text(strip=True)),
-            "oi":             parse_number(tds[6].get_text(strip=True)),
-            "oi_chg24_pct":   parse_number(tds[7].get_text(strip=True)),
-            "oi_chg4h_pct":   parse_number(tds[9].get_text(strip=True)),
-            "oi_vol_ratio":   parse_number(tds[11].get_text(strip=True)),
-            "oi_mktcap_ratio":parse_number(tds[12].get_text(strip=True)),
-            "fr_avg":         parse_number(tds[13].get_text(strip=True)),
-            "pfr_avg":        parse_number(tds[14].get_text(strip=True)),
-            "fr_oiw":         parse_number(tds[15].get_text(strip=True)),
-            "pfr_oiw":        parse_number(tds[16].get_text(strip=True)),
-            "liq_short24":    parse_number(tds[17].get_text(strip=True)),
-            "liq_long24":     parse_number(tds[18].get_text(strip=True)),
-            "ls_accounts":    parse_number(tds[19].get_text(strip=True)),
-            "btc_corr7d":     parse_number(tds[20].get_text(strip=True)),
-            "cvd24":          parse_number(tds[21].get_text(strip=True)),
-            "lls24":          parse_number(tds[22].get_text(strip=True)),
-        }
-        records.append(rec)
-
+        records.append({
+            "ts":              ts,
+            "symbol":          symbol,
+            "name":            coin_name,
+            "price":           parse_number(tds[2].get_text(strip=True)),
+            "price_chg24":     parse_number(tds[3].get_text(strip=True)),
+            "mktcap":          parse_number(tds[4].get_text(strip=True)),
+            "volume24":        parse_number(tds[5].get_text(strip=True)),
+            "oi":              parse_number(tds[6].get_text(strip=True)),
+            "oi_chg24_pct":    parse_number(tds[7].get_text(strip=True)),
+            "oi_chg4h_pct":    parse_number(tds[9].get_text(strip=True)),
+            "oi_vol_ratio":    parse_number(tds[11].get_text(strip=True)),
+            "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
+            "fr_avg":          parse_number(tds[13].get_text(strip=True)),
+            "pfr_avg":         parse_number(tds[14].get_text(strip=True)),
+            "fr_oiw":          parse_number(tds[15].get_text(strip=True)),
+            "pfr_oiw":         parse_number(tds[16].get_text(strip=True)),
+            "liq_short24":     parse_number(tds[17].get_text(strip=True)),
+            "liq_long24":      parse_number(tds[18].get_text(strip=True)),
+            "ls_accounts":     parse_number(tds[19].get_text(strip=True)),
+            "btc_corr7d":      parse_number(tds[20].get_text(strip=True)),
+            "cvd24":           parse_number(tds[21].get_text(strip=True)),
+            "lls24":           parse_number(tds[22].get_text(strip=True)),
+        })
     return records
 
 
 def fetch_data() -> list[dict]:
-    """Полный цикл: браузер → HTML → парсинг → записи."""
     html_text = fetch_html()
-
-    # Сохраняем debug
-    ensure_data_dir()
     DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-
     rows = parse_table(html_text)
     if not rows:
         send_telegram(
             "⚠️ <b>Coinalyze Monitor</b>\n"
-            "Не получены данные. Возможные причины:\n"
+            "Данные не получены.\n"
             "• Cookies истекли\n"
-            "• Изменилась HTML-разметка\n"
-            "• Cloudflare блокировка\n\n"
-            "Проверь data/debug_page.html"
+            "• Разметка изменилась\n"
+            "• Cloudflare\n\n"
+            "Проверь debug_page.html"
         )
         sys.exit(1)
-
     return rows
 
 
 # ═══════════════════════════════════════════════════════════
-# 2. ХРАНЕНИЕ ИСТОРИИ
+# 2. ХРАНЕНИЕ
 # ═══════════════════════════════════════════════════════════
 
 def append_jsonl(path: Path, record: dict):
@@ -254,20 +228,19 @@ def append_jsonl(path: Path, record: dict):
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    records = []
+    out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 try:
-                    records.append(json.loads(line))
+                    out.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    return records
+    return out
 
 
 def cleanup_jsonl(path: Path, ttl_days: int):
-    """Удаляет записи старше ttl_days."""
     if not path.exists():
         return
     cutoff = now_ts() - ttl_days * 86400
@@ -278,7 +251,7 @@ def cleanup_jsonl(path: Path, ttl_days: int):
         with open(path, "w", encoding="utf-8") as f:
             for r in fresh:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        log.info(f"Cleanup {path.name}: удалено {removed} записей")
+        log.info(f"Cleanup {path.name}: -{removed} записей")
 
 
 def load_watchlist() -> dict:
@@ -294,13 +267,10 @@ def save_watchlist(wl: dict):
 
 
 # ═══════════════════════════════════════════════════════════
-# 3. ПЕРВИЧНЫЙ ФИЛЬТР LONG
+# 3. ПЕРВИЧНЫЙ ФИЛЬТР
 # ═══════════════════════════════════════════════════════════
 
 def passes_primary_filter(r: dict) -> bool:
-    """
-    Раздел 3 спецификации. Все условия обязательны.
-    """
     vol = r.get("volume24")
     if vol is None or vol <= 1_000_000:
         return False
@@ -333,7 +303,6 @@ def passes_primary_filter(r: dict) -> bool:
     if oi_v is None or oi_v < 0.1 or oi_v > 2.5:
         return False
 
-    # Funding не экстремально положительный
     fr = r.get("fr_oiw")
     if fr is not None and fr > 0.05:
         return False
@@ -342,127 +311,113 @@ def passes_primary_filter(r: dict) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-# 4. SCORING ENGINE (макс 10)
+# 4. SCORING (макс 10)
 # ═══════════════════════════════════════════════════════════
 
 def calculate_score(r: dict) -> tuple[int, list[str], list[str]]:
-    """
-    Раздел 4. Возвращает (score, pros, cons).
-    """
     score = 0
-    pros = []
-    cons = []
+    pros: list[str] = []
+    cons: list[str] = []
 
+    # CVD
     cvd = r.get("cvd24")
     if cvd is not None:
         if cvd > 70:
-            score += 2; pros.append(f"CVD24={cvd:.0f} >70 — сильный спрос")
+            score += 2; pros.append(f"CVD={cvd:.0f} >70")
         elif cvd >= 55:
-            score += 1; pros.append(f"CVD24={cvd:.0f} 55-70 — умеренный спрос")
+            score += 1; pros.append(f"CVD={cvd:.0f} 55-70")
 
+    # LLS
     lls = r.get("lls24")
     if lls is not None:
         if lls < 15:
-            score += 2; pros.append(f"LLS24={lls:.0f}% <15 — шортов мало")
+            score += 2; pros.append(f"LLS={lls:.0f}% <15")
         elif lls < 40:
-            score += 1; pros.append(f"LLS24={lls:.0f}% 15-40 — нормально")
+            score += 1; pros.append(f"LLS={lls:.0f}% 15-40")
+        if lls > 50:
+            score -= 2; cons.append(f"LLS={lls:.0f}% >50")
 
+    # OI 24h
     oi24 = r.get("oi_chg24_pct")
     if oi24 is not None:
         if 5 <= oi24 <= 35:
-            score += 2; pros.append(f"OI24={oi24:.1f}% 5-35 — здоровый рост")
+            score += 2; pros.append(f"OI24={oi24:.1f}% 5-35")
         elif oi24 > 50:
-            score -= 2; cons.append(f"OI24={oi24:.1f}% >50 — перегрев")
+            score -= 2; cons.append(f"OI24={oi24:.1f}% >50 перегрев")
 
+    # OI 4h
     oi4h = r.get("oi_chg4h_pct")
     if oi4h is not None and oi4h > 0:
-        score += 1; pros.append(f"OI4h={oi4h:.1f}% >0 — приток продолжается")
+        score += 1; pros.append(f"OI4h={oi4h:.1f}% >0")
 
+    # Price
     pc = r.get("price_chg24")
     if pc is not None:
         if 2 <= pc <= 10:
-            score += 1; pros.append(f"Price24={pc:.1f}% 2-10 — умеренный рост")
+            score += 1; pros.append(f"Price={pc:.1f}% 2-10")
         elif pc > 20:
-            score -= 2; cons.append(f"Price24={pc:.1f}% >20 — вертикальный рост")
+            score -= 2; cons.append(f"Price={pc:.1f}% >20 вертикаль")
 
+    # Funding
     fr = r.get("fr_oiw")
     if fr is not None:
         if -0.01 <= fr <= 0.03:
-            score += 1; pros.append(f"Funding={fr:.4f} — нормальный")
+            score += 1; pros.append(f"Funding={fr:.4f} норма")
         elif fr > 0.05:
-            score -= 2; cons.append(f"Funding={fr:.4f} — перегрет")
+            score -= 2; cons.append(f"Funding={fr:.4f} перегрет")
 
+    # OI/Mcap
     oi_mc = r.get("oi_mktcap_ratio")
     if oi_mc is not None and oi_mc < 0.10:
-        score += 1; pros.append(f"OI/Mcap={oi_mc:.3f} <0.10 — безопасно")
-
-    # Доп. штраф
-    if lls is not None and lls > 50:
-        score -= 2; cons.append(f"LLS24={lls:.0f}% >50 — массовый выход")
+        score += 1; pros.append(f"OI/Mcap={oi_mc:.3f} <0.10")
 
     return score, pros, cons
 
 
 # ═══════════════════════════════════════════════════════════
-# 7. АНАЛИЗ ДИНАМИКИ
+# 7. ДИНАМИКА
 # ═══════════════════════════════════════════════════════════
 
-def compute_trend(values: list[Optional[float]]) -> str:
-    """Определяет тренд по последним значениям: up / down / flat."""
+def compute_trend(values: list) -> str:
     clean = [v for v in values if v is not None]
     if len(clean) < 2:
         return "flat"
     diffs = [clean[i] - clean[i - 1] for i in range(1, len(clean))]
-    avg_diff = sum(diffs) / len(diffs)
-    threshold = 0.5
-    if avg_diff > threshold:
+    avg = sum(diffs) / len(diffs)
+    if avg > 0.5:
         return "up"
-    elif avg_diff < -threshold:
+    if avg < -0.5:
         return "down"
     return "flat"
 
 
 def analyze_dynamics(snaps: list[dict]) -> dict:
-    """
-    Раздел 7. Анализирует последние 3-6 снимков.
-    """
     if len(snaps) < 2:
         return {"oi_trend": "flat", "cvd_trend": "flat",
-                "divergence": "none", "note": "недостаточно данных"}
+                "price_trend": "flat", "oi4h_trend": "flat",
+                "divergence": "none", "note": ""}
 
-    recent = snaps[-6:]  # максимум 6
+    recent = snaps[-6:]
+    oi_trend    = compute_trend([s.get("oi_chg24_pct") for s in recent])
+    cvd_trend   = compute_trend([s.get("cvd24") for s in recent])
+    price_trend = compute_trend([s.get("price_chg24") for s in recent])
+    oi4h_trend  = compute_trend([s.get("oi_chg4h_pct") for s in recent])
 
-    oi_vals   = [s.get("oi_chg24_pct") for s in recent]
-    cvd_vals  = [s.get("cvd24") for s in recent]
-    price_vals = [s.get("price_chg24") for s in recent]
-    oi4h_vals = [s.get("oi_chg4h_pct") for s in recent]
-
-    oi_trend  = compute_trend(oi_vals)
-    cvd_trend = compute_trend(cvd_vals)
-    price_trend = compute_trend(price_vals)
-
-    # Дивергенции
     divergence = "none"
-    if price_trend == "up" and oi_trend == "down":
-        divergence = "price_up_oi_down"  # плохо
-    elif price_trend == "up" and cvd_trend == "down":
-        divergence = "price_up_cvd_down"  # плохо
-
     note = ""
-    if divergence == "price_up_oi_down":
-        note = "Цена растёт, но OI падает — движение на закрытии шортов, не на новом спросе"
-    elif divergence == "price_up_cvd_down":
-        note = "Цена растёт, но CVD падает — покупатели ослабевают"
+    if price_trend == "up" and oi_trend == "down":
+        divergence = "price_up_oi_down"
+        note = "Цена ↑ OI ↓ — рост на закрытии шортов, не на новом спросе"
+    elif price_trend == "up" and cvd_trend == "down":
+        divergence = "price_up_cvd_down"
+        note = "Цена ↑ CVD ↓ — покупатели ослабевают"
     elif oi_trend == "up" and cvd_trend == "up" and price_trend == "up":
-        note = "Здоровое движение: цена, OI и CVD растут синхронно"
+        note = "Здоровое движение: Price+OI+CVD растут синхронно"
 
     return {
-        "oi_trend": oi_trend,
-        "cvd_trend": cvd_trend,
-        "price_trend": price_trend,
-        "oi4h_trend": compute_trend(oi4h_vals),
-        "divergence": divergence,
-        "note": note,
+        "oi_trend": oi_trend, "cvd_trend": cvd_trend,
+        "price_trend": price_trend, "oi4h_trend": oi4h_trend,
+        "divergence": divergence, "note": note,
     }
 
 
@@ -470,10 +425,7 @@ def analyze_dynamics(snaps: list[dict]) -> dict:
 # 8. ПАТТЕРНЫ
 # ═══════════════════════════════════════════════════════════
 
-def detect_pattern(r: dict, dynamics: dict) -> str:
-    """
-    Раздел 8. Определяет паттерн по текущему снимку + динамике.
-    """
+def detect_pattern(r: dict, dyn: dict) -> str:
     pc   = r.get("price_chg24") or 0
     oi24 = r.get("oi_chg24_pct") or 0
     cvd  = r.get("cvd24") or 50
@@ -481,165 +433,120 @@ def detect_pattern(r: dict, dynamics: dict) -> str:
     fr   = r.get("fr_oiw") or 0
     ls   = r.get("ls_accounts") or 1.0
 
-    oi_trend  = dynamics.get("oi_trend", "flat")
-    cvd_trend = dynamics.get("cvd_trend", "flat")
-
-    # Healthy Trend
-    if pc > 0 and oi24 > 5 and cvd > 60 and lls < 30 and oi_trend == "up":
+    if pc > 0 and oi24 > 5 and cvd > 60 and lls < 30 and dyn["oi_trend"] == "up":
         return "Healthy Trend"
-
-    # Short Squeeze Setup
     if pc > 0 and oi24 > 5 and lls > 35 and ls < 1.0:
         return "Short Squeeze Setup"
-
-    # Stealth Accumulation
-    if pc < 3 and cvd_trend == "up" and fr < 0.005:
+    if pc < 3 and dyn["cvd_trend"] == "up" and fr < 0.005:
         return "Stealth Accumulation"
-
-    # Late Trend
-    if pc > 10 and oi24 > 20 and cvd_trend == "down":
+    if pc > 10 and oi24 > 20 and dyn["cvd_trend"] == "down":
         return "Late Trend"
-
-    # Distribution
-    if pc < 0 and oi_trend == "down":
+    if pc < 0 and dyn["oi_trend"] == "down":
         return "Distribution"
-
-    # Capitulation
-    if oi24 < -10 and lls > 45 and cvd_trend == "up":
+    if oi24 < -10 and lls > 45 and dyn["cvd_trend"] == "up":
         return "Capitulation"
-
     return "Neutral"
 
 
 # ═══════════════════════════════════════════════════════════
-# 5-6. LIFECYCLE ENGINE
+# 5-6. LIFECYCLE
 # ═══════════════════════════════════════════════════════════
 
-STAGES = ["NEW", "WAIT_CONFIRMATION", "CONFIRMED_LONG", "RUNNING",
-          "EXIT_WARNING", "REMOVED"]
-
-
 def get_symbol_snapshots(symbol: str) -> list[dict]:
-    """Загружает все снимки монеты из snapshots.jsonl."""
     all_snaps = load_jsonl(SNAPSHOTS_FILE)
-    return sorted(
-        [s for s in all_snaps if s.get("symbol") == symbol],
-        key=lambda s: s["ts"]
-    )
+    return sorted([s for s in all_snaps if s.get("symbol") == symbol],
+                  key=lambda s: s["ts"])
 
 
 def lifecycle_transition(symbol: str, entry: dict, current: dict,
                          snaps: list[dict]) -> tuple[str, list[str]]:
-    """
-    Разделы 5-6. Определяет переход состояния.
-    Возвращает (new_stage, reasons).
-    """
     stage = entry.get("stage", "NEW")
-    reasons = []
+    reasons: list[str] = []
     score = current.get("score", 0)
-    dynamics = current.get("dynamics", {})
+    dyn = current.get("dynamics", {})
 
-    # ── NEW → WAIT_CONFIRMATION ──
+    # NEW → WAIT_CONFIRMATION
     if stage == "NEW":
         if score >= 6:
-            reasons.append(f"Score={score} ≥6 — первый хороший снимок")
+            reasons.append(f"Score={score} ≥6")
             return "WAIT_CONFIRMATION", reasons
         return stage, reasons
 
-    # ── WAIT_CONFIRMATION → CONFIRMED_LONG ──
+    # WAIT_CONFIRMATION → CONFIRMED_LONG
     if stage == "WAIT_CONFIRMATION":
-        # Нужно минимум 3 снимка за последние 30 минут
         cutoff = now_ts() - CONFIRM_WINDOW_MIN * 60
         recent = [s for s in snaps if s["ts"] > cutoff]
         if len(recent) >= CONFIRM_SNAPSHOTS:
-            # Проверяем условия подтверждения
             oi_ok = all(
                 (recent[i].get("oi_chg24_pct") or 0) >=
-                (recent[i-1].get("oi_chg24_pct") or 0) - 1
+                (recent[i - 1].get("oi_chg24_pct") or 0) - 1
                 for i in range(1, len(recent))
             )
-            oi4h_ok = all(
-                (s.get("oi_chg4h_pct") or 0) >= -0.5 for s in recent
-            )
+            oi4h_ok = all((s.get("oi_chg4h_pct") or 0) >= -0.5 for s in recent)
             cvd_ok = all(
                 (recent[i].get("cvd24") or 50) >=
-                (recent[i-1].get("cvd24") or 50) - 5
+                (recent[i - 1].get("cvd24") or 50) - 5
                 for i in range(1, len(recent))
             )
             lls_ok = all((s.get("lls24") or 30) < 50 for s in recent)
 
             if oi_ok and oi4h_ok and cvd_ok and lls_ok:
                 reasons.append(f"{len(recent)} снимков за {CONFIRM_WINDOW_MIN} мин")
-                reasons.append("OI24 растёт, OI4h не падает, CVD стабилен, LLS <50")
+                reasons.append("OI↑ OI4h≥0 CVD стабилен LLS<50")
                 return "CONFIRMED_LONG", reasons
-            else:
-                if not oi_ok:
-                    reasons.append("OI24 не растёт последовательно")
-                if not oi4h_ok:
-                    reasons.append("OI4h падает")
-                if not cvd_ok:
-                    reasons.append("CVD падает")
-                if not lls_ok:
-                    reasons.append("LLS >50")
+            if not oi_ok:   reasons.append("OI24 не растёт")
+            if not oi4h_ok: reasons.append("OI4h падает")
+            if not cvd_ok:  reasons.append("CVD падает")
+            if not lls_ok:  reasons.append("LLS>50")
         return stage, reasons
 
-    # ── CONFIRMED_LONG → RUNNING ──
+    # CONFIRMED_LONG → RUNNING
     if stage == "CONFIRMED_LONG":
         if len(snaps) >= RUNNING_SNAPSHOTS and score >= 7:
-            reasons.append(f"{len(snaps)} снимков, score={score} ≥7")
+            reasons.append(f"{len(snaps)} снимков, score={score}≥7")
             return "RUNNING", reasons
         return stage, reasons
 
-    # ── RUNNING → EXIT_WARNING ──
+    # RUNNING → EXIT_WARNING
     if stage == "RUNNING":
-        exit_triggered = False
+        triggered = False
 
-        # Условие 1: OI падает 2 снимка подряд
         if len(snaps) >= 3:
-            oi_last3 = [s.get("oi_chg24_pct") or 0 for s in snaps[-3:]]
-            if oi_last3[-1] < oi_last3[-2] < oi_last3[-3]:
-                exit_triggered = True
+            oi3 = [s.get("oi_chg24_pct") or 0 for s in snaps[-3:]]
+            if oi3[-1] < oi3[-2] < oi3[-3]:
+                triggered = True
                 reasons.append("OI падает 2 снимка подряд")
 
-        # Условие 2: CVD падает >15 пунктов
         if len(snaps) >= 2:
             cvd_prev = snaps[-2].get("cvd24") or 50
             cvd_curr = snaps[-1].get("cvd24") or 50
             if cvd_prev - cvd_curr > 15:
-                exit_triggered = True
-                reasons.append(f"CVD упал на {cvd_prev - cvd_curr:.0f} пунктов")
+                triggered = True
+                reasons.append(f"CVD -{cvd_prev - cvd_curr:.0f} пунктов")
 
-        # Условие 3: цена растёт, OI уменьшается
-        pc = current.get("price_chg24") or 0
-        oi_trend = dynamics.get("oi_trend", "flat")
-        if pc > 0 and oi_trend == "down":
-            exit_triggered = True
-            reasons.append("Дивергенция: цена ↑, OI ↓")
+        if (current.get("price_chg24") or 0) > 0 and dyn.get("oi_trend") == "down":
+            triggered = True
+            reasons.append("Дивергенция Price↑ OI↓")
 
-        # Условие 4: LLS > 50
-        lls = current.get("lls24") or 0
-        if lls > 50:
-            exit_triggered = True
-            reasons.append(f"LLS={lls:.0f}% >50")
+        if (current.get("lls24") or 0) > 50:
+            triggered = True
+            reasons.append(f"LLS={current['lls24']:.0f}%>50")
 
-        if exit_triggered:
+        if triggered:
             return "EXIT_WARNING", reasons
         return stage, reasons
 
-    # ── EXIT_WARNING → REMOVED ──
+    # EXIT_WARNING → REMOVED
     if stage == "EXIT_WARNING":
-        # Нет восстановления 3 снимка подряд
-        entry_ts = entry.get("exit_warning_since", 0)
-        snaps_since = [s for s in snaps if s["ts"] > entry_ts]
-        if len(snaps_since) >= EXIT_NO_RECOVERY:
-            # Проверяем: есть ли восстановление?
-            recovered = False
-            for s in snaps_since[-EXIT_NO_RECOVERY:]:
-                if (s.get("oi_chg4h_pct") or 0) > 0 and (s.get("cvd24") or 0) > 55:
-                    recovered = True
-                    break
+        since = entry.get("exit_warning_since", 0)
+        after = [s for s in snaps if s["ts"] > since]
+        if len(after) >= EXIT_NO_RECOVERY:
+            recovered = any(
+                (s.get("oi_chg4h_pct") or 0) > 0 and (s.get("cvd24") or 0) > 55
+                for s in after[-EXIT_NO_RECOVERY:]
+            )
             if not recovered:
-                reasons.append(f"Нет восстановления {EXIT_NO_RECOVERY} снимка подряд")
+                reasons.append(f"Нет восстановления {EXIT_NO_RECOVERY} снимка")
                 return "REMOVED", reasons
         return stage, reasons
 
@@ -656,317 +563,216 @@ def esc(val) -> str:
 
 def send_telegram(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram не настроен, пропускаю отправку")
+        log.warning("Telegram не настроен")
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    chunks, rem = [], text
+    while len(rem) > 3800:
+        sp = rem.rfind("\n", 0, 3800)
+        if sp == -1:
+            sp = 3800
+        chunks.append(rem[:sp])
+        rem = rem[sp:]
+    chunks.append(rem)
 
-    # Разбиваем на чанки
-    chunks = []
-    remaining = text
-    while len(remaining) > 3800:
-        split_at = remaining.rfind("\n", 0, 3800)
-        if split_at == -1:
-            split_at = 3800
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:]
-    chunks.append(remaining)
-
-    for chunk in chunks:
+    for ch in chunks:
         try:
-            resp = requests.post(url, data={
-                "chat_id": TG_CHAT_ID,
-                "text": chunk,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
+            r = requests.post(url, data={
+                "chat_id": TG_CHAT_ID, "text": ch,
+                "parse_mode": "HTML", "disable_web_page_preview": True,
             }, timeout=15)
-            if resp.status_code != 200:
-                # Fallback без HTML
+            if r.status_code != 200:
                 requests.post(url, data={
-                    "chat_id": TG_CHAT_ID,
-                    "text": chunk,
+                    "chat_id": TG_CHAT_ID, "text": ch,
                     "disable_web_page_preview": True,
                 }, timeout=15)
-            time.sleep(0.5)
+            time.sleep(0.4)
         except Exception as e:
-            log.error(f"Telegram error: {e}")
+            log.error(f"TG error: {e}")
 
 
-def format_lifecycle_message(symbol: str, entry: dict, current: dict,
-                             snaps: list[dict], reasons: list[str]) -> str:
-    """
-    Раздел 9. Форматирует сообщение для Telegram.
-    """
-    stage = entry.get("stage", "?")
-    score = current.get("score", 0)
-    pattern = current.get("pattern", "Neutral")
-    dynamics = current.get("dynamics", {})
+def format_signal(symbol: str, entry: dict, cur: dict,
+                  snaps: list[dict], reasons: list[str]) -> str:
+    stage = entry["stage"]
+    emoji = {"CONFIRMED_LONG": "🟢", "RUNNING": "🔵",
+             "EXIT_WARNING": "🟠"}.get(stage, "⚪")
+    dyn = cur.get("dynamics", {})
 
-    stage_emoji = {
-        "CONFIRMED_LONG": "🟢",
-        "RUNNING": "🔵",
-        "EXIT_WARNING": "🟠",
-    }.get(stage, "⚪")
-
-    # Последние 3-5 снимков
-    recent = snaps[-5:]
-    snap_lines = []
-    for s in recent:
+    lines_snap = []
+    for s in snaps[-5:]:
         t = time.strftime("%H:%M", time.gmtime(s["ts"]))
-        snap_lines.append(
-            f"  {t} | Price {s.get('price_chg24', '?')}% | "
-            f"OI24 {s.get('oi_chg24_pct', '?')}% | "
-            f"OI4h {s.get('oi_chg4h_pct', '?')}% | "
-            f"CVD {s.get('cvd24', '?')} | "
-            f"LLS {s.get('lls24', '?')}%"
+        lines_snap.append(
+            f"  {t} | P {s.get('price_chg24','?')}% | "
+            f"OI {s.get('oi_chg24_pct','?')}% | "
+            f"4h {s.get('oi_chg4h_pct','?')}% | "
+            f"CVD {s.get('cvd24','?')} | "
+            f"LLS {s.get('lls24','?')}%"
         )
-    snap_block = "\n".join(snap_lines) or "  нет данных"
 
-    pros = current.get("pros", [])
-    cons = current.get("cons", [])
-    pros_block = "\n".join(f"  ✅ {p}" for p in pros) or "  —"
-    cons_block = "\n".join(f"  ⚠️ {c}" for c in cons) or "  —"
+    pros = "\n".join(f"  ✅ {p}" for p in cur.get("pros", [])) or "  —"
+    cons = "\n".join(f"  ⚠️ {c}" for c in cur.get("cons", [])) or "  —"
+    reas = "\n".join(f"  → {esc(r)}" for r in reasons) or "  —"
 
-    # Следующее условие
-    next_cond = ""
-    if stage == "CONFIRMED_LONG":
-        next_cond = "Ждём 4+ снимков и score ≥7 для перехода в RUNNING"
-    elif stage == "RUNNING":
-        next_cond = "Следим за OI/CVD/LLS — при ухудшении будет EXIT_WARNING"
-    elif stage == "EXIT_WARNING":
-        next_cond = f"Если {EXIT_NO_RECOVERY} снимка без восстановления → REMOVED"
+    next_c = {
+        "CONFIRMED_LONG": "Ждём 4+ снимков и score≥7 → RUNNING",
+        "RUNNING": "Следим за OI/CVD/LLS",
+        "EXIT_WARNING": f"Без восстановления {EXIT_NO_RECOVERY} снимка → REMOVED",
+    }.get(stage, "")
 
     msg = (
-        f"{stage_emoji} <b>{esc(current.get('name', symbol))} ({esc(symbol)})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Состояние:</b> {esc(stage)}\n"
-        f"<b>Score:</b> {score}/10\n"
-        f"<b>Паттерн:</b> {esc(pattern)}\n"
-        f"<b>Динамика:</b> OI {dynamics.get('oi_trend','?')} | "
-        f"CVD {dynamics.get('cvd_trend','?')} | "
-        f"Price {dynamics.get('price_trend','?')}\n"
+        f"{emoji} <b>{esc(cur.get('name', symbol))} ({esc(symbol)})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Стадия:</b> {stage}\n"
+        f"<b>Score:</b> {cur.get('score',0)}/10\n"
+        f"<b>Паттерн:</b> {esc(cur.get('pattern','Neutral'))}\n"
+        f"<b>Тренды:</b> OI {dyn.get('oi_trend','?')} | "
+        f"CVD {dyn.get('cvd_trend','?')} | "
+        f"Price {dyn.get('price_trend','?')}\n"
     )
-    if dynamics.get("note"):
-        msg += f"<i>{esc(dynamics['note'])}</i>\n"
-
+    if dyn.get("note"):
+        msg += f"<i>{esc(dyn['note'])}</i>\n"
     msg += (
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Последние снимки:</b>\n{snap_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>ЗА:</b>\n{pros_block}\n"
-        f"<b>ПРОТИВ:</b>\n{cons_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Причины перехода:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Снимки:</b>\n" + "\n".join(lines_snap) + "\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>ЗА:</b>\n{pros}\n"
+        f"<b>ПРОТИВ:</b>\n{cons}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Причины:</b>\n{reas}\n"
     )
-    for r in reasons:
-        msg += f"  → {esc(r)}\n"
-
-    if next_cond:
-        msg += f"\n<b>Далее:</b> {esc(next_cond)}\n"
-
-    msg += f"\n<i>Информационный сигнал, не финансовая рекомендация.</i>"
+    if next_c:
+        msg += f"\n<b>Далее:</b> {esc(next_c)}\n"
+    msg += "\n<i>Не финансовая рекомендация.</i>"
     return msg
 
 
 # ═══════════════════════════════════════════════════════════
-# 10. LLM (ОПЦИОНАЛЬНО)
+# 10. LLM (опционально, только объяснение)
 # ═══════════════════════════════════════════════════════════
 
-def llm_explain(symbol: str, entry: dict, current: dict,
+def llm_explain(symbol: str, entry: dict, cur: dict,
                 snaps: list[dict]) -> Optional[str]:
-    """
-    Раздел 10. LLM только объясняет, НЕ принимает решений.
-    """
     if not ENABLE_LLM or not QWEN_API_KEY:
         return None
 
     recent = snaps[-5:]
-    snap_summary = "\n".join(
-        f"  ts={s['ts']} price_chg={s.get('price_chg24')} "
-        f"oi24={s.get('oi_chg24_pct')} oi4h={s.get('oi_chg4h_pct')} "
-        f"cvd={s.get('cvd24')} lls={s.get('lls24')} "
-        f"score={s.get('score')} pattern={s.get('pattern')}"
+    snap_txt = "\n".join(
+        f"  ts={s['ts']} p={s.get('price_chg24')} oi24={s.get('oi_chg24_pct')} "
+        f"oi4h={s.get('oi_chg4h_pct')} cvd={s.get('cvd24')} lls={s.get('lls24')}"
         for s in recent
     )
-
     user_msg = (
-        f"Монета: {symbol}\n"
-        f"Lifecycle: {entry.get('stage')}\n"
-        f"Score: {current.get('score')}\n"
-        f"Pattern: {current.get('pattern')}\n"
-        f"Dynamics: {json.dumps(current.get('dynamics', {}), ensure_ascii=False)}\n\n"
-        f"Последние {len(recent)} снимков:\n{snap_summary}\n\n"
-        f"Дай краткое объяснение ситуации (2-3 предложения). "
-        f"НЕ давай торговых рекомендаций. Только описание того, что происходит."
+        f"Монета: {symbol}\nСтадия: {entry.get('stage')}\n"
+        f"Score: {cur.get('score')}\nПаттерн: {cur.get('pattern')}\n"
+        f"Динамика: {json.dumps(cur.get('dynamics',{}), ensure_ascii=False)}\n\n"
+        f"Снимки:\n{snap_txt}\n\n"
+        f"Объясни ситуацию в 2-3 предложениях. Без рекомендаций."
     )
-
-    url = f"{QWEN_BASE_URL.rstrip('/')}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {QWEN_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": QWEN_MODEL,
-        "messages": [
-            {"role": "system",
-             "content": "Ты аналитик крипто-деривативов. Объясняй ситуацию кратко и нейтрально."},
-            {"role": "user", "content": user_msg},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 300,
-    }
-
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(
+            f"{QWEN_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {QWEN_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": QWEN_MODEL,
+                  "messages": [
+                      {"role": "system",
+                       "content": "Ты аналитик крипто-деривативов. Кратко и нейтрально."},
+                      {"role": "user", "content": user_msg}],
+                  "temperature": 0.2, "max_tokens": 250},
+            timeout=30,
+        )
         if resp.status_code == 200:
             return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        log.warning(f"LLM call failed: {e}")
+        log.warning(f"LLM: {e}")
     return None
 
 
 # ═══════════════════════════════════════════════════════════
-# 12. ОСНОВНОЙ ЦИКЛ
+# 12. ОСНОВНОЙ ЦИКЛ (один прогон)
 # ═══════════════════════════════════════════════════════════
 
-def run_once():
-    """Один полный цикл мониторинга."""
-    ensure_data_dir()
-    log.info("═══ Запуск цикла мониторинга ═══")
+def run():
+    log.info("═══ Прогон ═══")
 
-    # ── Шаг 1: Получить данные ──
+    # 1. Данные
     rows = fetch_data()
-    log.info(f"Получено монет: {len(rows)}")
+    log.info(f"Монет: {len(rows)}")
 
-    # ── Шаг 2: Записать heartbeat (все монеты) ──
+    # 2. Heartbeat
     ts = now_ts()
     for r in rows:
-        append_jsonl(HEARTBEAT_FILE, {
-            "ts": ts,
-            "symbol": r["symbol"],
-            "price": r.get("price"),
-        })
+        append_jsonl(HEARTBEAT_FILE, {"ts": ts, "symbol": r["symbol"],
+                                      "price": r.get("price")})
 
-    # ── Шаг 3: Отфильтровать кандидатов ──
+    # 3. Фильтр
     candidates = [r for r in rows if passes_primary_filter(r)]
-    log.info(f"Прошли первичный фильтр: {len(candidates)}")
+    log.info(f"Кандидатов: {len(candidates)}")
 
-    # ── Шаг 4: Обновить snapshots ──
+    # 4-6. Snapshots + watchlist + lifecycle
     watchlist = load_watchlist()
 
     for r in candidates:
-        symbol = r["symbol"]
-
-        # Scoring
+        sym = r["symbol"]
         score, pros, cons = calculate_score(r)
 
-        # Dynamics (нужна история)
-        sym_snaps = get_symbol_snapshots(symbol)
-        # Добавляем текущий снимок временно для анализа
-        current_snap = {**r, "score": score, "pros": pros, "cons": cons}
-        sym_snaps_with_current = sym_snaps + [current_snap]
-        dynamics = analyze_dynamics(sym_snaps_with_current)
+        sym_snaps = get_symbol_snapshots(sym)
+        cur_snap = {**r, "score": score, "pros": pros, "cons": cons}
+        dyn = analyze_dynamics(sym_snaps + [cur_snap])
+        pattern = detect_pattern(r, dyn)
 
-        # Pattern
-        pattern = detect_pattern(r, dynamics)
+        full = {**r, "score": score, "pros": pros, "cons": cons,
+                "dynamics": dyn, "pattern": pattern}
+        append_jsonl(SNAPSHOTS_FILE, full)
 
-        # Формируем полную запись
-        full_rec = {
-            **r,
-            "score": score,
-            "pros": pros,
-            "cons": cons,
-            "dynamics": dynamics,
-            "pattern": pattern,
-        }
-
-        # Записываем в snapshots.jsonl
-        append_jsonl(SNAPSHOTS_FILE, full_rec)
-
-        # ── Шаг 5: Обновить watchlist ──
-        if symbol not in watchlist:
-            watchlist[symbol] = {
-                "stage": "NEW",
-                "first_seen": ts,
-                "last_seen": ts,
-                "snapshots": 1,
-                "score": score,
-                "warnings": [],
-            }
+        # Watchlist
+        if sym not in watchlist:
+            watchlist[sym] = {"stage": "NEW", "first_seen": ts,
+                              "last_seen": ts, "snapshots": 1,
+                              "score": score, "warnings": []}
         else:
-            watchlist[symbol]["last_seen"] = ts
-            watchlist[symbol]["snapshots"] = watchlist[symbol].get("snapshots", 0) + 1
-            watchlist[symbol]["score"] = score
+            watchlist[sym]["last_seen"] = ts
+            watchlist[sym]["snapshots"] += 1
+            watchlist[sym]["score"] = score
 
-        # ── Шаг 6: Lifecycle transition ──
-        entry = watchlist[symbol]
-        all_snaps = get_symbol_snapshots(symbol)
-        new_stage, reasons = lifecycle_transition(
-            symbol, entry, full_rec, all_snaps
-        )
+        # Lifecycle
+        entry = watchlist[sym]
+        all_snaps = get_symbol_snapshots(sym)
+        new_stage, reasons = lifecycle_transition(sym, entry, full, all_snaps)
 
-        old_stage = entry.get("stage", "NEW")
+        old_stage = entry["stage"]
         if new_stage != old_stage:
-            log.info(f"[{symbol}] {old_stage} → {new_stage} | {reasons}")
-            watchlist[symbol]["stage"] = new_stage
-
+            log.info(f"[{sym}] {old_stage} → {new_stage} | {reasons}")
+            watchlist[sym]["stage"] = new_stage
             if new_stage == "EXIT_WARNING":
-                watchlist[symbol]["exit_warning_since"] = ts
+                watchlist[sym]["exit_warning_since"] = ts
 
-            # ── Шаг 7-8: Сигналы и Telegram ──
-            # Отправляем только для CONFIRMED_LONG, RUNNING, EXIT_WARNING
+            # Telegram только для CONFIRMED_LONG / RUNNING / EXIT_WARNING
             if new_stage in ("CONFIRMED_LONG", "RUNNING", "EXIT_WARNING"):
-                # LLM объяснение (опционально)
-                llm_text = llm_explain(symbol, watchlist[symbol],
-                                       full_rec, all_snaps)
-                msg = format_lifecycle_message(
-                    symbol, watchlist[symbol], full_rec, all_snaps, reasons
-                )
-                if llm_text:
-                    msg += f"\n\n🤖 <b>LLM-комментарий:</b>\n{esc(llm_text)}"
-
+                llm_txt = llm_explain(sym, watchlist[sym], full, all_snaps)
+                msg = format_signal(sym, watchlist[sym], full, all_snaps, reasons)
+                if llm_txt:
+                    msg += f"\n\n🤖 {esc(llm_txt)}"
                 send_telegram(msg)
 
-        # Удаляем REMOVED из watchlist
         if new_stage == "REMOVED":
-            log.info(f"[{symbol}] REMOVED — удаляю из watchlist")
-            del watchlist[symbol]
+            log.info(f"[{sym}] REMOVED")
+            del watchlist[sym]
 
-    # ── Шаг 9: Сохранить watchlist, удалить старые данные ──
+    # 7-9. Сохранение + cleanup
     save_watchlist(watchlist)
     cleanup_jsonl(SNAPSHOTS_FILE, SNAPSHOTS_TTL_DAYS)
     cleanup_jsonl(HEARTBEAT_FILE, HEARTBEAT_TTL_DAYS)
 
-    log.info(f"═══ Цикл завершён. В watchlist: {len(watchlist)} монет ═══")
+    log.info(f"═══ Готово. Watchlist: {len(watchlist)} ═══")
 
 
 # ═══════════════════════════════════════════════════════════
-# ЗАПУСК
-# ═══════════════════════════════════════════════════════════
-
-def main():
-    """
-    Основной entrypoint.
-    Для непрерывной работы: запускает цикл каждые 5 минут.
-    Для одноразового запуска (cron): передайте --once.
-    """
-    once = "--once" in sys.argv
-
-    if once:
-        run_once()
-    else:
-        log.info("Запуск в непрерывном режиме (интервал 5 мин). Ctrl+C для остановки.")
-        while True:
-            try:
-                run_once()
-            except KeyboardInterrupt:
-                log.info("Остановка по Ctrl+C")
-                break
-            except Exception as e:
-                log.exception(f"Необработанная ошибка в цикле: {e}")
-                send_telegram(f"⚠️ <b>Coinalyze Monitor</b>\nОшибка: {esc(str(e)[:500])}")
-            log.info("Следующий запуск через 5 минут...")
-            time.sleep(300)
-
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except Exception as e:
+        log.exception(f"Фатальная ошибка: {e}")
+        send_telegram(f"⚠️ <b>Coinalyze Monitor</b>\nОшибка: {esc(str(e)[:500])}")
+        sys.exit(1)
