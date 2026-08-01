@@ -1,12 +1,16 @@
 """
 coinalyze_monitor.py
 ====================
-Автоматический внутридневной поиск качественных LONG-кандидатов.
+Система распознавания жизненного цикла деривативного движения.
 
-Запуск через cron каждые 5 минут:
-  */5 * * * * cd /opt/monitor && /usr/bin/python3 coinalyze_monitor.py
+Фильтрация живёт в URL Coinalyze (discovery-слой). Код не фильтрует —
+он наблюдает за тем, что пришло, и ведёт lifecycle.
 
-Все файлы состояния лежат в корне рядом со скриптом.
+8 состояний:
+  NEUTRAL → ACCUMULATION → EARLY_MOVE → CONFIRMED_TREND
+  → ACCELERATION → EXHAUSTION → DISTRIBUTION → INVALIDATED
+
+Запуск: python coinalyze_monitor.py  (cron / GitHub Actions, каждые 5 мин)
 """
 
 import os
@@ -29,18 +33,19 @@ except ImportError:
         pass
 
 # ═══════════════════════════════════════════════════════════
-# ПУТИ — всё в корне рядом со скриптом
+# ПУТИ
 # ═══════════════════════════════════════════════════════════
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent
 
-SNAPSHOTS_FILE  = BASE_DIR / "snapshots.jsonl"
-HEARTBEAT_FILE  = BASE_DIR / "heartbeat.jsonl"
-WATCHLIST_FILE  = BASE_DIR / "watchlist.json"
-DEBUG_HTML_FILE = BASE_DIR / "debug_page.html"
+MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
+SNAPSHOTS_FILE      = BASE / "snapshots.jsonl"
+HEARTBEAT_FILE      = BASE / "heartbeat.jsonl"
+WATCHLIST_FILE      = BASE / "watchlist.json"
+DEBUG_HTML_FILE     = BASE / "debug_page.html"
 
 # ═══════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ
+# КОНФИГ
 # ═══════════════════════════════════════════════════════════
 
 COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
@@ -54,46 +59,37 @@ QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL",
                                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
 
+# Discovery-фильтр (настроен в UI Coinalyze):
+#   Volume>2M, OI>1M, OI24>0, OI4h>0, CVD>45, LLS<60
+# Сортировка по объёму (desc): при пагинации обрезается неликвидный хвост.
 COINALYZE_URL = (
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
-    "&filter=ZV9ndF8yLjUmYl9ndF8xJmNfZ3RfMTAwMDAwMCZjbTYxNjVfZ3RfMzUmY202MTY0X2x0XzQ1"
-    "&order_by=oi_current&order_dir=desc"
+    "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
+    "&order_by=volume_24hour&order_dir=desc"
 )
 
-# Сроки хранения
+MARKET_TTL_DAYS    = 1
 SNAPSHOTS_TTL_DAYS = 7
 HEARTBEAT_TTL_DAYS = 3
 
-# Lifecycle
-CONFIRM_SNAPSHOTS  = 3
-CONFIRM_WINDOW_MIN = 30
-RUNNING_SNAPSHOTS  = 4
-EXIT_NO_RECOVERY   = 3
+LIFECYCLE_WINDOW_MIN = 90
+MIN_SNAPS_LIFECYCLE  = 5
+
+MISS_EXIT_RUNS   = 2   # прогонов без данных → сигнал выхода
+MISS_REMOVE_RUNS = 4   # прогонов без данных → удаление
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("coinalyze")
+log = logging.getLogger("monitor")
 
 
 # ═══════════════════════════════════════════════════════════
 # УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════
-
-def fmt_pct(val):
-    """Форматирует число как процент с плюсом/минусом (например, +12.34%)"""
-    if val is None:
-        return "n/a"
-    return f"{val:+.2f}%"
-
-def fmt_num(val, suffix="", decimals=0):
-    """Форматирует число с заданным количеством знаков и опциональным суффиксом"""
-    if val is None:
-        return "n/a"
-    return f"{val:.{decimals}f}{suffix}"
 
 def parse_number(raw: Optional[str]) -> Optional[float]:
     if raw is None:
@@ -115,18 +111,41 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def esc(val) -> str:
+    return html_mod.escape(str(val), quote=False)
+
+
+def fmt_pct(val) -> str:
+    if val is None:
+        return "—"
+    sign = "+" if val > 0 else ""
+    return f"{sign}{val:.1f}%"
+
+
+def fmt_num(val, suffix="", dec=1) -> str:
+    if val is None:
+        return "—"
+    return f"{val:.{dec}f}{suffix}"
+
+
+def safe(val, default=0.0) -> float:
+    return val if val is not None else default
+
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+
 # ═══════════════════════════════════════════════════════════
-# 1. ИСТОЧНИК ДАННЫХ
+# 1. СБОР ДАННЫХ
 # ═══════════════════════════════════════════════════════════
 
 def fetch_html() -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            ),
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
@@ -140,54 +159,48 @@ def fetch_html() -> str:
                                 "domain": "coinalyze.net", "path": "/", "secure": True})
             cookies.append({"name": "cookies_accepted", "value": "1",
                             "domain": "coinalyze.net", "path": "/", "secure": True})
-            context.add_cookies(cookies)
+            ctx.add_cookies(cookies)
 
-        page = context.new_page()
+        page = ctx.new_page()
         stealth_sync(page)
-
         try:
             page.goto(COINALYZE_URL, wait_until="domcontentloaded", timeout=50_000)
             page.wait_for_timeout(4000)
             if "Attention Required" in page.content():
-                log.warning("Cloudflare challenge, waiting...")
+                log.warning("Cloudflare, waiting...")
                 page.wait_for_timeout(10_000)
             page.wait_for_selector("tbody tr", timeout=25_000)
-            html_content = page.content()
+            html_text = page.content()
         except Exception as e:
-            log.error(f"Ошибка загрузки: {e}")
+            log.error(f"Загрузка: {e}")
             try:
-                html_content = page.content()
+                html_text = page.content()
             except Exception:
-                html_content = ""
+                html_text = ""
             try:
-                page.screenshot(path=str(BASE_DIR / "debug_screenshot.png"), full_page=True)
+                page.screenshot(path=str(BASE / "debug_screenshot.png"), full_page=True)
             except Exception:
                 pass
         finally:
             browser.close()
-
-    return html_content
+    return html_text
 
 
 def parse_table(html_text: str) -> list[dict]:
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
-    log.info(f"Строк в таблице: {len(rows)}")
-
-    records = []
+    log.info(f"Строк: {len(rows)}")
     ts = now_ts()
+    out = []
     for tr in rows:
         symbol = tr.get("data-coin")
         tds = tr.find_all("td")
         if len(tds) < 23:
             continue
-        name_spans = tds[1].find_all("span")
-        coin_name = name_spans[0].get_text(strip=True) if name_spans else (symbol or "?")
-
-        records.append({
-            "ts":              ts,
-            "symbol":          symbol,
-            "name":            coin_name,
+        spans = tds[1].find_all("span")
+        name = spans[0].get_text(strip=True) if spans else (symbol or "?")
+        out.append({
+            "ts": ts, "symbol": symbol, "name": name,
             "price":           parse_number(tds[2].get_text(strip=True)),
             "price_chg24":     parse_number(tds[3].get_text(strip=True)),
             "mktcap":          parse_number(tds[4].get_text(strip=True)),
@@ -208,7 +221,7 @@ def parse_table(html_text: str) -> list[dict]:
             "cvd24":           parse_number(tds[21].get_text(strip=True)),
             "lls24":           parse_number(tds[22].get_text(strip=True)),
         })
-    return records
+    return out
 
 
 def fetch_data() -> list[dict]:
@@ -216,14 +229,7 @@ def fetch_data() -> list[dict]:
     DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
     rows = parse_table(html_text)
     if not rows:
-        send_telegram(
-            "⚠️ <b>Coinalyze Monitor</b>\n"
-            "Данные не получены.\n"
-            "• Cookies истекли\n"
-            "• Разметка изменилась\n"
-            "• Cloudflare\n\n"
-            "Проверь debug_page.html"
-        )
+        send_tg("⚠️ <b>Monitor</b>\nДанные не получены. Проверь debug_page.html")
         sys.exit(1)
     return rows
 
@@ -232,9 +238,9 @@ def fetch_data() -> list[dict]:
 # 2. ХРАНЕНИЕ
 # ═══════════════════════════════════════════════════════════
 
-def append_jsonl(path: Path, record: dict):
+def append_jsonl(path: Path, rec: dict):
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -256,74 +262,87 @@ def cleanup_jsonl(path: Path, ttl_days: int):
     if not path.exists():
         return
     cutoff = now_ts() - ttl_days * 86400
-    records = load_jsonl(path)
-    fresh = [r for r in records if r.get("ts", 0) > cutoff]
-    removed = len(records) - len(fresh)
-    if removed > 0:
+    recs = load_jsonl(path)
+    fresh = [r for r in recs if r.get("ts", 0) > cutoff]
+    removed = len(recs) - len(fresh)
+    if removed:
         with open(path, "w", encoding="utf-8") as f:
             for r in fresh:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        log.info(f"Cleanup {path.name}: -{removed} записей")
+        log.info(f"Cleanup {path.name}: -{removed}")
 
 
 def load_watchlist() -> dict:
     if not WATCHLIST_FILE.exists():
         return {}
-    with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.warning("watchlist.json повреждён, начинаю с чистого")
+        return {}
 
 
 def save_watchlist(wl: dict):
-    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(wl, f, ensure_ascii=False, indent=2)
+    WATCHLIST_FILE.write_text(
+        json.dumps(wl, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_market_history() -> dict[str, list[dict]]:
+    cutoff = now_ts() - LIFECYCLE_WINDOW_MIN * 60
+    recs = load_jsonl(MARKET_HISTORY_FILE)
+    grouped: dict[str, list[dict]] = {}
+    seen: set[tuple] = set()
+    for r in recs:
+        if r.get("ts", 0) > cutoff:
+            sym = r.get("symbol", "")
+            key = (r.get("ts"), sym)
+            if sym and key not in seen:
+                seen.add(key)
+                grouped.setdefault(sym, []).append(r)
+    for sym in grouped:
+        grouped[sym].sort(key=lambda x: x["ts"])
+    return grouped
 
 
 # ═══════════════════════════════════════════════════════════
-# 3. ПЕРВИЧНЫЙ ФИЛЬТР
+# 3. ФИЛЬТР ДЛЯ АРХИВА (snapshots.jsonl)
+#    Не влияет на сигналы — только для истории кандидатов.
 # ═══════════════════════════════════════════════════════════
 
-def passes_primary_filter(r: dict) -> bool:
-    vol = r.get("volume24")
-    if vol is None or vol <= 1_000_000:
+def passes_filter(r: dict) -> bool:
+    v = r.get("volume24")
+    if v is None or v <= 1_000_000:
         return False
-
     pc = r.get("price_chg24")
     if pc is None or pc < 1.0 or pc > 15.0:
         return False
-
-    oi24 = r.get("oi_chg24_pct")
-    if oi24 is None or oi24 <= 5.0 or oi24 >= 50.0:
+    oi = r.get("oi_chg24_pct")
+    if oi is None or oi <= 5.0 or oi >= 50.0:
         return False
-
-    oi4h = r.get("oi_chg4h_pct")
-    if oi4h is None or oi4h <= 0:
+    oi4 = r.get("oi_chg4h_pct")
+    if oi4 is None or oi4 <= 0:
         return False
-
     cvd = r.get("cvd24")
     if cvd is None or cvd <= 55:
         return False
-
     lls = r.get("lls24")
     if lls is None or lls >= 40:
         return False
-
-    oi_mc = r.get("oi_mktcap_ratio")
-    if oi_mc is None or oi_mc >= 0.15:
+    oim = r.get("oi_mktcap_ratio")
+    if oim is None or oim >= 0.15:
         return False
-
-    oi_v = r.get("oi_vol_ratio")
-    if oi_v is None or oi_v < 0.1 or oi_v > 2.5:
+    oiv = r.get("oi_vol_ratio")
+    if oiv is None or oiv < 0.1 or oiv > 2.5:
         return False
-
     fr = r.get("fr_oiw")
     if fr is not None and fr > 0.05:
         return False
-
     return True
 
 
 # ═══════════════════════════════════════════════════════════
-# 4. SCORING (макс 10)
+# 4. SCORING (0–10)
 # ═══════════════════════════════════════════════════════════
 
 def calculate_score(r: dict) -> tuple[int, list[str], list[str]]:
@@ -331,251 +350,491 @@ def calculate_score(r: dict) -> tuple[int, list[str], list[str]]:
     pros: list[str] = []
     cons: list[str] = []
 
-    # CVD
     cvd = r.get("cvd24")
     if cvd is not None:
-        if cvd > 70:
-            score += 2; pros.append(f"CVD={cvd:.0f} >70")
-        elif cvd >= 55:
-            score += 1; pros.append(f"CVD={cvd:.0f} 55-70")
+        if cvd > 70:    score += 2; pros.append(f"CVD={cvd:.0f}>70")
+        elif cvd >= 55: score += 1; pros.append(f"CVD={cvd:.0f}")
 
-    # LLS
     lls = r.get("lls24")
     if lls is not None:
-        if lls < 15:
-            score += 2; pros.append(f"LLS={lls:.0f}% <15")
-        elif lls < 40:
-            score += 1; pros.append(f"LLS={lls:.0f}% 15-40")
-        if lls > 50:
-            score -= 2; cons.append(f"LLS={lls:.0f}% >50")
+        if lls < 15:    score += 2; pros.append(f"LLS={lls:.0f}%<15")
+        elif lls < 40:  score += 1; pros.append(f"LLS={lls:.0f}%")
+        if lls > 50:    score -= 2; cons.append(f"LLS={lls:.0f}%>50")
 
-    # OI 24h
-    oi24 = r.get("oi_chg24_pct")
-    if oi24 is not None:
-        if 5 <= oi24 <= 35:
-            score += 2; pros.append(f"OI24={oi24:.1f}% 5-35")
-        elif oi24 > 50:
-            score -= 2; cons.append(f"OI24={oi24:.1f}% >50 перегрев")
+    oi = r.get("oi_chg24_pct")
+    if oi is not None:
+        if 5 <= oi <= 35: score += 2; pros.append(f"OI24={oi:.1f}%")
+        elif oi > 50:     score -= 2; cons.append(f"OI24={oi:.1f}%>50")
 
-    # OI 4h
-    oi4h = r.get("oi_chg4h_pct")
-    if oi4h is not None and oi4h > 0:
-        score += 1; pros.append(f"OI4h={oi4h:.1f}% >0")
+    oi4 = r.get("oi_chg4h_pct")
+    if oi4 is not None and oi4 > 0:
+        score += 1; pros.append(f"OI4h={oi4:.1f}%")
 
-    # Price
     pc = r.get("price_chg24")
     if pc is not None:
-        if 2 <= pc <= 10:
-            score += 1; pros.append(f"Price={pc:.1f}% 2-10")
-        elif pc > 20:
-            score -= 2; cons.append(f"Price={pc:.1f}% >20 вертикаль")
+        if 2 <= pc <= 10: score += 1; pros.append(f"P={pc:.1f}%")
+        elif pc > 20:     score -= 2; cons.append(f"P={pc:.1f}%>20")
 
-    # Funding
     fr = r.get("fr_oiw")
     if fr is not None:
-        if -0.01 <= fr <= 0.03:
-            score += 1; pros.append(f"Funding={fr:.4f} норма")
-        elif fr > 0.05:
-            score -= 2; cons.append(f"Funding={fr:.4f} перегрет")
+        if -0.01 <= fr <= 0.03: score += 1; pros.append(f"FR={fr:.4f}")
+        elif fr > 0.05:         score -= 2; cons.append(f"FR={fr:.4f}>0.05")
 
-    # OI/Mcap
-    oi_mc = r.get("oi_mktcap_ratio")
-    if oi_mc is not None and oi_mc < 0.10:
-        score += 1; pros.append(f"OI/Mcap={oi_mc:.3f} <0.10")
+    oim = r.get("oi_mktcap_ratio")
+    if oim is not None and oim < 0.10:
+        score += 1; pros.append(f"OI/Mc={oim:.3f}")
 
     return score, pros, cons
 
 
 # ═══════════════════════════════════════════════════════════
-# 7. ДИНАМИКА
+# 5. ПРОИЗВОДНЫЕ МЕТРИКИ + ДИВЕРГЕНЦИИ
 # ═══════════════════════════════════════════════════════════
 
-def compute_trend(values: list) -> str:
-    clean = [v for v in values if v is not None]
-    if len(clean) < 2:
-        return "flat"
-    diffs = [clean[i] - clean[i - 1] for i in range(1, len(clean))]
-    avg = sum(diffs) / len(diffs)
-    if avg > 0.5:
-        return "up"
-    if avg < -0.5:
-        return "down"
-    return "flat"
-
-
-def analyze_dynamics(snaps: list[dict]) -> dict:
-    if len(snaps) < 2:
-        return {"oi_trend": "flat", "cvd_trend": "flat",
-                "price_trend": "flat", "oi4h_trend": "flat",
-                "divergence": "none", "note": ""}
-
-    recent = snaps[-6:]
-    oi_trend    = compute_trend([s.get("oi_chg24_pct") for s in recent])
-    cvd_trend   = compute_trend([s.get("cvd24") for s in recent])
-    price_trend = compute_trend([s.get("price_chg24") for s in recent])
-    oi4h_trend  = compute_trend([s.get("oi_chg4h_pct") for s in recent])
-
-    divergence = "none"
-    note = ""
-    if price_trend == "up" and oi_trend == "down":
-        divergence = "price_up_oi_down"
-        note = "Цена ↑ OI ↓ — рост на закрытии шортов, не на новом спросе"
-    elif price_trend == "up" and cvd_trend == "down":
-        divergence = "price_up_cvd_down"
-        note = "Цена ↑ CVD ↓ — покупатели ослабевают"
-    elif oi_trend == "up" and cvd_trend == "up" and price_trend == "up":
-        note = "Здоровое движение: Price+OI+CVD растут синхронно"
-
-    return {
-        "oi_trend": oi_trend, "cvd_trend": cvd_trend,
-        "price_trend": price_trend, "oi4h_trend": oi4h_trend,
-        "divergence": divergence, "note": note,
+def calc_derived(snaps: list[dict]) -> dict:
+    n = len(snaps)
+    d = {
+        "oi_accel": 0.0,
+        "cvd_momentum": 0.0,
+        "price_accel": 0.0,
+        "funding_pressure": 0.0,
+        "oi_trend": "flat",
+        "cvd_trend": "flat",
+        "price_trend": "flat",
+        "oi4h_trend": "flat",
+        "divergence": "none",
+        "note": "",
     }
+    if n < 2:
+        return d
+
+    def trend(vals):
+        clean = [v for v in vals if v is not None]
+        if len(clean) < 2:
+            return "flat"
+        diff = clean[-1] - clean[0]
+        base = abs(clean[0]) if abs(clean[0]) > 1 else 1.0
+        if diff > base * 0.05:
+            return "up"
+        if diff < -base * 0.05:
+            return "down"
+        return "flat"
+
+    d["oi_trend"]    = trend([s.get("oi_chg24_pct") for s in snaps])
+    d["cvd_trend"]   = trend([s.get("cvd24") for s in snaps])
+    d["price_trend"] = trend([s.get("price_chg24") for s in snaps])
+    d["oi4h_trend"]  = trend([s.get("oi_chg4h_pct") for s in snaps])
+
+    if n >= 3:
+        oi = [safe(s.get("oi_chg24_pct")) for s in snaps[-3:]]
+        d["oi_accel"] = (oi[2] - oi[1]) - (oi[1] - oi[0])
+
+    if n >= 4:
+        d["cvd_momentum"] = safe(snaps[-1].get("cvd24")) - safe(snaps[-4].get("cvd24"))
+    elif n >= 2:
+        d["cvd_momentum"] = safe(snaps[-1].get("cvd24")) - safe(snaps[0].get("cvd24"))
+
+    if n >= 3:
+        pc = [safe(s.get("price_chg24")) for s in snaps[-3:]]
+        d["price_accel"] = (pc[2] - pc[1]) - (pc[1] - pc[0])
+
+    if n >= 3:
+        fr = [safe(s.get("fr_oiw")) for s in snaps[-3:]]
+        d["funding_pressure"] = (fr[2] - fr[1]) - (fr[1] - fr[0])
+
+    # 5 дивергенций
+    if d["price_trend"] == "up" and d["oi_trend"] == "down":
+        d["divergence"] = "price_up_oi_down"
+        d["note"] = "Цена ↑ OI ↓ — рост на закрытии шортов"
+
+    elif d["price_trend"] == "up" and d["cvd_trend"] == "down":
+        d["divergence"] = "price_up_cvd_down"
+        d["note"] = "Цена ↑ CVD ↓ — покупатели ослабевают"
+
+    elif d["price_trend"] == "down" and d["oi_trend"] == "up":
+        d["divergence"] = "price_down_oi_up"
+        d["note"] = "Цена ↓ OI ↑ — возможное накопление"
+
+    elif d["oi_trend"] == "down" and n >= 3:
+        fr_vals = [safe(s.get("fr_oiw")) for s in snaps[-3:]]
+        if fr_vals[-1] > fr_vals[0] + 0.005:
+            d["divergence"] = "funding_up_oi_down"
+            d["note"] = "Funding ↑ OI ↓ — выход участников"
+
+    elif d["price_trend"] == "up" and n >= 3:
+        lls_vals = [safe(s.get("lls24")) for s in snaps[-3:]]
+        if lls_vals[-1] > lls_vals[0] + 10:
+            d["divergence"] = "lls_up_price_up"
+            d["note"] = "LLS ↑ Price ↑ — поздняя стадия"
+
+    elif d["oi_trend"] != "down" and d["cvd_trend"] != "down" and d["price_trend"] == "up":
+        d["note"] = "Здоровое движение: Price↑ OI и CVD не падают"
+
+    return d
 
 
 # ═══════════════════════════════════════════════════════════
-# 8. ПАТТЕРНЫ
+# 6. MOMENTUM SCORE
 # ═══════════════════════════════════════════════════════════
 
-def detect_pattern(r: dict, dyn: dict) -> str:
-    pc   = r.get("price_chg24") or 0
-    oi24 = r.get("oi_chg24_pct") or 0
-    cvd  = r.get("cvd24") or 50
-    lls  = r.get("lls24") or 30
-    fr   = r.get("fr_oiw") or 0
-    ls   = r.get("ls_accounts") or 1.0
+def calc_momentum(derived: dict) -> tuple[int, list[str]]:
+    m = 0
+    tags: list[str] = []
 
-    if pc > 0 and oi24 > 5 and cvd > 60 and lls < 30 and dyn["oi_trend"] == "up":
-        return "Healthy Trend"
-    if pc > 0 and oi24 > 5 and lls > 35 and ls < 1.0:
-        return "Short Squeeze Setup"
-    if pc < 3 and dyn["cvd_trend"] == "up" and fr < 0.005:
-        return "Stealth Accumulation"
-    if pc > 10 and oi24 > 20 and dyn["cvd_trend"] == "down":
-        return "Late Trend"
-    if pc < 0 and dyn["oi_trend"] == "down":
+    if derived["oi_accel"] > 0:
+        m += 2; tags.append("OI accel↑")
+    elif derived["oi_accel"] < 0:
+        m -= 1; tags.append("OI accel↓")
+
+    if derived["cvd_momentum"] > 5:
+        m += 2; tags.append("CVD mom↑")
+    elif derived["cvd_momentum"] < -5:
+        m -= 1; tags.append("CVD mom↓")
+
+    if derived["price_accel"] > 0:
+        m += 1; tags.append("Price accel↑")
+
+    if derived["funding_pressure"] <= 0:
+        m += 1; tags.append("Funding stable")
+    else:
+        tags.append("Funding↑")
+
+    if derived["oi4h_trend"] == "up":
+        m += 1; tags.append("OI4h↑")
+
+    if derived["divergence"] == "none":
+        m += 2; tags.append("No divergence")
+    else:
+        m -= 2; tags.append(f"Div: {derived['divergence']}")
+
+    if derived["oi_trend"] == "up" and derived["cvd_trend"] == "up":
+        m += 1; tags.append("OI+CVD sync↑")
+
+    return clamp(m, 0, 10), tags
+
+
+# ═══════════════════════════════════════════════════════════
+# 7. PATTERN ENGINE
+#    Порядок: предупреждающие первыми, Healthy Trend последним
+#    (иначе жадный Healthy Trend перехватывает перегрев).
+# ═══════════════════════════════════════════════════════════
+
+def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
+    pc   = safe(r.get("price_chg24"))
+    oi24 = safe(r.get("oi_chg24_pct"))
+    cvd  = safe(r.get("cvd24"))
+    lls  = safe(r.get("lls24"))
+    fr   = safe(r.get("fr_oiw"))
+    ls   = safe(r.get("ls_accounts"))
+    div  = derived["divergence"]
+
+    # предупреждающие — первыми
+    if cvd > 90 and fr > 0.03 and derived["oi_accel"] < 0:
+        return "Exhaustion"
+
+    if div == "funding_up_oi_down" or (pc > 5 and derived["oi_trend"] == "down"):
         return "Distribution"
-    if oi24 < -10 and lls > 45 and dyn["cvd_trend"] == "up":
+
+    if oi24 < -10 and lls > 45 and derived["cvd_trend"] == "up":
         return "Capitulation"
-    return "Neutral"
+
+    if pc > 10 and oi24 > 20 and derived["cvd_trend"] == "down":
+        return "Late Trend"
+
+    # ситуативные
+    if pc > 0 and oi24 > 5 and lls > 35 and ls < 1.0:
+        return "Short Squeeze"
+
+    if (pc < 3 and derived["cvd_trend"] == "up" and fr < 0.005
+            and oi24 > 0 and div == "none"):
+        return "Stealth Accumulation"
+
+    if momentum >= 7 and derived["oi_accel"] > 2 and derived["cvd_momentum"] > 10:
+        return "Momentum Expansion"
+
+    # общий позитивный — последним
+    if (pc > 0 and oi24 > 5 and cvd > 60 and lls < 30
+            and derived["oi_trend"] != "down" and div == "none"):
+        return "Healthy Trend"
+
+    return "—"
 
 
 # ═══════════════════════════════════════════════════════════
-# 5-6. LIFECYCLE
+# 8. MARKET PHASE DETECTION
+#    (BTC может не пройти discovery-фильтр → modifier 0, это ок)
 # ═══════════════════════════════════════════════════════════
 
-def get_symbol_snapshots(symbol: str) -> list[dict]:
-    all_snaps = load_jsonl(SNAPSHOTS_FILE)
-    return sorted([s for s in all_snaps if s.get("symbol") == symbol],
-                  key=lambda s: s["ts"])
+def detect_market_phase(rows: list[dict]) -> dict:
+    btc = next((r for r in rows if r["symbol"] == "BTCUSDT"), None)
+    if not btc:
+        return {"phase": "unknown", "note": "", "modifier": 0}
+
+    btc_pc = safe(btc.get("price_chg24"))
+    up = sum(1 for r in rows if safe(r.get("price_chg24")) > 0)
+    ratio = up / max(len(rows), 1)
+
+    if btc_pc > 2 and ratio > 0.6:
+        return {"phase": "risk-on", "note": "BTC↑ рынок широкий", "modifier": +1}
+    if btc_pc > 2 and ratio < 0.4:
+        return {"phase": "btc-dominance", "note": "BTC↑ альты нет", "modifier": 0}
+    if btc_pc < -2 and ratio < 0.3:
+        return {"phase": "risk-off", "note": "BTC↓ рынок слабый", "modifier": -1}
+    if btc_pc < -2 and ratio > 0.5:
+        return {"phase": "rotation", "note": "BTC↓ альты держатся", "modifier": 0}
+    return {"phase": "neutral", "note": "", "modifier": 0}
 
 
-def lifecycle_transition(symbol: str, entry: dict, current: dict,
-                         snaps: list[dict]) -> tuple[str, list[str]]:
-    stage = entry.get("stage", "NEW")
+# ═══════════════════════════════════════════════════════════
+# 9. LIFECYCLE ENGINE
+# ═══════════════════════════════════════════════════════════
+
+ACTIONS = {
+    "NEUTRAL":         "IGNORE",
+    "ACCUMULATION":    "WATCH",
+    "EARLY_MOVE":      "WATCH_LONG",
+    "CONFIRMED_TREND": "POSSIBLE_ENTRY",
+    "ACCELERATION":    "LONG_SETUP",
+    "EXHAUSTION":      "NO_NEW_ENTRY",
+    "DISTRIBUTION":    "EXIT_AVOID",
+    "INVALIDATED":     "REMOVE",
+}
+
+STATE_EMOJI = {
+    "NEUTRAL": "⚪", "ACCUMULATION": "🔍", "EARLY_MOVE": "🌱",
+    "CONFIRMED_TREND": "🟢", "ACCELERATION": "🚀",
+    "EXHAUSTION": "🟠", "DISTRIBUTION": "🔴", "INVALIDATED": "❌",
+}
+
+ALLOWED_FROM = {
+    "ACCUMULATION":    {"NEUTRAL", "ACCUMULATION"},
+    "EARLY_MOVE":      {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE"},
+    "CONFIRMED_TREND": {"ACCUMULATION", "EARLY_MOVE", "CONFIRMED_TREND"},
+    "ACCELERATION":    {"CONFIRMED_TREND", "ACCELERATION"},
+    "EXHAUSTION":      {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION"},
+    "DISTRIBUTION":    {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"},
+    "INVALIDATED":     {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE", "CONFIRMED_TREND",
+                        "ACCELERATION", "EXHAUSTION", "DISTRIBUTION", "INVALIDATED"},
+}
+
+
+def detect_lifecycle(symbol: str, snaps: list[dict],
+                     score: int, derived: dict,
+                     prev_state: str = "NEUTRAL") -> tuple[str, list[str], list[str]]:
+
+    n = len(snaps)
     reasons: list[str] = []
-    score = current.get("score", 0)
-    dyn = current.get("dynamics", {})
+    warnings: list[str] = []
 
-    # NEW → WAIT_CONFIRMATION
-    if stage == "NEW":
-        if score >= 6:
-            reasons.append(f"Score={score} ≥6")
-            return "WAIT_CONFIRMATION", reasons
-        return stage, reasons
+    if n < 2:
+        return "NEUTRAL", ["недостаточно данных"], []
 
-    # WAIT_CONFIRMATION → CONFIRMED_LONG
-    if stage == "WAIT_CONFIRMATION":
-        cutoff = now_ts() - CONFIRM_WINDOW_MIN * 60
-        recent = [s for s in snaps if s["ts"] > cutoff]
-        if len(recent) >= CONFIRM_SNAPSHOTS:
-            oi_ok = all(
-                (recent[i].get("oi_chg24_pct") or 0) >=
-                (recent[i - 1].get("oi_chg24_pct") or 0) - 1
-                for i in range(1, len(recent))
-            )
-            oi4h_ok = all((s.get("oi_chg4h_pct") or 0) >= -0.5 for s in recent)
-            cvd_ok = all(
-                (recent[i].get("cvd24") or 50) >=
-                (recent[i - 1].get("cvd24") or 50) - 5
-                for i in range(1, len(recent))
-            )
-            lls_ok = all((s.get("lls24") or 30) < 50 for s in recent)
+    last = snaps[-1]
 
-            if oi_ok and oi4h_ok and cvd_ok and lls_ok:
-                reasons.append(f"{len(recent)} снимков за {CONFIRM_WINDOW_MIN} мин")
-                reasons.append("OI↑ OI4h≥0 CVD стабилен LLS<50")
-                return "CONFIRMED_LONG", reasons
-            if not oi_ok:   reasons.append("OI24 не растёт")
-            if not oi4h_ok: reasons.append("OI4h падает")
-            if not cvd_ok:  reasons.append("CVD падает")
-            if not lls_ok:  reasons.append("LLS>50")
-        return stage, reasons
+    if last.get("cvd24") is None or last.get("oi_chg24_pct") is None:
+        return "NEUTRAL", ["нет данных CVD/OI"], []
 
-    # CONFIRMED_LONG → RUNNING
-    if stage == "CONFIRMED_LONG":
-        if len(snaps) >= RUNNING_SNAPSHOTS and score >= 7:
-            reasons.append(f"{len(snaps)} снимков, score={score}≥7")
-            return "RUNNING", reasons
-        return stage, reasons
+    pc   = safe(last.get("price_chg24"))
+    oi24 = safe(last.get("oi_chg24_pct"))
+    oi4h = safe(last.get("oi_chg4h_pct"))
+    cvd  = safe(last.get("cvd24"))
+    lls  = safe(last.get("lls24"))
+    fr   = safe(last.get("fr_oiw"))
 
-    # RUNNING → EXIT_WARNING
-    if stage == "RUNNING":
-        triggered = False
+    oi_accel    = derived["oi_accel"]
+    cvd_mom     = derived["cvd_momentum"]
+    price_accel = derived["price_accel"]
+    fund_press  = derived["funding_pressure"]
 
-        if len(snaps) >= 3:
-            oi3 = [s.get("oi_chg24_pct") or 0 for s in snaps[-3:]]
-            if oi3[-1] < oi3[-2] < oi3[-3]:
-                triggered = True
-                reasons.append("OI падает 2 снимка подряд")
+    def allowed(target: str) -> bool:
+        return prev_state in ALLOWED_FROM.get(target, set())
 
-        if len(snaps) >= 2:
-            cvd_prev = snaps[-2].get("cvd24") or 50
-            cvd_curr = snaps[-1].get("cvd24") or 50
-            if cvd_prev - cvd_curr > 15:
-                triggered = True
-                reasons.append(f"CVD -{cvd_prev - cvd_curr:.0f} пунктов")
+    # ── INVALIDATED ──
+    if oi24 < -5 and cvd < 40:
+        reasons.append(f"OI24={oi24:.1f}%<-5, CVD={cvd:.0f}<40")
+        if pc < -3:
+            reasons.append(f"Price={pc:.1f}% — структура сломана")
+        return "INVALIDATED", reasons, warnings
 
-        if (current.get("price_chg24") or 0) > 0 and dyn.get("oi_trend") == "down":
-            triggered = True
-            reasons.append("Дивергенция Price↑ OI↓")
+    # ── DISTRIBUTION ──
+    if allowed("DISTRIBUTION") and n >= 2:
+        oi4h_prev = safe(snaps[-2].get("oi_chg4h_pct"))
+        if oi4h < 0 and oi4h_prev < 0 and cvd_mom < -10:
+            reasons.append(f"OI4h<0 2 снимка, CVD mom={cvd_mom:.0f}<-10")
+            if pc > 5:
+                reasons.append(f"Price={pc:.1f}% — ещё высокая")
+            if fr > 0.02:
+                reasons.append(f"FR={fr:.4f} — остаётся высоким")
+            return "DISTRIBUTION", reasons, warnings
 
-        if (current.get("lls24") or 0) > 50:
-            triggered = True
-            reasons.append(f"LLS={current['lls24']:.0f}%>50")
+    # ── EXHAUSTION ──
+    if allowed("EXHAUSTION"):
+        if cvd > 90 and (fr > 0.03 or fund_press > 0.005) and oi_accel < 0 and pc > 15:
+            reasons.append(f"CVD={cvd:.0f}>90, FR={fr:.4f}, fund_press={fund_press:.4f}")
+            reasons.append(f"OI accel={oi_accel:.1f}<0 — замедление")
+            warnings.append(f"Price={pc:.1f}% — вертикальный рост")
+            return "EXHAUSTION", reasons, warnings
 
-        if triggered:
-            return "EXIT_WARNING", reasons
-        return stage, reasons
+    # ── ACCELERATION ──
+    if allowed("ACCELERATION"):
+        if n >= 3 and oi_accel > 2 and cvd_mom > 10 and price_accel >= 1:
+            reasons.append(f"OI accel={oi_accel:.1f}>2")
+            reasons.append(f"CVD mom={cvd_mom:.0f}>10")
+            reasons.append(f"Price accel={price_accel:.1f}>=1")
+            if cvd > 85:
+                warnings.append(f"CVD={cvd:.0f} — близко к максимуму")
+            if pc > 10:
+                warnings.append(f"Price={pc:.1f}% — уже вырос")
+            return "ACCELERATION", reasons, warnings
 
-    # EXIT_WARNING → REMOVED
-    if stage == "EXIT_WARNING":
-        since = entry.get("exit_warning_since", 0)
-        after = [s for s in snaps if s["ts"] > since]
-        if len(after) >= EXIT_NO_RECOVERY:
-            recovered = any(
-                (s.get("oi_chg4h_pct") or 0) > 0 and (s.get("cvd24") or 0) > 55
-                for s in after[-EXIT_NO_RECOVERY:]
-            )
-            if not recovered:
-                reasons.append(f"Нет восстановления {EXIT_NO_RECOVERY} снимка")
-                return "REMOVED", reasons
-        return stage, reasons
+    # ── CONFIRMED_TREND (два пути) ──
+    if allowed("CONFIRMED_TREND") and n >= MIN_SNAPS_LIFECYCLE:
+        recent = snaps[-MIN_SNAPS_LIFECYCLE:]
 
-    return stage, reasons
+        oi_not_falling = all(
+            safe(recent[i].get("oi_chg24_pct")) >=
+            safe(recent[i - 1].get("oi_chg24_pct")) - 1
+            for i in range(1, len(recent))
+        )
+        cvd_not_falling = all(
+            safe(recent[i].get("cvd24")) >=
+            safe(recent[i - 1].get("cvd24")) - 5
+            for i in range(1, len(recent))
+        )
+        all_oi4 = all(safe(s.get("oi_chg4h_pct")) > 0 for s in recent)
+        all_fr  = all(safe(s.get("fr_oiw")) < 0.05 for s in recent)
+        all_lls = all(safe(s.get("lls24")) < 40 for s in recent)
+        all_pc  = all(
+            safe(recent[i].get("price_chg24")) >=
+            safe(recent[i - 1].get("price_chg24")) - 0.5
+            for i in range(1, len(recent))
+        )
+        pc_net_up = (safe(recent[-1].get("price_chg24"))
+                     >= safe(recent[0].get("price_chg24")) - 0.5)
+
+        oi_growing_faster = False
+        if len(recent) >= 3:
+            ov = [safe(s.get("oi_chg24_pct")) for s in recent[-3:]]
+            d1 = ov[1] - ov[0]
+            d2 = ov[2] - ov[1]
+            oi_growing_faster = d2 > d1 and d1 > 0
+
+        # Путь А: классика
+        path_a = (
+            all(safe(s.get("oi_chg24_pct")) > 5 for s in recent)
+            and all(safe(s.get("cvd24")) > 55 for s in recent)
+        )
+
+        # Путь Б: ранний
+        path_b = (
+            all(safe(s.get("oi_chg24_pct")) > 2 for s in recent)
+            and all(safe(s.get("cvd24")) > 50 for s in recent)
+            and oi_growing_faster
+            and cvd_mom > 5
+        )
+
+        if ((path_a or path_b)
+                and all_oi4 and all_fr and all_lls
+                and all_pc and pc_net_up
+                and oi_not_falling and cvd_not_falling):
+
+            if path_b and not path_a:
+                reasons.append("Раннее подтверждение: OI>2 CVD>50 + ускорение + momentum")
+            else:
+                reasons.append(
+                    f"{MIN_SNAPS_LIFECYCLE} снимков: OI>5 CVD>55 LLS<40 OI4h>0 P↑ FR<0.05"
+                )
+            reasons.append("OI и CVD не снижаются между снимками")
+            if oi_accel <= 0:
+                warnings.append("OI не ускоряется")
+            return "CONFIRMED_TREND", reasons, warnings
+
+    # ── EARLY_MOVE ──
+    if allowed("EARLY_MOVE") and n >= 3:
+        last3 = snaps[-3:]
+        price_up = all(
+            safe(last3[i].get("price_chg24")) > safe(last3[i - 1].get("price_chg24"))
+            for i in range(1, 3)
+        )
+        oi_up = all(
+            safe(last3[i].get("oi_chg24_pct")) > safe(last3[i - 1].get("oi_chg24_pct"))
+            for i in range(1, 3)
+        )
+        cvd_up = all(
+            safe(last3[i].get("cvd24")) > safe(last3[i - 1].get("cvd24")) - 3
+            for i in range(1, 3)
+        )
+        vol_up = all(
+            safe(last3[i].get("volume24")) > safe(last3[i - 1].get("volume24")) * 0.95
+            for i in range(1, 3)
+        )
+        if price_up and oi_up and cvd_up and vol_up:
+            reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑")
+            return "EARLY_MOVE", reasons, warnings
+
+    # ── ACCUMULATION ──
+    if allowed("ACCUMULATION") and n >= 3:
+        last3 = snaps[-3:]
+        oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
+        cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / 3
+        fr_ok   = all(safe(s.get("fr_oiw")) < 0.03 for s in last3)
+
+        if oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok:
+            reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
+            reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
+            return "ACCUMULATION", reasons, warnings
+
+    # ── NEUTRAL ──
+    return "NEUTRAL", ["нет подтверждённого движения"], warnings
 
 
 # ═══════════════════════════════════════════════════════════
-# 9. TELEGRAM
+# 10. CONFIDENCE (0–100)
 # ═══════════════════════════════════════════════════════════
 
-def esc(val) -> str:
-    return html_mod.escape(str(val), quote=False)
+def calc_confidence(state: str, snaps: list[dict], score: int,
+                    derived: dict, market_mod: int) -> int:
+    base = {
+        "NEUTRAL": 50, "ACCUMULATION": 40, "EARLY_MOVE": 55,
+        "CONFIRMED_TREND": 70, "ACCELERATION": 80,
+        "EXHAUSTION": 75, "DISTRIBUTION": 70, "INVALIDATED": 90,
+    }.get(state, 50)
+
+    snap_bonus   = min(len(snaps), 10) * 2
+    score_bonus  = score
+    market_bonus = market_mod * 3
+
+    penalty = 0
+    if derived["divergence"] != "none":
+        penalty += 15
+    if derived["oi_accel"] < 0 and state in ("ACCELERATION", "CONFIRMED_TREND"):
+        penalty += 10
+    if len(snaps) > 0 and safe(snaps[-1].get("cvd24")) > 95 and state == "ACCELERATION":
+        penalty += 5
+
+    return clamp(base + snap_bonus + score_bonus + market_bonus - penalty, 0, 100)
 
 
-def send_telegram(text: str):
+# ═══════════════════════════════════════════════════════════
+# 11. ENTRY EARLINESS
+# ═══════════════════════════════════════════════════════════
+
+def entry_earliness(r: dict) -> tuple[float, str]:
+    pc_pos = min(safe(r.get("price_chg24")) / 15.0, 1.0)
+    oi_pos = min(safe(r.get("oi_chg24_pct")) / 50.0, 1.0)
+    fr_pos = min(max(safe(r.get("fr_oiw")) / 0.05, 0), 1.0)
+    avg = (pc_pos + oi_pos + fr_pos) / 3
+    label = "ранняя" if avg < 0.35 else "средняя" if avg < 0.65 else "поздняя"
+    return avg, label
+
+
+# ═══════════════════════════════════════════════════════════
+# 12. TELEGRAM
+# ═══════════════════════════════════════════════════════════
+
+def send_tg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram не настроен")
+        log.warning("TG не настроен")
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     chunks, rem = [], text
@@ -586,7 +845,6 @@ def send_telegram(text: str):
         chunks.append(rem[:sp])
         rem = rem[sp:]
     chunks.append(rem)
-
     for ch in chunks:
         try:
             r = requests.post(url, data={
@@ -600,82 +858,100 @@ def send_telegram(text: str):
                 }, timeout=15)
             time.sleep(0.4)
         except Exception as e:
-            log.error(f"TG error: {e}")
+            log.error(f"TG: {e}")
 
 
-def format_signal(symbol: str, entry: dict, cur: dict,
-                  snaps: list[dict], reasons: list[str]) -> str:
-    stage = entry["stage"]
-    dyn = cur.get("dynamics", {})
+def format_signal(symbol: str, wl: dict, cur: dict,
+                  snaps: list[dict], reasons: list[str],
+                  warnings: list[str], market: dict) -> str:
+    state   = wl["state"]
+    emoji   = STATE_EMOJI.get(state, "⚪")
+    action  = ACTIONS.get(state, "")
+    conf    = wl.get("confidence", 0)
+    score   = cur.get("score", 0)
+    mom     = cur.get("momentum", 0)
+    pattern = cur.get("pattern", "—")
+    derived = cur.get("derived", {})
+    prev    = wl.get("previous_state", "")
     s = snaps[-1] if snaps else {}
 
-    cfg = {
-        "CONFIRMED_LONG": ("🟢", "ЛОНГ ПОДТВЕРЖДЁН"),
-        "RUNNING":        ("🔵", "ТРЕНД АКТИВЕН"),
-        "EXIT_WARNING":   ("🟠", "ПРИЗНАКИ ВЫХОДА"),
-    }
-    emoji, label = cfg.get(stage, ("⚪", stage))
-
     ar = {"up": "↑", "down": "↓", "flat": "→"}
-    oi_t  = ar.get(dyn.get("oi_trend"), "→")
-    cvd_t = ar.get(dyn.get("cvd_trend"), "→")
-    prc_t = ar.get(dyn.get("price_trend"), "→")
+    oi_t  = ar.get(derived.get("oi_trend"), "→")
+    cvd_t = ar.get(derived.get("cvd_trend"), "→")
+    prc_t = ar.get(derived.get("price_trend"), "→")
 
-    pattern = cur.get("pattern", "Neutral")
-    pattern = "—" if pattern == "Neutral" else pattern
-
-    score = cur.get("score", 0)
-    note = dyn.get("note", "")
-    reas = " · ".join(reasons) if reasons else ""
-
+    _, early_label = entry_earliness(s)
     line = "━━━━━━━━━━━━━━━━━━"
+
+    reas  = " · ".join(reasons[:3]) if reasons else ""
+    warns = " · ".join(warnings[:3]) if warnings else ""
+
+    prev_line = f" ({esc(prev)} →)" if prev and prev != state else ""
 
     msg = (
         f"{emoji} <b>{esc(cur.get('name', symbol))} ({esc(symbol)})</b>\n"
         f"{line}\n"
-        f"Стадия: {label}\n"
-        f"Score: {score}/10\n"
-        f"Паттерн: {esc(pattern)}\n"
-        f"Тренды: OI {oi_t} | CVD {cvd_t} | Price {prc_t}\n"
-        f"{line}\n"
+        f"{esc(state)}{prev_line} → {esc(action)}\n"
+        f"Score {score}/10 · Momentum {mom}/10 · Conf {conf}%\n"
+        f"Вход: {early_label} · Паттерн: {esc(pattern)}\n"
+        f"OI {oi_t} CVD {cvd_t} Price {prc_t}"
+    )
+    if market.get("note"):
+        msg += f" · {esc(market['note'])}"
+    msg += (
+        f"\n{line}\n"
         f"P {fmt_pct(s.get('price_chg24'))} | "
         f"OI {fmt_pct(s.get('oi_chg24_pct'))} | "
         f"4h {fmt_pct(s.get('oi_chg4h_pct'))} | "
-        f"CVD {fmt_num(s.get('cvd24'), decimals=0)} | "
+        f"CVD {fmt_num(s.get('cvd24'), dec=0)} | "
         f"LLS {fmt_num(s.get('lls24'), '%', 0)}\n"
     )
-
-    if note:
-        msg += f"{line}\n<i>{esc(note)}</i>\n"
-
+    if derived.get("note"):
+        msg += f"<i>{esc(derived['note'])}</i>\n"
     if reas:
-        msg += f"{line}\n<i>{esc(reas)}</i>\n"
-
+        msg += f"{line}\n✅ {esc(reas)}\n"
+    if warns:
+        msg += f"⚠️ {esc(warns)}\n"
     return msg
 
 
 # ═══════════════════════════════════════════════════════════
-# 10. LLM (опционально, только объяснение)
+# 13. LLM — ВЕРИФИКАТОР
 # ═══════════════════════════════════════════════════════════
 
-def llm_explain(symbol: str, entry: dict, cur: dict,
-                snaps: list[dict]) -> Optional[str]:
+def llm_verify(symbol: str, wl: dict, cur: dict,
+               snaps: list[dict]) -> Optional[dict]:
     if not ENABLE_LLM or not QWEN_API_KEY:
         return None
 
+    state   = wl["state"]
+    conf    = wl.get("confidence", 0)
+    action  = ACTIONS.get(state, "")
+    derived = cur.get("derived", {})
+
     recent = snaps[-5:]
     snap_txt = "\n".join(
-        f"  ts={s['ts']} p={s.get('price_chg24')} oi24={s.get('oi_chg24_pct')} "
-        f"oi4h={s.get('oi_chg4h_pct')} cvd={s.get('cvd24')} lls={s.get('lls24')}"
+        f"  ts={s['ts']} P={s.get('price_chg24')} OI24={s.get('oi_chg24_pct')} "
+        f"OI4h={s.get('oi_chg4h_pct')} CVD={s.get('cvd24')} LLS={s.get('lls24')} "
+        f"FR={s.get('fr_oiw')}"
         for s in recent
     )
+
     user_msg = (
-        f"Монета: {symbol}\nСтадия: {entry.get('stage')}\n"
-        f"Score: {cur.get('score')}\nПаттерн: {cur.get('pattern')}\n"
-        f"Динамика: {json.dumps(cur.get('dynamics',{}), ensure_ascii=False)}\n\n"
+        f"Монета: {symbol}\n"
+        f"State: {state}\nConfidence: {conf}%\nAction: {action}\n"
+        f"Momentum: {cur.get('momentum', 0)}/10\n"
+        f"Pattern: {cur.get('pattern', '—')}\n"
+        f"Derived: OI_accel={derived.get('oi_accel', 0):.1f} "
+        f"CVD_mom={derived.get('cvd_momentum', 0):.0f} "
+        f"Price_accel={derived.get('price_accel', 0):.1f} "
+        f"Funding_press={derived.get('funding_pressure', 0):.4f}\n"
+        f"Divergence: {derived.get('divergence', 'none')}\n\n"
         f"Снимки:\n{snap_txt}\n\n"
-        f"Объясни ситуацию в 2-3 предложениях. Без рекомендаций."
+        f'Верни JSON: {{"agree": true/false, "reason": "одно предложение", '
+        f'"risk": "low/medium/high"}}'
     )
+
     try:
         resp = requests.post(
             f"{QWEN_BASE_URL.rstrip('/')}/chat/completions",
@@ -684,95 +960,178 @@ def llm_explain(symbol: str, entry: dict, cur: dict,
             json={"model": QWEN_MODEL,
                   "messages": [
                       {"role": "system",
-                       "content": "Ты аналитик крипто-деривативов. Кратко и нейтрально."},
+                       "content": "Верификатор крипто-сигналов. Только JSON."},
                       {"role": "user", "content": user_msg}],
-                  "temperature": 0.2, "max_tokens": 250},
+                  "temperature": 0.1, "max_tokens": 150,
+                  "response_format": {"type": "json_object"}},
             timeout=30,
         )
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
     except Exception as e:
         log.warning(f"LLM: {e}")
     return None
 
 
 # ═══════════════════════════════════════════════════════════
-# 12. ОСНОВНОЙ ЦИКЛ (один прогон)
+# 14. ОСНОВНОЙ ПРОГОН
 # ═══════════════════════════════════════════════════════════
+
+TG_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
+ACTIVE_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
+
 
 def run():
     log.info("═══ Прогон ═══")
 
-    # 1. Данные
+    # 1. Сбор (таблица уже отфильтрована URL)
     rows = fetch_data()
-    log.info(f"Монет: {len(rows)}")
+    log.info(f"Монет после discovery-фильтра: {len(rows)}")
 
-    # 2. Heartbeat
+    # 2. Market phase (BTC может не пройти фильтр → modifier 0)
+    market = detect_market_phase(rows)
+    log.info(f"Market: {market['phase']} {market['note']}")
+
+    # 3. Watchlist ЗАРАНЕЕ (до записи history)
+    wl_all = load_watchlist()
+
+    # 4. Символы, присутствующие в текущей таблице
+    current_symbols = {r["symbol"] for r in rows}
+
+    # 5. Heartbeat + market_history — пишем всё, что пришло (код НЕ фильтрует)
     ts = now_ts()
     for r in rows:
         append_jsonl(HEARTBEAT_FILE, {"ts": ts, "symbol": r["symbol"],
                                       "price": r.get("price")})
+        append_jsonl(MARKET_HISTORY_FILE, r)
 
-    # 3. Фильтр
-    candidates = [r for r in rows if passes_primary_filter(r)]
-    log.info(f"Кандидатов: {len(candidates)}")
+    # 6. History (один раз)
+    history_all = load_market_history()
 
-    # 4-6. Snapshots + watchlist + lifecycle
-    watchlist = load_watchlist()
+    # 7. Анализ — только монеты, присутствующие в текущей таблице.
+    #    Выпавшие из фильтра здесь НЕ обрабатываются (иначе lifecycle по старым
+    #    снимкам сбрасывал бы missed_runs и сигнал выхода не срабатывал).
+    for sym, hist in history_all.items():
+        if not hist:
+            continue
+        if sym not in current_symbols:
+            continue
 
-    for r in candidates:
-        sym = r["symbol"]
-        score, pros, cons = calculate_score(r)
+        r = hist[-1]
 
-        sym_snaps = get_symbol_snapshots(sym)
-        cur_snap = {**r, "score": score, "pros": pros, "cons": cons}
-        dyn = analyze_dynamics(sym_snaps + [cur_snap])
-        pattern = detect_pattern(r, dyn)
+        raw_score, pros, cons = calculate_score(r)
+        score = clamp(raw_score + market["modifier"], 0, 10)
 
-        full = {**r, "score": score, "pros": pros, "cons": cons,
-                "dynamics": dyn, "pattern": pattern}
-        append_jsonl(SNAPSHOTS_FILE, full)
+        derived = calc_derived(hist)
+        momentum, mom_tags = calc_momentum(derived)
+        pattern = detect_pattern(r, derived, momentum)
+
+        prev_state = wl_all.get(sym, {}).get("state", "NEUTRAL")
+
+        state, reasons, warnings = detect_lifecycle(
+            sym, hist, score, derived, prev_state
+        )
+
+        # NEUTRAL → не наблюдаем
+        if state == "NEUTRAL":
+            if sym in wl_all:
+                log.info(f"[{sym}] → NEUTRAL, remove")
+                del wl_all[sym]
+            continue
+
+        # INVALIDATED → удаляем
+        if state == "INVALIDATED":
+            if sym in wl_all:
+                log.info(f"[{sym}] INVALIDATED → remove")
+                del wl_all[sym]
+            continue
+
+        # Confidence + earliness
+        conf = calc_confidence(state, hist, score, derived, market["modifier"])
+        early_val, _ = entry_earliness(r)
 
         # Watchlist
-        if sym not in watchlist:
-            watchlist[sym] = {"stage": "NEW", "first_seen": ts,
-                              "last_seen": ts, "snapshots": 1,
-                              "score": score, "warnings": []}
-        else:
-            watchlist[sym]["last_seen"] = ts
-            watchlist[sym]["snapshots"] += 1
-            watchlist[sym]["score"] = score
+        wl_all[sym] = {
+            "state": state,
+            "previous_state": prev_state,
+            "action": ACTIONS.get(state, ""),
+            "confidence": conf,
+            "score": score,
+            "momentum": momentum,
+            "pattern": pattern,
+            "name": r.get("name", sym),
+            "first_seen": wl_all.get(sym, {}).get("first_seen", ts),
+            "last_seen": ts,
+            "snapshots": wl_all.get(sym, {}).get("snapshots", 0) + 1,
+            "missed_runs": 0,
+            "entry_earliness": round(early_val, 2),
+            "reasons": reasons,
+            "warnings": warnings,
+            "mom_tags": mom_tags,
+        }
 
-        # Lifecycle
-        entry = watchlist[sym]
-        all_snaps = get_symbol_snapshots(sym)
-        new_stage, reasons = lifecycle_transition(sym, entry, full, all_snaps)
+        cur = {**r, "score": score, "pros": pros, "cons": cons,
+               "derived": derived, "momentum": momentum, "pattern": pattern}
 
-        old_stage = entry["stage"]
-        if new_stage != old_stage:
-            log.info(f"[{sym}] {old_stage} → {new_stage} | {reasons}")
-            watchlist[sym]["stage"] = new_stage
-            if new_stage == "EXIT_WARNING":
-                watchlist[sym]["exit_warning_since"] = ts
+        # Переход → Telegram
+        if state != prev_state:
+            log.info(f"[{sym}] {prev_state} → {state} | {reasons}")
 
-            # Telegram только для CONFIRMED_LONG / RUNNING / EXIT_WARNING
-            if new_stage in ("CONFIRMED_LONG", "RUNNING", "EXIT_WARNING"):
-                llm_txt = llm_explain(sym, watchlist[sym], full, all_snaps)
-                msg = format_signal(sym, watchlist[sym], full, all_snaps, reasons)
-                if llm_txt:
-                    msg += f"\n\n🤖 {esc(llm_txt)}"
-                send_telegram(msg)
+            if state in TG_STATES:
+                llm_res = llm_verify(sym, wl_all[sym], cur, hist)
+                msg = format_signal(sym, wl_all[sym], cur, hist,
+                                    reasons, warnings, market)
+                if llm_res:
+                    agree = "✅" if llm_res.get("agree") is True else "❌"
+                    risk = llm_res.get("risk", "?")
+                    reason = llm_res.get("reason", "")
+                    msg += f"\n🤖 {agree} {esc(risk)} · {esc(reason)}"
+                send_tg(msg)
 
-        if new_stage == "REMOVED":
-            log.info(f"[{sym}] REMOVED")
-            del watchlist[sym]
+    # 8. Монеты, которые были в watchlist, но выпали из discovery-фильтра.
+    #    Раз их нет в current_symbols, lifecycle их не трогал (шаг 7),
+    #    поэтому missed_runs корректно накапливается.
+    for sym in list(wl_all.keys()):
+        if sym in current_symbols:
+            continue
 
-    # 7-9. Сохранение + cleanup
-    save_watchlist(watchlist)
+        missed = wl_all[sym].get("missed_runs", 0) + 1
+        wl_all[sym]["missed_runs"] = missed
+        wl_all[sym]["last_seen"] = ts
+
+        stage = wl_all[sym]["state"]
+        if stage in ACTIVE_STATES and missed == MISS_EXIT_RUNS:
+            log.info(f"[{sym}] выпала из фильтра {missed} прогона → EXIT")
+            send_tg(
+                f"🟠 <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"DISTRIBUTION → EXIT_AVOID\n"
+                f"Выпала из discovery-фильтра {missed} прогона подряд\n"
+                f"<i>Метрики ухудшились настолько, что монета не проходит "
+                f"базовые условия (OI/CVD/LLS)</i>\n"
+            )
+            wl_all[sym]["state"] = "DISTRIBUTION"
+
+        if missed >= MISS_REMOVE_RUNS:
+            log.info(f"[{sym}] нет в данных {missed} прогонов → remove")
+            del wl_all[sym]
+
+    # 9. Сохранение
+    save_watchlist(wl_all)
+
+    # 10. Кандидаты в snapshots (жёсткий фильтр, только архив)
+    for r in rows:
+        if passes_filter(r):
+            sc, pr, co = calculate_score(r)
+            append_jsonl(SNAPSHOTS_FILE, {**r, "score": sc,
+                                          "pros": pr, "cons": co})
+
+    # 11. Cleanup
+    cleanup_jsonl(MARKET_HISTORY_FILE, MARKET_TTL_DAYS)
     cleanup_jsonl(SNAPSHOTS_FILE, SNAPSHOTS_TTL_DAYS)
     cleanup_jsonl(HEARTBEAT_FILE, HEARTBEAT_TTL_DAYS)
 
-    log.info(f"═══ Готово. Watchlist: {len(watchlist)} ═══")
+    log.info(f"═══ Готово. Active: {len(wl_all)} ═══")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -781,6 +1140,6 @@ if __name__ == "__main__":
     try:
         run()
     except Exception as e:
-        log.exception(f"Фатальная ошибка: {e}")
-        send_telegram(f"⚠️ <b>Coinalyze Monitor</b>\nОшибка: {esc(str(e)[:500])}")
+        log.exception(f"Фатал: {e}")
+        send_tg(f"⚠️ <b>Monitor</b>\n{esc(str(e)[:500])}")
         sys.exit(1)
