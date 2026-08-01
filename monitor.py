@@ -413,7 +413,9 @@ def calc_derived(snaps: list[dict]) -> dict:
         if len(clean) < 2:
             return "flat"
         diff = clean[-1] - clean[0]
-        base = abs(clean[0]) if abs(clean[0]) > 1 else 1.0
+        # FIX (review #2): при |first|<=1 порог должен быть 0.5, а не 0.05.
+        # base=10.0 → 10*0.05 = 0.5, как задумано в спеке.
+        base = abs(clean[0]) if abs(clean[0]) > 1 else 10.0
         if diff > base * 0.05:
             return "up"
         if diff < -base * 0.05:
@@ -702,8 +704,11 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             for i in range(1, len(recent))
         )
         all_oi4 = all(safe(s.get("oi_chg4h_pct")) > 0 for s in recent)
-        all_fr  = all(safe(s.get("fr_oiw")) < 0.05 for s in recent)
-        all_lls = all(safe(s.get("lls24")) < 40 for s in recent)
+        # FIX (review #3): фейл-клоуз — None не должен выглядеть как «отлично».
+        all_fr  = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.05
+                      for s in recent)
+        all_lls = all(s.get("lls24") is not None and s.get("lls24") < 40
+                      for s in recent)
         all_pc  = all(
             safe(recent[i].get("price_chg24")) >=
             safe(recent[i - 1].get("price_chg24")) - 0.5
@@ -777,7 +782,9 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
         last3 = snaps[-3:]
         oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
         cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / 3
-        fr_ok   = all(safe(s.get("fr_oiw")) < 0.03 for s in last3)
+        # FIX (review #3): фейл-клоуз по funding.
+        fr_ok   = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.03
+                      for s in last3)
 
         if oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok:
             reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
@@ -1032,16 +1039,34 @@ def run():
             sym, hist, score, derived, prev_state
         )
 
-        # NEUTRAL → не наблюдаем
+        # NEUTRAL → не наблюдаем.
+        # FIX (review #1): если монета была в активной (TG) стадии — сообщаем
+        # о снятии, иначе выход теряется. ACCUMULATION/EARLY — молча.
         if state == "NEUTRAL":
             if sym in wl_all:
-                log.info(f"[{sym}] → NEUTRAL, remove")
+                old = wl_all[sym]["state"]
+                if old in ACTIVE_STATES:
+                    send_tg(
+                        f"⚪ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"{esc(old)} → NEUTRAL\n"
+                        f"<i>Снята с отслеживания: условия тренда не выполняются</i>\n"
+                    )
+                log.info(f"[{sym}] {old} → NEUTRAL, remove")
                 del wl_all[sym]
             continue
 
-        # INVALIDATED → удаляем
+        # INVALIDATED → удаляем.
+        # FIX (review #1): терминальное состояние — сообщаем всегда.
         if state == "INVALIDATED":
             if sym in wl_all:
+                old = wl_all[sym]["state"]
+                send_tg(
+                    f"❌ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{esc(old)} → INVALIDATED\n"
+                    f"<i>Сценарий сломан: {esc(' · '.join(reasons[:2]))}</i>\n"
+                )
                 log.info(f"[{sym}] INVALIDATED → remove")
                 del wl_all[sym]
             continue
