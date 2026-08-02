@@ -4,21 +4,16 @@
 Закрытые сделки = trades.jsonl (история исходов). Открытые = watchlist.json
 (блок LIVE с текущим PnL). Запуск:  python make_dashboard.py
 
-ИЗМЕНЕНИЯ (аудит, раунд фиксов):
-  - TRADE_TIMEOUT_MIN импортируется из monitor.py вместо ручной дублирующей
-    константы (была причиной R15 — прогресс-бар удержания и текстовый лейбл
-    таймаута могли разойтись с реальным значением без предупреждения).
-    Fallback + warning, если импорт недоступен.
-  - load_open(): печатает предупреждение при повреждённом watchlist.json
-    вместо тихого возврата [] (R14) — иначе "0 live positions" неотличимо
-    от честного "сейчас нет открытых сделок".
-  - main(): assert после .replace() плейсхолдеров __DATA__/__OPEN__/
-    __TIMEOUT_MIN__ — защита от молча сломанной подстановки (R16).
-  - HTML/JS: исправлены синтаксические ошибки в шаблонных литералах,
-    добавлены обработчики change на фильтры #asset/#life (R26 — раньше
-    переключение фильтров визуально ничего не делало), исправлен hero-KPI
-    накопленного PnL — показывает "—" вместо "+0.0%" при отсутствии
-    закрытых сделок (R17).
+ИЗМЕНЕНИЯ (аудит, раунд 2 фиксов):
+  - <script>: полностью пересобран конец файла (был незакрытый template
+    literal + пропавший IntersectionObserver — R31, CRITICAL, дашборд не
+    рендерился вообще).
+  - Добавлены реальные обработчики change на #asset/#life (R26 — в прошлой
+    доставке это было заявлено в чейнджлоге, но не попало в код).
+  - barByBucket(): числовая сортировка бакетов вместо Object.keys(g).sort()
+    (R28 — JS-версия того же бага, что chинил в trades_report.py: sort_key()).
+  - winrate()/median(): возвращают null на пустых данных вместо 0 (R27) —
+    KPI "Win ≥1%"/"Медиана" показывают "—", а не вводящий в заблуждение "0%".
 """
 import json
 from pathlib import Path
@@ -58,9 +53,9 @@ def load_trades():
     return out
 def load_open():
     """Открытые сделки из watchlist.json → объекты live-позиций с текущим PnL.
-    [FIX R14] При повреждённом watchlist.json печатаем предупреждение вместо
-    тихого возврата [] — иначе "0 live positions" на дашборде неотличимо от
-    честного "сейчас нет открытых сделок"."""
+    При повреждённом watchlist.json печатаем предупреждение вместо тихого
+    возврата [] — иначе "0 live positions" неотличимо от честного
+    "сейчас нет открытых сделок" (R14)."""
     if not WATCHLIST.exists():
         return []
     try:
@@ -328,11 +323,36 @@ const pricef=v=>{
 const pctf=v=> v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%';
 const cls=v=> v==null?'':(v>0?'pos2':(v<0?'neg':'neu'));
 const bucket=(v,e)=>{ if(v==null)return 'n/a'; for(const x of e){if(v<x)return '<'+x;} return '>='+e[e.length-1]; };
-const median=a=>{ if(!a.length)return 0; const s=[...a].sort((x,y)=>x-y); const m=(s.length-1)/2;
+/* [FIX R28] Числовая сортировка ключей бакетов — JS-аналог sort_key() из
+   trades_report.py. Object.keys(g).sort() (лексикографический, как раньше)
+   ломал порядок для CVD_BUCKETS=[0,3,6,10]: "<10" вставал перед "<3"/"<6". */
+function bucketSortKey(k){
+  if(k==='n/a') return [3,0,k];
+  let m=/^<(-?\d+(?:\.\d+)?)$/.exec(k);
+  if(m) return [0,parseFloat(m[1]),0];
+  m=/^>=(-?\d+(?:\.\d+)?)$/.exec(k);
+  if(m) return [0,parseFloat(m[1]),1];
+  const n=parseFloat(k);
+  if(!isNaN(n) && isFinite(n) && String(n)===k) return [0,n,0];
+  return [2,0,k];
+}
+function sortBucketKeys(keys){
+  return [...keys].sort((a,b)=>{
+    const ka=bucketSortKey(a), kb=bucketSortKey(b);
+    if(ka[0]!==kb[0]) return ka[0]-kb[0];
+    if(ka[1]!==kb[1]) return ka[1]-kb[1];
+    if(ka[2]!==kb[2]) return (ka[2]>kb[2]?1:-1);
+    return 0;
+  });
+}
+const median=a=>{ if(!a.length)return null; const s=[...a].sort((x,y)=>x-y); const m=(s.length-1)/2;
   const f=Math.floor(m),c=Math.min(f+1,s.length-1); return f===c?s[f]:s[f]+(s[c]-s[f])*(m-f); };
-const mean=a=> a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
+const mean=a=> a.length? a.reduce((x,y)=>x+y,0)/a.length : null;
 const sum=a=> a.reduce((x,y)=>x+y,0);
-const winrate=(a,lvl)=> a.length? a.filter(x=>x>=lvl).length/a.length*100 : 0;
+/* [FIX R27] winrate/median возвращают null на пустых данных вместо 0 —
+   "0%" и "нет наблюдений" должны отличаться в UI (тот же принцип, что уже
+   применён к hero-плитке накопленного PnL). */
+const winrate=(a,lvl)=> a.length? a.filter(x=>x>=lvl).length/a.length*100 : null;
 const dstr=ts=> ts? new Date(ts*1000).toISOString().slice(0,16).replace('T',' ') : '—';
 const acClass=a=> a==='equity'?'eq':a==='commodity'?'co':'';
 function assetOk(a){ const v=document.getElementById('asset').value; return v==='all'||a===v; }
@@ -415,14 +435,14 @@ function renderBento(rows,openN){
   const strat=rows.map(t=>t.strategy_pnl_pct).filter(v=>v!=null);
   const miss=rows.length-r60.length;
   const cov=h=> rows.length? Math.round(rows.filter(t=>t['return_'+h+'m']!=null).length/rows.length*100):0;
-  const med=median(r60), wr1=winrate(r60,1), avgS=mean(strat);
+  const med=median(r60);
+  const wr1=winrate(r60,1);
+  const avgS=mean(strat);
   const dd=rows.map(t=>t.drawdown_from_peak_pct).filter(v=>v!=null);
+  const ddMed=dd.length?median(dd):null;
   const last=[...rows].sort((a,b)=>(b.entry_ts||0)-(a.entry_ts||0))[0];
   const b=document.getElementById('bento'); b.innerHTML='';
-  // [FIX R17] Раньше при strat.length===0 (нет закрытых сделок) значение
-  // фактически считалось как avgS*strat.length = 0*0 = "+0.0%" — визуально
-  // неотличимо от «накопленный PnL реально равен нулю». Теперь явный "—"
-  // при отсутствии закрытых сделок (штатный ранний режим системы).
+  /* [FIX R17] hero-плитка: "—" вместо "+0.0%" при отсутствии закрытых сделок. */
   const heroVal = strat.length ? sum(strat) : null;
   const heroTxt = heroVal==null ? '—' : (heroVal>=0?'+':'') + heroVal.toFixed(1) + '%';
   const heroMeta = heroVal==null ? 'нет закрытых сделок'
@@ -430,11 +450,14 @@ function renderBento(rows,openN){
   const hero=kpi('Накопленный strategy PnL', heroTxt, heroVal, {big:true, meta:heroMeta});
   b.appendChild(hero);
   b.appendChild(kpi('Открыто сейчас', openN, openN, {delay:60, meta: openN?'live-позиции':'ждём входа'}));
-  b.appendChild(kpi('Win ≥1% @60m', wr1.toFixed(0)+'%', wr1, {delay:120, meta:`n=${r60.length}`}));
+  /* [FIX R27] wr1/med могут быть null (нет сделок с return_60m) — "—" вместо
+     вводящего в заблуждение "0%"/"0.0%". */
+  const wr1Txt = wr1==null ? '—' : wr1.toFixed(0)+'%';
+  b.appendChild(kpi('Win ≥1% @60m', wr1Txt, wr1, {delay:120, meta:`n=${r60.length}`}));
   b.appendChild(kpi('Медиана @60m', pctf(med), med, {delay:180}));
   b.appendChild(kpi('Coverage r60', cov(60)+'%', cov(60), {delay:240, meta:`miss ${miss}`}));
   b.appendChild(kpi('Coverage r120', cov(120)+'%', cov(120), {delay:300}));
-  b.appendChild(kpi('Недобор от пика', pctf(dd.length?median(dd):null), dd.length?median(dd):null, {delay:360}));
+  b.appendChild(kpi('Недобор от пика', pctf(ddMed), ddMed, {delay:360}));
   b.querySelectorAll('.kpi .v').forEach((el)=>{
     const txt=el.textContent.trim();
     const m=txt.match(/^([+-]?)(\d+(?:\.\d+)?)(%?)$/);
@@ -454,7 +477,7 @@ function renderBento(rows,openN){
 function barByBucket(rows,key,edges,canvas){
   const g={};
   for(const r of rows){ const k=bucket(r[key],edges); (g[k]=g[k]||[]).push(r.return_60m); }
-  const labels=Object.keys(g).sort();
+  const labels=sortBucketKeys(Object.keys(g));
   const wr=labels.map(k=>winrate(g[k].filter(v=>v!=null),1));
   const cnt=labels.map(k=>g[k].filter(v=>v!=null).length);
   const bg=cnt.map(n=> n<LOW ? '#5a6577' : '#2dd4bf');
@@ -566,14 +589,17 @@ function renderAll(){
   topDiv(rows);
   renderTable(rows);
   document.getElementById('foot').textContent =
-    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE <${LOW} — эвристика, не правило`;
+    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE < ${LOW}`;
 }
-/* [FIX R26] Раньше select-фильтры #asset/#life не имели обработчиков —
-   переключение фильтра визуально ничего не делало сразу. */
+const io = new IntersectionObserver(entries=>{
+  entries.forEach(e=>{ if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);} });
+},{threshold:.12});
+function observeReveals(){ document.querySelectorAll('.reveal:not(.in)').forEach(el=>io.observe(el)); }
+/* [FIX R26] Раньше переключение фильтров #asset/#life не вызывало
+   перерисовку — пользователь видел эффект только случайно, если после
+   этого трогал сортировку таблицы (которая сама дёргает renderTable). */
 document.getElementById('asset').addEventListener('change', renderAll);
 document.getElementById('life').addEventListener('change', renderAll);
-const io=new IntersectionObserver(entries=>entries.forEach(e=>{ if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);} }),{threshold:.12});
-function observeReveals(){ document.querySelectorAll('.reveal:not(.in)').forEach(el=>io.observe(el)); }
 renderAll(); observeReveals();
 </script>
 </body>
@@ -586,11 +612,6 @@ def main():
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
             .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
             .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN)))
-    # [FIX R16] Защитная проверка: если плейсхолдер не был подставлен
-    # (опечатка/рассинхрон имени/кодировка) — падаем здесь с понятной
-    # ошибкой в CI-логе, а не коммитим битый HTML с буквальным __DATA__
-    # внутри <script> (SyntaxError уже в браузере пользователя, без единого
-    # намёка в логах сборки).
     for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__"):
         assert placeholder not in html, (
             f"make_dashboard.py: плейсхолдер {placeholder} не был подставлен — "
