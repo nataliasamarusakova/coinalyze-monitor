@@ -1,23 +1,32 @@
 """trades_report.py — исследовательская статистика по trades.jsonl (schema v2).
-
 Принципы:
   - НЕ зашиваем один критерий win: перцентили + win-rate по нескольким уровням.
   - Срезы по return_60m (signal outcome), НЕ по strategy_pnl (strategy outcome).
   - Не-крипто исключаются из win-rate, но видны в счётчиках.
-  - Цензура видна: coverage по горизонтам + причина финализации pending.
+  - Цензура видна: coverage по горизонтам + причина финализации pending +
+    доля сделок, закрытых по устаревшей цене (stale exits).
   - LOW_SAMPLE_WARNING — эвристика (не правило): помечает группы, по которым
     рано делать выводы; при малой общей выборке это нормально, не паника.
   - Периоды — ISO-недели (стабильны во времени).
+
+ИЗМЕНЕНИЯ (аудит, раунд фиксов):
+  - sort_key(): числовая сортировка вместо лексикографической — раньше бакеты
+    вида <10/<3/<6/>=10 сортировались как строки ("<10" перед "<3"), что
+    искажало читаемость ВСЕХ таблиц срезов, не только signal_logic_version.
+  - main(): счётчик excluded разбит на equity/commodity/unknown вместо одного
+    агрегата — будущая порча asset_class не будет прятаться внутри суммы.
+  - load(): считает и печатает skipped_bad_lines вместо тихого pass.
+  - coverage(): добавлена секция STALE EXITS (exit_price_source/stale_min) —
+    видимость сделок, закрытых по устаревшей цене (обычно MISSED).
 """
 import json
+import re
 import time
 import statistics as st
 from pathlib import Path
 from collections import defaultdict
-
 BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
-
 WIN_LEVELS       = [0.0, 0.5, 1.0, 2.0]
 MOMENTUM_BUCKETS = [3, 5, 7]
 CVD_BUCKETS      = [0, 3, 6, 10]
@@ -25,22 +34,21 @@ PRICE_BUCKETS    = [3, 8, 15]
 HORIZONS         = [60, 120, 240]
 LOW_SAMPLE_WARNING = 20   # эвристика: ниже — помечать, выводов не делать
 TOP_N            = 10
-
-
 def load():
+    """Возвращает (rows, skipped_bad_lines) — количество битых строк теперь
+    считается и печатается в отчёте, а не пропадает молча (см. main())."""
     if not TRADES.exists():
-        return []
+        return [], 0
     out = []
+    skipped = 0
     for ln in TRADES.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if ln:
             try:
                 out.append(json.loads(ln))
             except json.JSONDecodeError:
-                pass
-    return out
-
-
+                skipped += 1
+    return out, skipped
 def pct(data, p):
     if not data:
         return None
@@ -49,22 +57,14 @@ def pct(data, p):
     f = int(k)
     c = min(f + 1, len(s) - 1)
     return s[f] if f == c else s[f] + (s[c] - s[f]) * (k - f)
-
-
 def winrates(data, levels=WIN_LEVELS):
     if not data:
         return {lvl: 0.0 for lvl in levels}
     return {lvl: sum(1 for x in data if x >= lvl) / len(data) * 100 for lvl in levels}
-
-
 def wr_str(wr):
     return " ".join(f"≥{lvl:g}%:{wr[lvl]:4.0f}" for lvl in WIN_LEVELS)
-
-
 def iso_week(ts):
     return time.strftime("%G-W%V", time.gmtime(ts))
-
-
 def bucket(v, edges):
     if v is None:
         return "n/a"
@@ -72,12 +72,33 @@ def bucket(v, edges):
         if v < e:
             return f"<{e}"
     return f">={edges[-1]}"
-
-
+_BUCKET_LT_RE = re.compile(r'^<(-?\d+(?:\.\d+)?)$')
+_BUCKET_GE_RE = re.compile(r'^>=(-?\d+(?:\.\d+)?)$')
+def sort_key(k):
+    """[FIX R11] Числовая сортировка группировочных ключей вместо
+    лексикографической str(x). Раньше sorted(g, key=lambda x: str(x)) ломала:
+      - числовые значения ("10" вставал перед "2");
+      - бакеты вида <0/<3/<6/<10/>=10 — реальный пример из CVD_BUCKETS:
+        лексикографически "<10" встаёт перед "<3" и "<6".
+    Порядок групп: (0) числа и бакеты <X/>=X по значению X, где <X идёт
+    перед >=X при равном X; (2) прочие строковые метки — алфавитно;
+    (3) "n/a" — всегда последним."""
+    s = str(k)
+    if s == "n/a":
+        return (3, 0.0, s)
+    m = _BUCKET_LT_RE.match(s)
+    if m:
+        return (0, float(m.group(1)), 0)
+    m = _BUCKET_GE_RE.match(s)
+    if m:
+        return (0, float(m.group(1)), 1)
+    try:
+        return (0, float(s), 0)
+    except ValueError:
+        pass
+    return (2, 0.0, s)
 def fnum(v, d=1):
     return "—" if v is None else f"{v:+.{d}f}%"
-
-
 def coverage(rows, label):
     total = len(rows)
     print(f"\nCOVERAGE — {label} (полнота данных по горизонтам)")
@@ -93,8 +114,28 @@ def coverage(rows, label):
         for k in ("COMPLETE", "WAIT_TIMEOUT", "MISSING_PRICE", "UNKNOWN"):
             if fr[k]:
                 print(f"    {k:14} {fr[k]:>4}  ({fr[k]/total*100:4.1f}%)")
-
-
+    # [NEW, следствие R7] STALE EXITS — доля сделок, закрытых по цене,
+    # которая на момент exit_ts была устаревшей (обычно MISSED: монета
+    # выпала из discovery-фильтра, exit_price = последняя виденная цена).
+    # Поле опционально: старые записи trades.jsonl (до фикса R7) его не
+    # содержат — такие сделки просто не попадают в этот срез.
+    stale = [r for r in rows if r.get("exit_price_source") == "last_seen"]
+    have_field = sum(1 for r in rows if "exit_price_source" in r)
+    if have_field:
+        print(f"\n  STALE EXITS (цена выхода устарела на момент закрытия):")
+        print(f"    с полем exit_price_source: {have_field}/{total} записей "
+              f"(старые записи до фикса — без поля)")
+        if stale:
+            stale_min = [r.get("exit_price_stale_min") for r in stale
+                        if r.get("exit_price_stale_min") is not None]
+            print(f"    exit_price_source=last_seen: {len(stale)} "
+                  f"({len(stale)/have_field*100:4.1f}% от записей с полем)")
+            if stale_min:
+                print(f"    stale_min: median={st.median(stale_min):.1f}  "
+                      f"max={max(stale_min):.1f}  "
+                      f"(эти PnL точнее не измерить — цена не наблюдалась)")
+        else:
+            print(f"    exit_price_source=last_seen: 0 — все выходы по свежей цене")
 def slice_table(rows, key, label, edges=None):
     g = defaultdict(lambda: {"rets": [], "missing": 0})
     for r in rows:
@@ -108,7 +149,7 @@ def slice_table(rows, key, label, edges=None):
     print(f"\n=== {label}  (signal outcome @60m, crypto) ===")
     print(f"  {'группа':20} {'n':>4} {'miss':>4} {'median':>8} {'win≥0':>6} {'win≥1':>6}")
     low = []
-    for k in sorted(g, key=lambda x: str(x)):
+    for k in sorted(g, key=sort_key):
         d = g[k]
         n = len(d["rets"])
         med = st.median(d["rets"]) if d["rets"] else 0
@@ -122,8 +163,6 @@ def slice_table(rows, key, label, edges=None):
     if low:
         print(f"  ⚠ low sample (<{LOW_SAMPLE_WARNING}, эвристика): "
               f"{', '.join(low)} — выводов пока не делать")
-
-
 def top_signals(rows, label, key, reverse=True):
     have = [r for r in rows if r.get(key) is not None]
     have.sort(key=lambda r: r[key], reverse=reverse)
@@ -135,8 +174,6 @@ def top_signals(rows, label, key, reverse=True):
               f"path={r.get('entry_path')}  {r.get('entry_pattern')}  "
               f"{r.get('entry_earliness_label')}  exit={r.get('exit_reason')}/"
               f"{r.get('exit_state')}  <60m={r.get('closed_before_60m')}")
-
-
 def top_divergence(rows):
     """Отличный вход (signal), плохой выход (strategy) — диагностика качества выхода."""
     have = [r for r in rows
@@ -150,53 +187,54 @@ def top_divergence(rows):
         print(f"  {r['symbol']:12} r60={r['return_60m']:+6.1f}%  "
               f"strat={r['strategy_pnl_pct']:+6.1f}%  Δ={diff:+6.1f}%  "
               f"hold={r.get('hold_min')}м  exit={r.get('exit_reason')}  peak={peak_s}")
-
-
 def main():
-    rows = load()
+    rows, skipped_bad_lines = load()
     if not rows:
         print("trades.jsonl пуст — копим сделки.")
+        if skipped_bad_lines:
+            print(f"⚠ обнаружено {skipped_bad_lines} битых строк при чтении.")
         return
-
     crypto = [r for r in rows if r.get("asset_class") == "crypto"]
+    non_crypto = [r for r in rows if r.get("asset_class") != "crypto"]
+    # [FIX R12] Разбивка исключённых по типу вместо одного агрегата —
+    # будущая порча/пропажа asset_class не спрячется внутри суммы.
+    equity_n    = sum(1 for r in non_crypto if r.get("asset_class") == "equity")
+    commodity_n = sum(1 for r in non_crypto if r.get("asset_class") == "commodity")
+    unknown_n   = len(non_crypto) - equity_n - commodity_n
     with60 = [r for r in crypto if r.get("return_60m") is not None]
     miss60 = len(crypto) - len(with60)
     closed = [r for r in crypto if r.get("strategy_pnl_pct") is not None]
-
     lv = defaultdict(int)
     for r in crypto:
         lv[r.get("signal_logic_version") or "?"] += 1
-
     print("ВЫБОРКА")
     print(f"  сделок всего:        {len(rows)}")
-    print(f"  из них crypto:       {len(crypto)}  "
-          f"(equity/commodity: {len(rows) - len(crypto)} — исключены из win-rate)")
+    if skipped_bad_lines:
+        print(f"  ⚠ битых строк пропущено при чтении: {skipped_bad_lines}")
+    print(f"  из них crypto:       {len(crypto)}")
+    print(f"  исключены из win-rate: equity={equity_n}  commodity={commodity_n}"
+          + (f"  unknown/missing={unknown_n}" if unknown_n else ""))
     print(f"  с return_60m:        {len(with60)}")
     print(f"  без return_60m:      {miss60}  ← горизонт не наступил / нет цены / история очищена")
     print(f"  закрытых (strategy): {len(closed)}")
     print(f"  закрытых раньше 60м: "
           f"{sum(1 for r in crypto if r.get('closed_before_60m'))}")
     print(f"  signal_logic_version:  "
-          + ", ".join(f"v{k}={lv[k]}" for k in sorted(lv)))
-
+          + ", ".join(f"v{k}={lv[k]}" for k in sorted(lv, key=sort_key)))
     coverage(crypto, "crypto")
-
     rets60 = [r["return_60m"] for r in with60]
     if not rets60:
         print("\nНет сделок с return_60m — нечего анализировать.")
         return
-
     print("\nSIGNAL OUTCOME @60m (crypto)")
     print(f"  n={len(rets60)}  mean={st.mean(rets60):+.2f}%  median={st.median(rets60):+.2f}%")
     print(f"  p25={pct(rets60,25):+.2f}%  p75={pct(rets60,75):+.2f}%  "
           f"p90={pct(rets60,90):+.2f}%  min={min(rets60):+.1f}%  max={max(rets60):+.1f}%")
     print(f"  win-rate:  {wr_str(winrates(rets60))}")
-
     rets120 = [r["return_120m"] for r in crypto if r.get("return_120m") is not None]
     if rets120:
         print(f"\nSIGNAL OUTCOME @120m  n={len(rets120)}  "
               f"median={st.median(rets120):+.2f}%  win-rate: {wr_str(winrates(rets120))}")
-
     peaks = [r["max_pnl_pct"] - r["strategy_pnl_pct"]
              for r in closed
              if r.get("max_pnl_pct") is not None and r.get("strategy_pnl_pct") is not None]
@@ -204,7 +242,6 @@ def main():
         print(f"\nSTRATEGY OUTCOME — недобор от пика (max_pnl − strategy_pnl):")
         print(f"  median={st.median(peaks):.2f}%  mean={st.mean(peaks):.2f}%  "
               f"(много → выход запаздывает, кандидат на TP/earlier-exit)")
-
     wg = defaultdict(list)
     for r in with60:
         wg[iso_week(r["entry_ts"])].append(r["return_60m"])
@@ -216,7 +253,6 @@ def main():
         low = "  *low*" if 0 < len(d) < LOW_SAMPLE_WARNING else ""
         print(f"  {wk:10} {len(d):>4} {st.median(d):+7.2f}% "
               f"{wr[0.0]:5.0f}% {wr[1.0]:5.0f}%{low}")
-
     slice_table(crypto, "entry_momentum",        "MOMENTUM на входе",      MOMENTUM_BUCKETS)
     slice_table(crypto, "entry_cvd_momentum",    "CVD_MOMENTUM на входе",  CVD_BUCKETS)
     slice_table(crypto, "entry_price_chg24",     "PRICE_CHG24 на входе",   PRICE_BUCKETS)
@@ -227,13 +263,10 @@ def main():
     slice_table(crypto, "entry_market_phase",    "ФАЗА рынка на входе")
     slice_table(crypto, "closed_before_60m",     "ЖИЗНЬ СДЕЛКИ (<60м / ≥60м)")
     slice_table(crypto, "signal_logic_version",  "ВЕРСИЯ логики сигнала (v1 vs v2)")
-
     top_signals(crypto, "TOP 10 BEST SIGNAL",    "return_60m",       reverse=True)
     top_signals(crypto, "TOP 10 WORST SIGNAL",   "return_60m",       reverse=False)
     top_signals(crypto, "TOP 10 BEST STRATEGY",  "strategy_pnl_pct", reverse=True)
     top_signals(crypto, "TOP 10 WORST STRATEGY", "strategy_pnl_pct", reverse=False)
     top_divergence(crypto)
-
-
 if __name__ == "__main__":
     main()
