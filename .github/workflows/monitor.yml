@@ -1,16 +1,12 @@
 name: Coinalyze Monitor
-
 on:
   repository_dispatch:
     types: [run_monitor]
-
 permissions:
   contents: write
-
 concurrency:
   group: coinalyze-monitor
   cancel-in-progress: false
-
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -20,37 +16,30 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-
       - name: Cache Playwright browser binaries
         id: cache-playwright-browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-browsers-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
       - name: Install Playwright Chromium (если кеша нет)
         if: steps.cache-playwright-browsers.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
-
       - name: Install only system deps (браузер уже в кеше)
         if: steps.cache-playwright-browsers.outputs.cache-hit == 'true'
         run: playwright install-deps chromium
-
       - name: Run monitor
         env:
           COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
@@ -58,10 +47,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python monitor.py
-
       - name: Build dashboard
         run: python make_dashboard.py
-
       - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -72,16 +59,56 @@ jobs:
             debug_screenshot.png
           retention-days: 3
           if-no-files-found: ignore
-
+      # [FIX R23] Раньше git commit/pull/push никак не проверялись на успех:
+      # `git diff --cached --quiet || git commit ...` глотал ошибку commit,
+      # а `git pull --rebase origin main` и `git push` не проверялись вовсе.
+      # При неудачном push на эфемерном раннере весь прогресс прогона
+      # (финализированные сделки, обновлённый watchlist/pending) исчезал
+      # без единого следа — ни в Telegram, ни явно в статусе job (шаг
+      # формально завершался кодом 0 из-за отсутствия `set -e` на составной
+      # команде). Теперь: явный retry на pull+push, TG-алерт при неудаче
+      # через curl (Python-процесс monitor.py к этому шагу уже завершился,
+      # его send_tg() здесь недоступен), и exit 1 — job гарантированно
+      # красный при потере данных.
       - name: Commit snapshot log and state
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          set -e
           git config user.name "actions-user"
           git config user.email "actions@github.com"
+          alert() {
+            local msg="$1"
+            echo "::error::$msg"
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TG_CHAT_ID}" \
+                -d text="⚠️ Monitor CI: $msg" >/dev/null || true
+            fi
+          }
           for f in market_history.jsonl snapshots.jsonl heartbeat.jsonl \
                    watchlist.json calibration.jsonl trades.jsonl \
                    pending_trades.json docs/index.html; do
             git add "$f" 2>/dev/null || true
           done
-          git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git pull --rebase origin main
-          git push
+          if git diff --cached --quiet; then
+            echo "Нет изменений для коммита"
+          else
+            if ! git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+              alert "git commit failed — изменения текущего прогона не сохранены в git"
+              exit 1
+            fi
+          fi
+          n=0
+          until git pull --rebase origin main && git push; do
+            n=$((n+1))
+            if [ "$n" -ge 3 ]; then
+              alert "git push failed после ${n} попыток — коммит с закрытыми сделками/watchlist остался только на раннере и будет потерян при завершении job"
+              exit 1
+            fi
+            echo "pull --rebase / push попытка ${n} не удалась, retry через 5s..."
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          echo "Commit/push OK"
