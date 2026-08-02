@@ -316,6 +316,13 @@ const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED
 let charts={};
 
 const fmt=(v,d=1)=> v==null?'—':(+v).toFixed(d);
+const trimZ=s=> s.replace(/\.?0+$/,'');
+const pricef=v=>{
+  if(v==null) return '—';
+  const n=+v;
+  if(!isFinite(n)) return '—';
+  return Math.abs(n)>=0.01 ? trimZ(n.toFixed(4)) : trimZ(n.toPrecision(4));
+};
 const pctf=v=> v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%';
 const cls=v=> v==null?'':(v>0?'pos2':(v<0?'neg':'neu'));
 const bucket=(v,e)=>{ if(v==null)return 'n/a'; for(const x of e){if(v<x)return '<'+x;} return '>='+e[e.length-1]; };
@@ -360,7 +367,7 @@ function renderLive(){
       <div class="row1">
         <div>
           <div class="sym">${o.symbol}</div>
-          <div class="nm">${o.name||''} · вход ${fmt(o.entry_price,4)} → ${fmt(o.last_price,4)}</div>
+          <div class="nm">${o.name||''} · вход ${pricef(o.entry_price)} → ${pricef(o.last_price)}</div>
         </div>
         <div class="pnl ${cls(pnl)}" data-num="${pnl==null?'':pnl}">${pctf(pnl)}</div>
       </div>
@@ -384,7 +391,6 @@ function renderLive(){
     </div>`;
   }).join('');
 
-  // анимация прогресс-баров и count-up PnL
   requestAnimationFrame(()=>{
     grid.querySelectorAll('.fill').forEach(f=>{ f.style.width=f.dataset.w+'%'; });
     grid.querySelectorAll('.pnl[data-num]').forEach(el=>{
@@ -503,8 +509,8 @@ const COLS=[
   ['entry_momentum','Mom',t=>fmt(t.entry_momentum,0)],
   ['entry_cvd_momentum','CVDm',t=>fmt(t.entry_cvd_momentum,0)],
   ['entry_earliness_label','Ранность',t=>t.entry_earliness_label||'—',1],
-  ['entry_price','Вход',t=>fmt(t.entry_price,4)],
-  ['exit_price','Выход',t=>fmt(t.exit_price,4)],
+  ['entry_price','Вход',t=>pricef(t.entry_price)],
+  ['exit_price','Выход',t=>pricef(t.exit_price)],
   ['strategy_pnl_pct','Strat%',t=>`<span class="${cls(t.strategy_pnl_pct)}">${pctf(t.strategy_pnl_pct)}</span>`],
   ['return_60m','r60%',t=>`<span class="${cls(t.return_60m)}">${pctf(t.return_60m)}</span>`],
   ['max_pnl_pct','Пик%',t=>pctf(t.max_pnl_pct)],
