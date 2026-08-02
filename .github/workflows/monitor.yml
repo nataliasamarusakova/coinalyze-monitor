@@ -48,7 +48,25 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python monitor.py
       - name: Build dashboard
+        id: build_dashboard
         run: python make_dashboard.py
+      # [FIX R29, новый шаг] Раньше сбой make_dashboard.py (например, assert
+      # на плейсхолдерах из R16, или ImportError на TRADE_TIMEOUT_MIN из R15)
+      # был виден только как "красный" шаг в логах Actions — без явного
+      # алерта. Плюс, без if: always() на коммит-шаге ниже, такой сбой
+      # молча блокировал бы сохранение уже корректно обновлённых
+      # trades.jsonl/watchlist.json/pending_trades.json.
+      - name: Notify on dashboard build failure
+        if: failure() && steps.build_dashboard.outcome == 'failure'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="⚠️ Monitor CI: сборка дашборда (make_dashboard.py) упала. Торговые данные из monitor.py не пострадали и будут закоммичены отдельно." >/dev/null || true
+          fi
       - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -59,18 +77,15 @@ jobs:
             debug_screenshot.png
           retention-days: 3
           if-no-files-found: ignore
-      # [FIX R23] Раньше git commit/pull/push никак не проверялись на успех:
-      # `git diff --cached --quiet || git commit ...` глотал ошибку commit,
-      # а `git pull --rebase origin main` и `git push` не проверялись вовсе.
-      # При неудачном push на эфемерном раннере весь прогресс прогона
-      # (финализированные сделки, обновлённый watchlist/pending) исчезал
-      # без единого следа — ни в Telegram, ни явно в статусе job (шаг
-      # формально завершался кодом 0 из-за отсутствия `set -e` на составной
-      # команде). Теперь: явный retry на pull+push, TG-алерт при неудаче
-      # через curl (Python-процесс monitor.py к этому шагу уже завершился,
-      # его send_tg() здесь недоступен), и exit 1 — job гарантированно
-      # красный при потере данных.
+      # [FIX R23, ранее] git commit/pull/push с явной проверкой ошибок,
+      # retry и TG-алертом при неудаче.
+      # [FIX R29, здесь] if: always() — этот шаг ДОЛЖЕН выполниться, даже
+      # если "Build dashboard" упал. Иначе сбой генерации HTML (косметика)
+      # блокировал бы сохранение реальных торговых данных, собранных
+      # monitor.py в этом же прогоне. Единственное, чего always() не
+      # переживёт — явная отмена job (cancelled), что и требуется.
       - name: Commit snapshot log and state
+        if: always()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
