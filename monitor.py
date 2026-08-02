@@ -19,6 +19,7 @@ import sys
 import time
 import json
 import shutil
+import hashlib
 import html as html_mod
 import logging
 from pathlib import Path
@@ -27,6 +28,7 @@ from bisect import bisect_left
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
+
 try:
     from playwright_stealth import stealth_sync
 except ImportError:
@@ -304,23 +306,49 @@ def cleanup_jsonl(path: Path, ttl_days: int):
             for r in fresh:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         log.info(f"Cleanup {path.name}: -{removed}")
-def _quarantine_corrupt_file(path: Path) -> Optional[Path]:
+ 
+def _quarantine_corrupt_file(path: Path, empty_content: str = "") -> Optional[Path]:
     """[FIX R2/R4] Бэкапит битый файл рядом с оригиналом с меткой времени,
-    чтобы данные можно было руками восстановить/разобрать, а не потерять молча."""
+    чтобы данные можно было руками восстановить/разобрать, а не потерять молча.
+    [FIX F3] Раньше файл только копировался (shutil.copy2), оригинал оставался
+    на месте — следующий прогон падал на том же битом файле снова, создавая
+    НОВЫЙ .corrupt.<ts> бэкап и слал TG-алерт КАЖДЫЙ прогон (каждые 5 минут),
+    пока кто-то не починит файл вручную. Теперь:
+      1) если бэкап с идентичным содержимым уже существует — не дублируем
+         его и не шлём повторный алерт (проверяем по sha256);
+      2) битый файл переименовывается (не копируется) в .corrupt.<ts>, а на
+         его прежнем месте создаётся пустой валидный файл (empty_content) —
+         следующий прогон стартует с чистого состояния, а не падает снова.
+    Возвращает (backup_path, is_new) — is_new=False, если это уже известный
+    инцидент (бэкап с таким содержимым был создан ранее)."""
     if not path.exists():
-        return None
-    dest = path.with_name(f"{path.name}.corrupt.{now_ts()}")
+        return None, False
     try:
-        shutil.copy2(path, dest)
-        return dest
+        raw = path.read_bytes()
     except Exception as e:
-        log.error(f"Не удалось сделать backup {path.name}: {e}")
-        return None
-def load_watchlist() -> dict:
-    """[FIX R2] При повреждении файла — backup + TG-алерт + остановка прогона.
-    Раньше здесь тихо возвращался {}, что могло привести к тому, что успешный
-    прогон перезапишет watchlist.json пустым/частичным состоянием и потеряет
-    все открытые сделки безвозвратно. Файл, который существует, но не парсится,
+        log.error(f"Не удалось прочитать {path.name} для backup: {e}")
+        return None, False
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    # Ищем уже существующий бэкап этого же битого содержимого — не плодим
+    # дубликаты и не шлём повторный алерт за тот же самый инцидент.
+    for existing in path.parent.glob(f"{path.name}.corrupt.*"):
+        try:
+            if hashlib.sha256(existing.read_bytes()).hexdigest()[:16] == digest:
+                return existing, False
+        except Exception:
+            continue
+    dest = path.with_name(f"{path.name}.corrupt.{now_ts()}.{digest}")
+    try:
+        path.rename(dest)
+        path.write_text(empty_content, encoding="utf-8")
+        return dest, True
+    except Exception as e: 
+        log.error(f"Не удалось сделать backup/reset {path.name}: {e}")
+        return None, False
+      
+ def load_watchlist() -> dict:
+    """При повреждении файла — backup + TG-алерт (только для НОВЫХ инцидентов,
+    см. F3) + остановка прогона. Файл, который существует, но не парсится —
     ЭТО НЕ «система молодая и файла ещё нет» (тот случай — FileNotFoundError,
     обрабатывается веткой ниже и остаётся штатным поведением)."""
     if not WATCHLIST_FILE.exists():
@@ -328,24 +356,29 @@ def load_watchlist() -> dict:
     try:
         data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        backup = _quarantine_corrupt_file(WATCHLIST_FILE)
-        msg = (f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\n"
-              f"Backup: {backup.name if backup else 'не создан'}\n"
-              f"Прогон остановлен, чтобы не потерять открытые сделки.")
-        log.error(msg.replace("<b>", "").replace("</b>", ""))
-        send_tg(msg)
+        backup, is_new = _quarantine_corrupt_file(WATCHLIST_FILE, empty_content="{}")
+        if is_new:
+            msg = (f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\n"
+                  f"Backup: {backup.name if backup else 'не создан'}\n"
+                  f"Файл сброшен в чистое состояние ({{}}), прогон остановлен "
+                  f"для ручной проверки backup перед продолжением.")
+            log.error(msg.replace("<b>", "").replace("</b>", ""))
+            send_tg(msg)
+        else:
+            log.error(f"watchlist.json повреждён (уже известный инцидент, "
+                      f"backup={backup.name if backup else '?'}) — повторный "
+                      f"алерт не отправляется, прогон всё равно остановлен")
         sys.exit(1)
     # Integrity: trade_id без open_trade = потерянная сделка (survivorship risk).
     for sym, rec in data.items():
         if rec.get("trade_id") and not rec.get("open_trade"):
             log.error(f"CORRUPTION: {sym} has trade_id={rec.get('trade_id')} "
                       f"but no open_trade — сделка могла потеряться")
-        # [FIX R8] симметричная проверка обратного случая — инвариант
-        # "open_trade и trade_id — тогда и только тогда" должен работать в обе стороны.
         if rec.get("open_trade") and not rec.get("trade_id"):
             log.error(f"CORRUPTION: {sym} has open_trade but no trade_id — "
                       f"нарушен инвариант открытой сделки")
     return data
+   
 def save_watchlist(wl: dict):
     WATCHLIST_FILE.write_text(
         json.dumps(wl, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -388,10 +421,19 @@ def load_existing_trade_ids() -> set:
         if tid:
             ids.add(tid)
     return ids
+  
 def load_pending() -> list:
     """Очередь закрытых сделок, ждущих горизонтов. Формат — JSONL (по записи
     на строку); совместим с merge=union в .gitattributes. Умеет прочитать и
-    старый формат (единый JSON-массив) для миграции на лету."""
+    старый формат (единый JSON-массив) для миграции на лету.
+    [FIX F4] Раньше, если ВСЕ непустые строки JSONL оказывались битыми,
+    data оставался валидным пустым списком ([]) — проверка
+    `if not isinstance(data, list)` не срабатывала, и функция тихо возвращала
+    [], неотличимо от честного «pending пуст». Частичное повреждение (часть
+    строк битые) уже обрабатывалось правильно — с warning; тотальное — нет.
+    Теперь: если были непустые строки, но НИ ОДНА не распарсилась — это
+    тот же CRITICAL-сценарий, что и битый legacy-JSON: backup + алерт +
+    остановка прогона."""
     if not PENDING_FILE.exists():
         return []
     raw = PENDING_FILE.read_text(encoding="utf-8")
@@ -402,13 +444,18 @@ def load_pending() -> list:
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as e:
-            backup = _quarantine_corrupt_file(PENDING_FILE)
-            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json (legacy-формат) "
-                  f"повреждён: {e}\nBackup: {backup.name if backup else 'не создан'}\n"
-                  f"Прогон остановлен, чтобы не потерять закрытые сделки, "
-                  f"ждущие горизонтов.")
-            log.error(msg.replace("<b>", "").replace("</b>", ""))
-            send_tg(msg)
+            backup, is_new = _quarantine_corrupt_file(PENDING_FILE, empty_content="")
+            if is_new:
+                msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json (legacy-формат) "
+                      f"повреждён: {e}\nBackup: {backup.name if backup else 'не создан'}\n"
+                      f"Файл сброшен в пустое состояние, прогон остановлен для "
+                      f"ручной проверки backup перед продолжением.")
+                log.error(msg.replace("<b>", "").replace("</b>", ""))
+                send_tg(msg)
+            else:
+                log.error(f"pending_trades.json повреждён (уже известный "
+                          f"инцидент, backup={backup.name if backup else '?'}) "
+                          f"— повторный алерт не отправляется")
             sys.exit(1)
     else:
         # Новый формат — JSONL. Битые отдельные строки пропускаем построчно
@@ -416,36 +463,35 @@ def load_pending() -> list:
         # должна ронять всю очередь.
         data = []
         bad_lines = 0
+        nonempty_lines = 0
         for ln in raw.splitlines():
             ln = ln.strip()
             if not ln:
                 continue
+            nonempty_lines += 1
             try:
                 data.append(json.loads(ln))
             except json.JSONDecodeError:
                 bad_lines += 1
         if bad_lines:
             log.warning(f"pending_trades.json: {bad_lines} битых строк пропущено")
-    if not isinstance(data, list):
-        backup = _quarantine_corrupt_file(PENDING_FILE)
-        msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json имеет неожиданный "
-              f"формат (не список). Backup: {backup.name if backup else 'не создан'}\n"
-              f"Прогон остановлен.")
-        log.error(msg.replace("<b>", "").replace("</b>", ""))
-        send_tg(msg)
-        sys.exit(1)
-    # Дедуп по trade_id: страховка от дублей после любого не-serial мерджа.
-    seen, out = set(), []
-    for item in data:
-        tid = item.get("rec", {}).get("trade_id")
-        if tid and tid in seen:
-            continue
-        if tid:
-            seen.add(tid)
-        out.append(item)
-    if len(out) != len(data):
-        log.warning(f"pending dedup: {len(data)} → {len(out)} (убрано дублей)")
+        # [FIX F4] Тотальное повреждение: были непустые строки, но НИ ОДНА
+        # не распарсилась — data остался бы валидным [], маскируя потерю
+        # всей очереди. Отличаем от штатного случая "файл реально пуст"
+        # (nonempty_lines == 0, там data == [] законно и не требует алерта).
+        if nonempty_lines > 0 and bad_lines == nonempty_lines:
+            backup, is_new = _quarantine_corrupt_file(PENDING_FILE, empty_content="")
+            if is_new:
+                msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json: все "
+                      f"{bad_lines} непустых строк повреждены — вся очередь "
+                      f"закрытых сделок, ждущих горизонтов, под угрозой.\n"
+                      f"Backup: {backup.name if backup else 'не создан'}\n"
+                      f"Файл сброшен в пустое состояние, прогон остановлен для "
+                      f"ручной проверки backup перед продолжением.")
+                log.error(msg.replace("<b>", "").replace("</b>", ""))
+                send_tg(msg)
     return out
+  
 def save_pending(pending: list):
     """[FIX R19] JSONL-формат: по записи на строку, а не единый JSON-массив.
     Это делает файл совместимым с merge=union (та же логика, что для
