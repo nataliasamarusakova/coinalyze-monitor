@@ -87,15 +87,11 @@ jobs:
 
       - name: Commit snapshot log and state
         run: |
-          git config user.name "coinalyze-bot"
+          git config user.name "actions-user"
           git config user.email "actions@github.com"
-          git config merge.ours.driver true
-          for f in snapshots.jsonl calibration.jsonl heartbeat.jsonl watchlist.json market_history.jsonl; do
-            if [ -f "$f" ]; then git add "$f"; fi
-          done
+          git pull --rebase origin main
+          git add market_history.jsonl snapshots.jsonl heartbeat.jsonl \
+                  watchlist.json calibration.jsonl trades.jsonl \
+                  pending_trades.json docs/index.html || true
           git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          if ! git pull --rebase --autostash origin main; then
-            git rebase --abort || true
-            git pull --no-rebase -X ours origin main
-          fi
           git push
