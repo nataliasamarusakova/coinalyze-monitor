@@ -1,18 +1,37 @@
 """make_dashboard.py — генерирует docs/index.html (дашборд сделок) из trades.jsonl
 + живые открытые позиции из watchlist.json.
-
 Данные инлайнятся → самодостаточный HTML (GitHub Pages + локально без сервера).
 Закрытые сделки = trades.jsonl (история исходов). Открытые = watchlist.json
-(блок LIVE с текущим PnL). Запуск:  python make_dashboard.py"""
+(блок LIVE с текущим PnL). Запуск:  python make_dashboard.py
+
+ИЗМЕНЕНИЯ (аудит, раунд фиксов):
+  - TRADE_TIMEOUT_MIN импортируется из monitor.py вместо ручной дублирующей
+    константы (была причиной R15 — прогресс-бар удержания и текстовый лейбл
+    таймаута могли разойтись с реальным значением без предупреждения).
+    Fallback + warning, если импорт недоступен.
+  - load_open(): печатает предупреждение при повреждённом watchlist.json
+    вместо тихого возврата [] (R14) — иначе "0 live positions" неотличимо
+    от честного "сейчас нет открытых сделок".
+  - main(): assert после .replace() плейсхолдеров __DATA__/__OPEN__/
+    __TIMEOUT_MIN__ — защита от молча сломанной подстановки (R16).
+  - HTML/JS: исправлены синтаксические ошибки в шаблонных литералах,
+    добавлены обработчики change на фильтры #asset/#life (R26 — раньше
+    переключение фильтров визуально ничего не делало), исправлен hero-KPI
+    накопленного PnL — показывает "—" вместо "+0.0%" при отсутствии
+    закрытых сделок (R17).
+"""
 import json
 from pathlib import Path
-
 BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
 WATCHLIST = BASE / "watchlist.json"
 OUT = BASE / "docs" / "index.html"
-TRADE_TIMEOUT_MIN = 240   # должно совпадать с monitor.py (для прогресс-бара удержания)
-
+try:
+    from monitor import TRADE_TIMEOUT_MIN
+except Exception as e:
+    TRADE_TIMEOUT_MIN = 240  # fallback — держи в синхроне с monitor.py вручную
+    print(f"WARNING: не удалось импортировать TRADE_TIMEOUT_MIN из monitor.py "
+          f"({e}); используется fallback=240 — проверь синхронизацию вручную")
 FIELDS = [
     "symbol", "name", "asset_class", "entry_ts", "entry_price", "exit_price",
     "strategy_pnl_pct", "gross_pnl_pct", "return_60m", "return_120m", "return_240m",
@@ -21,9 +40,8 @@ FIELDS = [
     "entry_divergence", "entry_market_phase", "max_pnl_pct", "min_pnl_pct",
     "drawdown_from_peak_pct", "signal_age_min", "entry_price_chg24",
     "signal_logic_version", "pending_finalize_reason",
+    "exit_price_source", "exit_price_stale_min",
 ]
-
-
 def load_trades():
     if not TRADES.exists():
         return []
@@ -38,15 +56,18 @@ def load_trades():
             continue
         out.append({k: r.get(k) for k in FIELDS})
     return out
-
-
 def load_open():
-    """Открытые сделки из watchlist.json → объекты live-позиций с текущим PnL."""
+    """Открытые сделки из watchlist.json → объекты live-позиций с текущим PnL.
+    [FIX R14] При повреждённом watchlist.json печатаем предупреждение вместо
+    тихого возврата [] — иначе "0 live positions" на дашборде неотличимо от
+    честного "сейчас нет открытых сделок"."""
     if not WATCHLIST.exists():
         return []
     try:
         data = json.loads(WATCHLIST.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"WARNING: watchlist.json повреждён ({e}) — live-позиции "
+              f"недоступны на этой сборке дашборда")
         return []
     out = []
     for sym, rec in data.items():
@@ -85,8 +106,6 @@ def load_open():
     out.sort(key=lambda x: (x["cur_pnl_pct"] if x["cur_pnl_pct"] is not None else -999),
              reverse=True)
     return out
-
-
 HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
@@ -123,7 +142,6 @@ HTML = r"""<!doctype html>
     mask-image:radial-gradient(circle at 50% 30%, #000 30%, transparent 85%);
   }
   .wrap{position:relative;z-index:1;max-width:1240px;margin:0 auto;padding:28px 22px 80px;}
-
   .mast{display:flex;align-items:flex-end;justify-content:space-between;
     gap:20px;flex-wrap:wrap;margin-bottom:26px;padding-bottom:18px;
     border-bottom:1px solid var(--line);}
@@ -139,7 +157,6 @@ HTML = r"""<!doctype html>
   .dot.idle{background:var(--mut-2);animation:none;box-shadow:none;}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5);}
     70%{box-shadow:0 0 0 9px rgba(52,211,153,0);}100%{box-shadow:0 0 0 0 rgba(52,211,153,0);}}
-
   .controls{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px;}
   .ctl{display:flex;flex-direction:column;gap:5px;}
   .ctl label{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--mut-2);}
@@ -149,7 +166,6 @@ HTML = r"""<!doctype html>
     transition:border-color .2s,transform .15s;}
   select:hover{border-color:var(--teal);}
   select:focus{outline:none;border-color:var(--teal);transform:translateY(-1px);}
-
   /* ── LIVE POSITIONS ── */
   .livehead{display:flex;align-items:center;gap:11px;margin:6px 0 14px;}
   .livehead h2{font-family:var(--display);font-weight:700;font-size:15px;margin:0;
@@ -189,7 +205,6 @@ HTML = r"""<!doctype html>
   .pos .metrics b{color:var(--txt);font-weight:600;}
   .pos .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px;}
   .emptybox{color:var(--mut-2);font-style:italic;padding:22px 4px;font-size:13.5px;}
-
   .bento{display:grid;grid-template-columns:repeat(4,1fr);
     grid-auto-rows:minmax(96px,auto);gap:14px;margin-bottom:26px;}
   .kpi{position:relative;background:linear-gradient(160deg,var(--panel-2),var(--panel));
@@ -210,17 +225,14 @@ HTML = r"""<!doctype html>
   .kpi .m{font-family:var(--mono);font-size:12px;color:var(--mut);margin-top:8px;}
   .pos2{color:var(--grn);} .neg{color:var(--red);} .neu{color:var(--amb);}
   @keyframes pop{from{opacity:0;transform:translateY(10px) scale(.98);}to{opacity:1;transform:none;}}
-
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px;}
   @media(max-width:860px){.grid2{grid-template-columns:1fr;}.bento{grid-template-columns:repeat(2,1fr);}.kpi.big{grid-column:span 2;}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 20px;}
   .panel h3{margin:0 0 14px;font-family:var(--display);font-weight:600;font-size:14px;
     color:var(--txt);display:flex;align-items:center;gap:9px;}
   .panel h3::before{content:"";width:4px;height:15px;border-radius:3px;background:var(--teal);}
-
   .reveal{opacity:0;transform:translateY(22px);transition:opacity .6s ease,transform .6s cubic-bezier(.2,.7,.3,1);}
   .reveal.in{opacity:1;transform:none;}
-
   table{width:100%;border-collapse:collapse;font:12.5px/1.3 var(--mono);}
   th,td{padding:7px 9px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;}
   th{color:var(--mut-2);cursor:pointer;user-select:none;position:sticky;top:0;
@@ -237,7 +249,6 @@ HTML = r"""<!doctype html>
     border:1px solid var(--line);font:500 10.5px var(--body);color:var(--mut);}
   .tag.eq{color:var(--amb);border-color:rgba(251,191,36,.3);}
   .tag.co{color:var(--teal);border-color:rgba(45,212,191,.3);}
-
   .toprow{display:flex;justify-content:space-between;align-items:center;
     padding:7px 2px;border-bottom:1px solid var(--line);font-size:12.5px;gap:10px;
     transition:background .15s;}
@@ -258,7 +269,6 @@ HTML = r"""<!doctype html>
     </div>
     <div class="live"><span class="dot idle" id="mastDot"></span><span id="liveTxt">—</span></div>
   </div>
-
   <div class="controls">
     <div class="ctl"><label>Класс актива</label>
       <select id="asset">
@@ -274,38 +284,31 @@ HTML = r"""<!doctype html>
         <option value="short">умерли &lt;60м</option>
       </select></div>
   </div>
-
   <div class="livehead">
     <span class="pdot idle" id="liveDot"></span>
     <h2>Live positions</h2>
     <span class="cnt" id="liveCnt">0</span>
   </div>
   <div class="livegrid" id="liveGrid"></div>
-
   <div class="bento" id="bento"></div>
-
   <div class="grid2">
     <div class="panel reveal"><h3>Win-rate ≥1% по MOMENTUM входа</h3><canvas id="chMom"></canvas></div>
     <div class="panel reveal"><h3>Win-rate ≥1% по CVD_MOMENTUM входа</h3><canvas id="chCvd"></canvas></div>
     <div class="panel reveal"><h3>CVD_MOMENTUM × return@60m</h3><canvas id="chScatter"></canvas></div>
     <div class="panel reveal"><h3>Накопленный strategy PnL</h3><canvas id="chEquity"></canvas></div>
   </div>
-
   <div class="grid2">
     <div class="panel reveal"><h3>TOP 10 — лучший сигнал (return@60m)</h3><div id="topSig"></div></div>
     <div class="panel reveal"><h3>TOP 10 — лучшая стратегия (PnL)</h3><div id="topStr"></div></div>
   </div>
   <div class="panel reveal" style="margin-bottom:18px">
     <h3>Расхождение: отличный вход, плохой выход</h3><div id="topDiv"></div></div>
-
   <div class="panel reveal">
     <h3>Архив сделок <span style="color:var(--mut-2);font-weight:400;font-size:12px">· клик по заголовку — сортировка</span></h3>
     <div class="tblwrap"><table id="tbl"></table></div>
   </div>
-
   <div class="foot" id="foot"></div>
 </div>
-
 <script>
 const TRADES = __DATA__;
 const OPEN   = __OPEN__;
@@ -314,7 +317,6 @@ const LOW=20;                 // эвристика LOW SAMPLE (не прави�
 const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED_TREND:"🟢",
   ACCELERATION:"🚀",EXHAUSTION:"🟠",DISTRIBUTION:"🔴",INVALIDATED:"❌"};
 let charts={};
-
 const fmt=(v,d=1)=> v==null?'—':(+v).toFixed(d);
 const trimZ=s=> s.replace(/\.?0+$/,'');
 const pricef=v=>{
@@ -329,12 +331,11 @@ const bucket=(v,e)=>{ if(v==null)return 'n/a'; for(const x of e){if(v<x)return '
 const median=a=>{ if(!a.length)return 0; const s=[...a].sort((x,y)=>x-y); const m=(s.length-1)/2;
   const f=Math.floor(m),c=Math.min(f+1,s.length-1); return f===c?s[f]:s[f]+(s[c]-s[f])*(m-f); };
 const mean=a=> a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
+const sum=a=> a.reduce((x,y)=>x+y,0);
 const winrate=(a,lvl)=> a.length? a.filter(x=>x>=lvl).length/a.length*100 : 0;
 const dstr=ts=> ts? new Date(ts*1000).toISOString().slice(0,16).replace('T',' ') : '—';
 const acClass=a=> a==='equity'?'eq':a==='commodity'?'co':'';
-
 function assetOk(a){ const v=document.getElementById('asset').value; return v==='all'||a===v; }
-
 function filtered(){
   const l=document.getElementById('life').value;
   return TRADES.filter(t=>{
@@ -345,7 +346,6 @@ function filtered(){
   });
 }
 function openFiltered(){ return OPEN.filter(o=>assetOk(o.asset_class)); }
-
 /* ── LIVE POSITIONS ── */
 function renderLive(){
   const ops=openFiltered();
@@ -354,7 +354,6 @@ function renderLive(){
   document.getElementById('liveCnt').textContent=ops.length;
   const alive=ops.length>0;
   dotL.classList.toggle('idle',!alive); dotM.classList.toggle('idle',!alive);
-
   if(!ops.length){
     grid.innerHTML='<div class="emptybox">Нет открытых позиций · система ждёт подтверждения тренда (CONFIRMED / ACCELERATION).</div>';
     return;
@@ -373,7 +372,7 @@ function renderLive(){
       </div>
       <div class="stg"><span class="se">${se}</span>${o.state||'—'} · ${o.entry_path||'—'} · держим ${fmt(o.hold_min,0)}м</div>
       <div class="bars">
-        <div class="barlab"><span>удержание / таймаут 240м</span><span>${o.timeout_pct}%</span></div>
+        <div class="barlab"><span>удержание / таймаут __TIMEOUT_MIN__м</span><span>${o.timeout_pct}%</span></div>
         <div class="track"><div class="fill ${warn?'warn':''}" data-w="${o.timeout_pct}"></div></div>
       </div>
       <div class="metrics">
@@ -384,13 +383,12 @@ function renderLive(){
       </div>
       <div class="tags">
         <span class="tag ${acClass(o.asset_class)}">${o.asset_class||''}</span>
-        ${o.entry_pattern&&o.entry_pattern!=='—'?`<span class="tag">${o.entry_pattern}</span>`:''}
+        ${o.entry_pattern && o.entry_pattern!=='—' ? `<span class="tag">${o.entry_pattern}</span>` : ''}
         <span class="tag">${o.entry_earliness_label||'—'}</span>
-        ${o.entry_divergence&&o.entry_divergence!=='none'?`<span class="tag">div ${o.entry_divergence}</span>`:''}
+        ${o.entry_divergence && o.entry_divergence!=='none' ? `<span class="tag">div ${o.entry_divergence}</span>` : ''}
       </div>
     </div>`;
   }).join('');
-
   requestAnimationFrame(()=>{
     grid.querySelectorAll('.fill').forEach(f=>{ f.style.width=f.dataset.w+'%'; });
     grid.querySelectorAll('.pnl[data-num]').forEach(el=>{
@@ -402,15 +400,14 @@ function renderLive(){
     });
   });
 }
-
 /* ── KPI BENTO ── */
 function kpi(label,valHtml,rawNum,opts={}){
   const d=document.createElement('div');
   d.className='kpi'+(opts.big?' big':'');
   d.style.animationDelay=(opts.delay||0)+'ms';
   const c=cls(rawNum);
-  d.innerHTML=`<div class="l">${label}</div><div class="v ${opts.big?'':'s'} ${c}">${valHtml}</div>`
-    +(opts.meta?`<div class="m">${opts.meta}</div>`:'');
+  d.innerHTML = `<div class="l">${label}</div><div class="v ${opts.big?'':'s'} ${c}">${valHtml}</div>`
+    + (opts.meta ? `<div class="m">${opts.meta}</div>` : '');
   return d;
 }
 function renderBento(rows,openN){
@@ -421,18 +418,23 @@ function renderBento(rows,openN){
   const med=median(r60), wr1=winrate(r60,1), avgS=mean(strat);
   const dd=rows.map(t=>t.drawdown_from_peak_pct).filter(v=>v!=null);
   const last=[...rows].sort((a,b)=>(b.entry_ts||0)-(a.entry_ts||0))[0];
-
   const b=document.getElementById('bento'); b.innerHTML='';
-  const hero=kpi('Накопленный strategy PnL', (avgS*strat.length>=0?'+':'')+ (avgS*strat.length).toFixed(1)+'%',
-     avgS*strat.length, {big:true, meta:`среднее ${pctf(avgS)} на сделку · ${strat.length} закрытых`});
+  // [FIX R17] Раньше при strat.length===0 (нет закрытых сделок) значение
+  // фактически считалось как avgS*strat.length = 0*0 = "+0.0%" — визуально
+  // неотличимо от «накопленный PnL реально равен нулю». Теперь явный "—"
+  // при отсутствии закрытых сделок (штатный ранний режим системы).
+  const heroVal = strat.length ? sum(strat) : null;
+  const heroTxt = heroVal==null ? '—' : (heroVal>=0?'+':'') + heroVal.toFixed(1) + '%';
+  const heroMeta = heroVal==null ? 'нет закрытых сделок'
+    : `среднее ${pctf(avgS)} на сделку · ${strat.length} закрытых`;
+  const hero=kpi('Накопленный strategy PnL', heroTxt, heroVal, {big:true, meta:heroMeta});
   b.appendChild(hero);
-  b.appendChild(kpi('Открыто сейчас', openN, openN, {delay:60, meta:openN?'live-позиции':'ждём входа'}));
+  b.appendChild(kpi('Открыто сейчас', openN, openN, {delay:60, meta: openN?'live-позиции':'ждём входа'}));
   b.appendChild(kpi('Win ≥1% @60m', wr1.toFixed(0)+'%', wr1, {delay:120, meta:`n=${r60.length}`}));
   b.appendChild(kpi('Медиана @60m', pctf(med), med, {delay:180}));
   b.appendChild(kpi('Coverage r60', cov(60)+'%', cov(60), {delay:240, meta:`miss ${miss}`}));
   b.appendChild(kpi('Coverage r120', cov(120)+'%', cov(120), {delay:300}));
   b.appendChild(kpi('Недобор от пика', pctf(dd.length?median(dd):null), dd.length?median(dd):null, {delay:360}));
-
   b.querySelectorAll('.kpi .v').forEach((el)=>{
     const txt=el.textContent.trim();
     const m=txt.match(/^([+-]?)(\d+(?:\.\d+)?)(%?)$/);
@@ -443,13 +445,11 @@ function renderBento(rows,openN){
         el.textContent=sign+(num*e).toFixed(suf&&num>=10?0:1)+suf; if(p<1)requestAnimationFrame(step); };
       requestAnimationFrame(step); }
   });
-
   const liveLast=openFiltered()[0];
   document.getElementById('liveTxt').textContent = openN
-    ? `${openN} открыто`+(liveLast?` · ${liveLast.symbol} ${pctf(liveLast.cur_pnl_pct)}`:'')
-    : (last? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}` : 'нет сделок');
+    ? `${openN} открыто` + (liveLast ? ` · ${liveLast.symbol} ${pctf(liveLast.cur_pnl_pct)}` : '')
+    : (last ? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}` : 'нет сделок');
 }
-
 /* ── CHARTS ── */
 function barByBucket(rows,key,edges,canvas){
   const g={};
@@ -498,7 +498,6 @@ function equity(rows,canvas){
         y:{ticks:{color:'#93a0b8',callback:v=>v+'%'},grid:{color:'#2c3447'}}},
       plugins:{legend:{labels:{color:'#93a0b8'}}}}});
 }
-
 /* ── TABLE + TOP ── */
 const COLS=[
   ['entry_ts','Дата',t=>dstr(t.entry_ts),1],
@@ -553,7 +552,6 @@ function topDiv(rows){
     </div>`;
   }).join('') : '<div class="empty">Нет данных</div>';
 }
-
 function renderAll(){
   const rows=filtered();
   const ops=openFiltered();
@@ -568,31 +566,37 @@ function renderAll(){
   topDiv(rows);
   renderTable(rows);
   document.getElementById('foot').textContent =
-    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE n<${LOW} помечен *`;
+    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE <${LOW} — эвристика, не правило`;
 }
-
-document.getElementById('asset').onchange=renderAll;
-document.getElementById('life').onchange=renderAll;
-
-const io=new IntersectionObserver(es=>es.forEach(e=>{ if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);} }),{threshold:.12});
+/* [FIX R26] Раньше select-фильтры #asset/#life не имели обработчиков —
+   переключение фильтра визуально ничего не делало сразу. */
+document.getElementById('asset').addEventListener('change', renderAll);
+document.getElementById('life').addEventListener('change', renderAll);
+const io=new IntersectionObserver(entries=>entries.forEach(e=>{ if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);} }),{threshold:.12});
 function observeReveals(){ document.querySelectorAll('.reveal:not(.in)').forEach(el=>io.observe(el)); }
-
 renderAll(); observeReveals();
 </script>
 </body>
 </html>"""
-
-
 def main():
     trades = load_trades()
     open_positions = load_open()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     html = (HTML
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
-            .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False)))
+            .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
+            .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN)))
+    # [FIX R16] Защитная проверка: если плейсхолдер не был подставлен
+    # (опечатка/рассинхрон имени/кодировка) — падаем здесь с понятной
+    # ошибкой в CI-логе, а не коммитим битый HTML с буквальным __DATA__
+    # внутри <script> (SyntaxError уже в браузере пользователя, без единого
+    # намёка в логах сборки).
+    for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__"):
+        assert placeholder not in html, (
+            f"make_dashboard.py: плейсхолдер {placeholder} не был подставлен — "
+            f"генерация дашборда остановлена, чтобы не закоммитить битый HTML"
+        )
     OUT.write_text(html, encoding="utf-8")
     print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых)")
-
-
 if __name__ == "__main__":
     main()
