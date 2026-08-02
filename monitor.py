@@ -346,7 +346,7 @@ def _quarantine_corrupt_file(path: Path, empty_content: str = "") -> Optional[Pa
         log.error(f"Не удалось сделать backup/reset {path.name}: {e}")
         return None, False
       
- def load_watchlist() -> dict:
+def load_watchlist() -> dict:
     """При повреждении файла — backup + TG-алерт (только для НОВЫХ инцидентов,
     см. F3) + остановка прогона. Файл, который существует, но не парсится —
     ЭТО НЕ «система молодая и файла ещё нет» (тот случай — FileNotFoundError,
