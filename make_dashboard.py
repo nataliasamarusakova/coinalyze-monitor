@@ -1,12 +1,17 @@
-"""make_dashboard.py — генерирует docs/index.html (дашборд сделок) из trades.jsonl.
+"""make_dashboard.py — генерирует docs/index.html (дашборд сделок) из trades.jsonl
++ живые открытые позиции из watchlist.json.
+
 Данные инлайнятся → самодостаточный HTML (GitHub Pages + локально без сервера).
-Запуск:  python make_dashboard.py   (после прогона monitor.py / flush_pending)"""
+Закрытые сделки = trades.jsonl (история исходов). Открытые = watchlist.json
+(блок LIVE с текущим PnL). Запуск:  python make_dashboard.py"""
 import json
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
+WATCHLIST = BASE / "watchlist.json"
 OUT = BASE / "docs" / "index.html"
+TRADE_TIMEOUT_MIN = 240   # должно совпадать с monitor.py (для прогресс-бара удержания)
 
 FIELDS = [
     "symbol", "name", "asset_class", "entry_ts", "entry_price", "exit_price",
@@ -32,6 +37,53 @@ def load_trades():
         except json.JSONDecodeError:
             continue
         out.append({k: r.get(k) for k in FIELDS})
+    return out
+
+
+def load_open():
+    """Открытые сделки из watchlist.json → объекты live-позиций с текущим PnL."""
+    if not WATCHLIST.exists():
+        return []
+    try:
+        data = json.loads(WATCHLIST.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for sym, rec in data.items():
+        ot = rec.get("open_trade")
+        if not ot:
+            continue
+        ep = ot.get("entry_price")
+        lp = ot.get("last_price")
+        cur_pnl = round((lp - ep) / ep * 100, 2) if (ep and lp) else None
+        ets = ot.get("entry_ts", 0)
+        lts = ot.get("last_price_ts", ets)
+        hold = round((lts - ets) / 60, 1) if lts > ets else 0.0
+        timeout_pct = min(hold / TRADE_TIMEOUT_MIN * 100, 100) if TRADE_TIMEOUT_MIN else 0
+        out.append({
+            "symbol": sym,
+            "name": ot.get("name", sym),
+            "asset_class": ot.get("asset_class", "crypto"),
+            "state": rec.get("state"),
+            "entry_ts": ets,
+            "last_price_ts": lts,
+            "entry_price": ep,
+            "last_price": lp,
+            "cur_pnl_pct": cur_pnl,
+            "hold_min": hold,
+            "timeout_pct": round(timeout_pct, 1),
+            "max_pnl_pct": ot.get("max_pnl_pct", 0.0),
+            "min_pnl_pct": ot.get("min_pnl_pct", 0.0),
+            "entry_path": ot.get("entry_path"),
+            "entry_pattern": ot.get("entry_pattern"),
+            "entry_momentum": ot.get("entry_momentum"),
+            "entry_cvd_momentum": ot.get("entry_cvd_momentum"),
+            "entry_earliness_label": ot.get("entry_earliness_label"),
+            "entry_divergence": ot.get("entry_divergence"),
+            "signal_logic_version": ot.get("signal_logic_version"),
+        })
+    out.sort(key=lambda x: (x["cur_pnl_pct"] if x["cur_pnl_pct"] is not None else -999),
+             reverse=True)
     return out
 
 
@@ -84,6 +136,7 @@ HTML = r"""<!doctype html>
     padding:8px 14px;border-radius:999px;}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--grn);
     box-shadow:0 0 0 0 rgba(52,211,153,.6);animation:pulse 2s infinite;}
+  .dot.idle{background:var(--mut-2);animation:none;box-shadow:none;}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5);}
     70%{box-shadow:0 0 0 9px rgba(52,211,153,0);}100%{box-shadow:0 0 0 0 rgba(52,211,153,0);}}
 
@@ -96,6 +149,46 @@ HTML = r"""<!doctype html>
     transition:border-color .2s,transform .15s;}
   select:hover{border-color:var(--teal);}
   select:focus{outline:none;border-color:var(--teal);transform:translateY(-1px);}
+
+  /* ── LIVE POSITIONS ── */
+  .livehead{display:flex;align-items:center;gap:11px;margin:6px 0 14px;}
+  .livehead h2{font-family:var(--display);font-weight:700;font-size:15px;margin:0;
+    letter-spacing:.18em;text-transform:uppercase;color:var(--txt);}
+  .livehead .pdot{width:9px;height:9px;border-radius:50%;background:var(--grn);
+    animation:pulse 1.6s infinite;}
+  .livehead .pdot.idle{background:var(--mut-2);animation:none;}
+  .livehead .cnt{font-family:var(--mono);font-size:12px;color:var(--mut);
+    background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:2px 10px;}
+  .livegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+    gap:14px;margin-bottom:30px;}
+  .pos{position:relative;background:linear-gradient(155deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line);border-radius:16px;padding:16px 18px 16px 22px;
+    overflow:hidden;transition:transform .22s cubic-bezier(.2,.7,.3,1),border-color .22s,box-shadow .22s;
+    animation:pop .5s both;}
+  .pos::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--teal);}
+  .pos.eq::before{background:var(--amb);} .pos.co::before{background:var(--teal);}
+  .pos:hover{transform:translateY(-3px);border-color:var(--teal);
+    box-shadow:0 16px 34px -18px rgba(45,212,191,.45);}
+  .pos .row1{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
+  .pos .sym{font-family:var(--display);font-weight:700;font-size:20px;letter-spacing:-.01em;line-height:1;}
+  .pos .nm{color:var(--mut);font-size:11.5px;margin-top:3px;}
+  .pos .pnl{font-family:var(--display);font-weight:700;font-size:26px;line-height:1;
+    font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;}
+  .pos .stg{display:inline-flex;align-items:center;gap:5px;margin-top:7px;
+    font-family:var(--mono);font-size:11px;color:var(--mut);}
+  .pos .stg .se{font-size:13px;}
+  .pos .bars{margin:13px 0 4px;}
+  .pos .barlab{display:flex;justify-content:space-between;font-family:var(--mono);
+    font-size:10.5px;color:var(--mut-2);margin-bottom:4px;}
+  .pos .track{height:5px;border-radius:4px;background:var(--bg-deep);overflow:hidden;}
+  .pos .fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--teal),#22a89a);
+    width:0;transition:width 1s cubic-bezier(.2,.7,.3,1);}
+  .pos .fill.warn{background:linear-gradient(90deg,var(--amb),#d99a16);}
+  .pos .metrics{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:12px;
+    font-family:var(--mono);font-size:11px;color:var(--mut);}
+  .pos .metrics b{color:var(--txt);font-weight:600;}
+  .pos .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px;}
+  .emptybox{color:var(--mut-2);font-style:italic;padding:22px 4px;font-size:13.5px;}
 
   .bento{display:grid;grid-template-columns:repeat(4,1fr);
     grid-auto-rows:minmax(96px,auto);gap:14px;margin-bottom:26px;}
@@ -115,7 +208,7 @@ HTML = r"""<!doctype html>
   .kpi .v.s{font-size:30px;}
   .kpi.big .v{font-size:clamp(44px,7vw,72px);}
   .kpi .m{font-family:var(--mono);font-size:12px;color:var(--mut);margin-top:8px;}
-  .pos{color:var(--grn);} .neg{color:var(--red);} .neu{color:var(--amb);}
+  .pos2{color:var(--grn);} .neg{color:var(--red);} .neu{color:var(--amb);}
   @keyframes pop{from{opacity:0;transform:translateY(10px) scale(.98);}to{opacity:1;transform:none;}}
 
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px;}
@@ -161,9 +254,9 @@ HTML = r"""<!doctype html>
   <div class="mast">
     <div>
       <h1>Trade <span class="tick">Journal</span></h1>
-      <div class="sub">исследовательский журнал сигналов · signal vs strategy outcome · schema v2</div>
+      <div class="sub">исследовательский журнал сигналов · live-позиции + signal vs strategy outcome · schema v2</div>
     </div>
-    <div class="live"><span class="dot"></span><span id="liveTxt">—</span></div>
+    <div class="live"><span class="dot idle" id="mastDot"></span><span id="liveTxt">—</span></div>
   </div>
 
   <div class="controls">
@@ -174,13 +267,20 @@ HTML = r"""<!doctype html>
         <option value="equity">equity</option>
         <option value="commodity">commodity</option>
       </select></div>
-    <div class="ctl"><label>Жизнь сделки</label>
+    <div class="ctl"><label>Жизнь сделки (архив)</label>
       <select id="life">
         <option value="all" selected>все</option>
         <option value="long">дожили ≥60м</option>
         <option value="short">умерли &lt;60м</option>
       </select></div>
   </div>
+
+  <div class="livehead">
+    <span class="pdot idle" id="liveDot"></span>
+    <h2>Live positions</h2>
+    <span class="cnt" id="liveCnt">0</span>
+  </div>
+  <div class="livegrid" id="liveGrid"></div>
 
   <div class="bento" id="bento"></div>
 
@@ -199,7 +299,7 @@ HTML = r"""<!doctype html>
     <h3>Расхождение: отличный вход, плохой выход</h3><div id="topDiv"></div></div>
 
   <div class="panel reveal">
-    <h3>Все сделки <span style="color:var(--mut-2);font-weight:400;font-size:12px">· клик по заголовку — сортировка</span></h3>
+    <h3>Архив сделок <span style="color:var(--mut-2);font-weight:400;font-size:12px">· клик по заголовку — сортировка</span></h3>
     <div class="tblwrap"><table id="tbl"></table></div>
   </div>
 
@@ -208,31 +308,96 @@ HTML = r"""<!doctype html>
 
 <script>
 const TRADES = __DATA__;
+const OPEN   = __OPEN__;
 const MOM_B=[3,5,7], CVD_B=[0,3,6,10];
 const LOW=20;                 // эвристика LOW SAMPLE (не правило)
+const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED_TREND:"🟢",
+  ACCELERATION:"🚀",EXHAUSTION:"🟠",DISTRIBUTION:"🔴",INVALIDATED:"❌"};
 let charts={};
 
 const fmt=(v,d=1)=> v==null?'—':(+v).toFixed(d);
 const pctf=v=> v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%';
-const cls=v=> v==null?'':(v>0?'pos':(v<0?'neg':'neu'));
+const cls=v=> v==null?'':(v>0?'pos2':(v<0?'neg':'neu'));
 const bucket=(v,e)=>{ if(v==null)return 'n/a'; for(const x of e){if(v<x)return '<'+x;} return '>='+e[e.length-1]; };
 const median=a=>{ if(!a.length)return 0; const s=[...a].sort((x,y)=>x-y); const m=(s.length-1)/2;
   const f=Math.floor(m),c=Math.min(f+1,s.length-1); return f===c?s[f]:s[f]+(s[c]-s[f])*(m-f); };
 const mean=a=> a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
 const winrate=(a,lvl)=> a.length? a.filter(x=>x>=lvl).length/a.length*100 : 0;
 const dstr=ts=> ts? new Date(ts*1000).toISOString().slice(0,16).replace('T',' ') : '—';
+const acClass=a=> a==='equity'?'eq':a==='commodity'?'co':'';
+
+function assetOk(a){ const v=document.getElementById('asset').value; return v==='all'||a===v; }
 
 function filtered(){
-  const a=document.getElementById('asset').value;
   const l=document.getElementById('life').value;
   return TRADES.filter(t=>{
-    if(a!=='all' && t.asset_class!==a) return false;
+    if(!assetOk(t.asset_class)) return false;
     if(l==='long' && t.closed_before_60m!==false) return false;
     if(l==='short' && t.closed_before_60m!==true) return false;
     return true;
   });
 }
+function openFiltered(){ return OPEN.filter(o=>assetOk(o.asset_class)); }
 
+/* ── LIVE POSITIONS ── */
+function renderLive(){
+  const ops=openFiltered();
+  const grid=document.getElementById('liveGrid');
+  const dotL=document.getElementById('liveDot'), dotM=document.getElementById('mastDot');
+  document.getElementById('liveCnt').textContent=ops.length;
+  const alive=ops.length>0;
+  dotL.classList.toggle('idle',!alive); dotM.classList.toggle('idle',!alive);
+
+  if(!ops.length){
+    grid.innerHTML='<div class="emptybox">Нет открытых позиций · система ждёт подтверждения тренда (CONFIRMED / ACCELERATION).</div>';
+    return;
+  }
+  grid.innerHTML=ops.map((o,i)=>{
+    const pnl=o.cur_pnl_pct;
+    const warn=o.timeout_pct>=80;
+    const se=STATE_EMOJI[o.state]||'·';
+    return `<div class="pos ${acClass(o.asset_class)}" style="animation-delay:${i*50}ms">
+      <div class="row1">
+        <div>
+          <div class="sym">${o.symbol}</div>
+          <div class="nm">${o.name||''} · вход ${fmt(o.entry_price,4)} → ${fmt(o.last_price,4)}</div>
+        </div>
+        <div class="pnl ${cls(pnl)}" data-num="${pnl==null?'':pnl}">${pctf(pnl)}</div>
+      </div>
+      <div class="stg"><span class="se">${se}</span>${o.state||'—'} · ${o.entry_path||'—'} · держим ${fmt(o.hold_min,0)}м</div>
+      <div class="bars">
+        <div class="barlab"><span>удержание / таймаут 240м</span><span>${o.timeout_pct}%</span></div>
+        <div class="track"><div class="fill ${warn?'warn':''}" data-w="${o.timeout_pct}"></div></div>
+      </div>
+      <div class="metrics">
+        <span>пик <b class="${cls(o.max_pnl_pct)}">${pctf(o.max_pnl_pct)}</b></span>
+        <span>дно <b class="${cls(o.min_pnl_pct)}">${pctf(o.min_pnl_pct)}</b></span>
+        <span>mom <b>${fmt(o.entry_momentum,0)}</b></span>
+        <span>cvd_m <b>${fmt(o.entry_cvd_momentum,0)}</b></span>
+      </div>
+      <div class="tags">
+        <span class="tag ${acClass(o.asset_class)}">${o.asset_class||''}</span>
+        ${o.entry_pattern&&o.entry_pattern!=='—'?`<span class="tag">${o.entry_pattern}</span>`:''}
+        <span class="tag">${o.entry_earliness_label||'—'}</span>
+        ${o.entry_divergence&&o.entry_divergence!=='none'?`<span class="tag">div ${o.entry_divergence}</span>`:''}
+      </div>
+    </div>`;
+  }).join('');
+
+  // анимация прогресс-баров и count-up PnL
+  requestAnimationFrame(()=>{
+    grid.querySelectorAll('.fill').forEach(f=>{ f.style.width=f.dataset.w+'%'; });
+    grid.querySelectorAll('.pnl[data-num]').forEach(el=>{
+      const tgt=parseFloat(el.dataset.num); if(isNaN(tgt))return;
+      const sign=tgt>=0?'+':'', t0=performance.now();
+      const step=now=>{ const p=Math.min(1,(now-t0)/700), e=1-Math.pow(1-p,3);
+        el.textContent=sign+(tgt*e).toFixed(1)+'%'; if(p<1)requestAnimationFrame(step); };
+      requestAnimationFrame(step);
+    });
+  });
+}
+
+/* ── KPI BENTO ── */
 function kpi(label,valHtml,rawNum,opts={}){
   const d=document.createElement('div');
   d.className='kpi'+(opts.big?' big':'');
@@ -242,8 +407,7 @@ function kpi(label,valHtml,rawNum,opts={}){
     +(opts.meta?`<div class="m">${opts.meta}</div>`:'');
   return d;
 }
-
-function renderBento(rows){
+function renderBento(rows,openN){
   const r60=rows.map(t=>t.return_60m).filter(v=>v!=null);
   const strat=rows.map(t=>t.strategy_pnl_pct).filter(v=>v!=null);
   const miss=rows.length-r60.length;
@@ -256,7 +420,7 @@ function renderBento(rows){
   const hero=kpi('Накопленный strategy PnL', (avgS*strat.length>=0?'+':'')+ (avgS*strat.length).toFixed(1)+'%',
      avgS*strat.length, {big:true, meta:`среднее ${pctf(avgS)} на сделку · ${strat.length} закрытых`});
   b.appendChild(hero);
-  b.appendChild(kpi('Сделок', rows.length, rows.length, {delay:60}));
+  b.appendChild(kpi('Открыто сейчас', openN, openN, {delay:60, meta:openN?'live-позиции':'ждём входа'}));
   b.appendChild(kpi('Win ≥1% @60m', wr1.toFixed(0)+'%', wr1, {delay:120, meta:`n=${r60.length}`}));
   b.appendChild(kpi('Медиана @60m', pctf(med), med, {delay:180}));
   b.appendChild(kpi('Coverage r60', cov(60)+'%', cov(60), {delay:240, meta:`miss ${miss}`}));
@@ -274,11 +438,13 @@ function renderBento(rows){
       requestAnimationFrame(step); }
   });
 
-  document.getElementById('liveTxt').textContent = last
-    ? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}`
-    : 'нет сделок';
+  const liveLast=openFiltered()[0];
+  document.getElementById('liveTxt').textContent = openN
+    ? `${openN} открыто`+(liveLast?` · ${liveLast.symbol} ${pctf(liveLast.cur_pnl_pct)}`:'')
+    : (last? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}` : 'нет сделок');
 }
 
+/* ── CHARTS ── */
 function barByBucket(rows,key,edges,canvas){
   const g={};
   for(const r of rows){ const k=bucket(r[key],edges); (g[k]=g[k]||[]).push(r.return_60m); }
@@ -299,7 +465,6 @@ function barByBucket(rows,key,edges,canvas){
         x:{ticks:{color:'#93a0b8'},grid:{display:false}}},
       plugins:{legend:{labels:{color:'#93a0b8',font:{family:'IBM Plex Sans'}}}}}});
 }
-
 function scatter(rows,canvas){
   const pts=rows.filter(r=>r.entry_cvd_momentum!=null&&r.return_60m!=null)
     .map(r=>({x:r.entry_cvd_momentum,y:r.return_60m,
@@ -313,7 +478,6 @@ function scatter(rows,canvas){
       plugins:{legend:{display:false},
         tooltip:{callbacks:{label:c=>`${c.raw.s}: cvd_m ${c.raw.x}, r60 ${c.raw.y}%`}}}}});
 }
-
 function equity(rows,canvas){
   const s=rows.filter(r=>r.strategy_pnl_pct!=null).sort((a,b)=>a.entry_ts-b.entry_ts);
   let cum=0; const labels=[],data=[];
@@ -329,10 +493,11 @@ function equity(rows,canvas){
       plugins:{legend:{labels:{color:'#93a0b8'}}}}});
 }
 
+/* ── TABLE + TOP ── */
 const COLS=[
   ['entry_ts','Дата',t=>dstr(t.entry_ts),1],
   ['symbol','Монета',t=>t.symbol,1],
-  ['asset_class','Класс',t=>`<span class="tag ${t.asset_class==='equity'?'eq':t.asset_class==='commodity'?'co':''}">${t.asset_class||''}</span>`,1],
+  ['asset_class','Класс',t=>`<span class="tag ${acClass(t.asset_class)}">${t.asset_class||''}</span>`,1],
   ['entry_path','Путь',t=>t.entry_path||'—',1],
   ['entry_pattern','Паттерн',t=>t.entry_pattern||'—',1],
   ['entry_momentum','Mom',t=>fmt(t.entry_momentum,0)],
@@ -348,7 +513,6 @@ const COLS=[
   ['exit_reason','Выход',t=>t.exit_reason||'—',1],
 ];
 let sortKey='entry_ts', sortDir=-1;
-
 function renderTable(rows){
   const data=[...rows].sort((a,b)=>{
     const x=a[sortKey],y=b[sortKey];
@@ -364,7 +528,6 @@ function renderTable(rows){
     const k=th.dataset.k; if(sortKey===k)sortDir*=-1; else{sortKey=k;sortDir=-1;} renderTable(filtered());
   });
 }
-
 function topList(rows,key,elId){
   const have=rows.filter(r=>r[key]!=null).sort((a,b)=>b[key]-a[key]).slice(0,10);
   document.getElementById(elId).innerHTML = have.length? have.map(r=>{
@@ -374,7 +537,6 @@ function topList(rows,key,elId){
     </div>`;
   }).join('') : '<div class="empty">Нет данных</div>';
 }
-
 function topDiv(rows){
   const have=rows.filter(r=>r.return_60m!=null&&r.strategy_pnl_pct!=null)
     .map(r=>({...r,_d:r.return_60m-r.strategy_pnl_pct})).sort((a,b)=>b._d-a._d).slice(0,8);
@@ -388,7 +550,9 @@ function topDiv(rows){
 
 function renderAll(){
   const rows=filtered();
-  renderBento(rows);
+  const ops=openFiltered();
+  renderLive();
+  renderBento(rows,ops.length);
   barByBucket(rows,'entry_momentum',MOM_B,'chMom');
   barByBucket(rows,'entry_cvd_momentum',CVD_B,'chCvd');
   scatter(rows,'chScatter');
@@ -398,7 +562,7 @@ function renderAll(){
   topDiv(rows);
   renderTable(rows);
   document.getElementById('foot').textContent =
-    `trades: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE n<${LOW} помечен *`;
+    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE n<${LOW} помечен *`;
 }
 
 document.getElementById('asset').onchange=renderAll;
@@ -415,10 +579,13 @@ renderAll(); observeReveals();
 
 def main():
     trades = load_trades()
+    open_positions = load_open()
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    html = HTML.replace("__DATA__", json.dumps(trades, ensure_ascii=False))
+    html = (HTML
+            .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
+            .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False)))
     OUT.write_text(html, encoding="utf-8")
-    print(f"Dashboard: {OUT}  ({len(trades)} сделок)")
+    print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых)")
 
 
 if __name__ == "__main__":
