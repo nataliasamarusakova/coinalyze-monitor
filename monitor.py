@@ -426,26 +426,30 @@ def load_pending() -> list:
     """Очередь закрытых сделок, ждущих горизонтов. Формат — JSONL (по записи
     на строку); совместим с merge=union в .gitattributes. Умеет прочитать и
     старый формат (единый JSON-массив) для миграции на лету.
-    [FIX F4] Раньше, если ВСЕ непустые строки JSONL оказывались битыми,
-    data оставался валидным пустым списком ([]) — проверка
-    `if not isinstance(data, list)` не срабатывала, и функция тихо возвращала
-    [], неотличимо от честного «pending пуст». Частичное повреждение (часть
-    строк битые) уже обрабатывалось правильно — с warning; тотальное — нет.
-    Теперь: если были непустые строки, но НИ ОДНА не распарсилась — это
-    тот же CRITICAL-сценарий, что и битый legacy-JSON: backup + алерт +
-    остановка прогона."""
+
+    Повреждения:
+      - битый legacy JSON-массив → backup + алерт + остановка прогона;
+      - битые отдельные строки JSONL → пропускаются построчно (warning);
+      - тотальное повреждение JSONL (все непустые строки битые) → backup +
+        алерт + остановка прогона (иначе очередь терялась бы молча, F4).
+    В обоих fail-fast случаях файл сбрасывается в пустое состояние, чтобы
+    следующий прогон стартовал с чистого листа, а не падал снова. Алерт
+    шлётся только для НОВЫХ инцидентов (или если backup не удалось создать) —
+    повторный алерт за тот же битый контент не отправляется (F3).
+    """
     if not PENDING_FILE.exists():
         return []
     raw = PENDING_FILE.read_text(encoding="utf-8")
     stripped = raw.strip()
     data = None
+
     if stripped.startswith("["):
         # Старый формат — единый JSON-массив. Разово мигрируем при чтении.
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as e:
             backup, is_new = _quarantine_corrupt_file(PENDING_FILE, empty_content="")
-            if is_new:
+            if backup is None or is_new:
                 msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json (legacy-формат) "
                       f"повреждён: {e}\nBackup: {backup.name if backup else 'не создан'}\n"
                       f"Файл сброшен в пустое состояние, прогон остановлен для "
@@ -453,14 +457,12 @@ def load_pending() -> list:
                 log.error(msg.replace("<b>", "").replace("</b>", ""))
                 send_tg(msg)
             else:
-                log.error(f"pending_trades.json повреждён (уже известный "
-                          f"инцидент, backup={backup.name if backup else '?'}) "
-                          f"— повторный алерт не отправляется")
+                log.error(f"pending_trades.json повреждён (известный инцидент, "
+                          f"backup={backup.name}) — повторный алерт не отправляется")
             sys.exit(1)
     else:
-        # Новый формат — JSONL. Битые отдельные строки пропускаем построчно
-        # (как и остальные *.jsonl в системе) — одна повреждённая строка не
-        # должна ронять всю очередь.
+        # Новый формат — JSONL. Битые отдельные строки пропускаем построчно —
+        # одна повреждённая строка не должна ронять всю очередь.
         data = []
         bad_lines = 0
         nonempty_lines = 0
@@ -475,13 +477,12 @@ def load_pending() -> list:
                 bad_lines += 1
         if bad_lines:
             log.warning(f"pending_trades.json: {bad_lines} битых строк пропущено")
-        # [FIX F4] Тотальное повреждение: были непустые строки, но НИ ОДНА
-        # не распарсилась — data остался бы валидным [], маскируя потерю
-        # всей очереди. Отличаем от штатного случая "файл реально пуст"
-        # (nonempty_lines == 0, там data == [] законно и не требует алерта).
+        # [FIX F4] Тотальное повреждение: были непустые строки, но НИ ОДНА не
+        # распарсилась — data остался бы валидным [], маскируя потерю всей
+        # очереди. Отличаем от штатного "файл реально пуст" (nonempty_lines == 0).
         if nonempty_lines > 0 and bad_lines == nonempty_lines:
             backup, is_new = _quarantine_corrupt_file(PENDING_FILE, empty_content="")
-            if is_new:
+            if backup is None or is_new:
                 msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json: все "
                       f"{bad_lines} непустых строк повреждены — вся очередь "
                       f"закрытых сделок, ждущих горизонтов, под угрозой.\n"
@@ -490,6 +491,23 @@ def load_pending() -> list:
                       f"ручной проверки backup перед продолжением.")
                 log.error(msg.replace("<b>", "").replace("</b>", ""))
                 send_tg(msg)
+            else:
+                log.error(f"pending_trades.json повреждён (известный инцидент, "
+                          f"backup={backup.name}) — повторный алерт не отправляется")
+            sys.exit(1)
+
+    # Дедуп по trade_id: страховка от дублей после любого не-serial мерджа
+    # (merge=union может объединить строки двух версий).
+    seen, out = set(), []
+    for item in data:
+        tid = item.get("rec", {}).get("trade_id")
+        if tid and tid in seen:
+            continue
+        if tid:
+            seen.add(tid)
+        out.append(item)
+    if len(out) != len(data):
+        log.warning(f"pending dedup: {len(data)} → {len(out)} (убрано дублей)")
     return out
   
 def save_pending(pending: list):
