@@ -1,16 +1,22 @@
 """
-coinalyze_monitor.py
-====================
-Система распознавания жизненного цикла деривативного движения.
+monitor.py
+==========
+Система распознавания жизненного цикла деривативного движения + журнал сделок.
 
-Фильтрация живёт в URL Coinalyze (discovery-слой). Код не фильтрует —
-он наблюдает за тем, что пришло, и ведёт lifecycle.
+Журнал сделок (trades.jsonl, append-only): одна строка = одна сделка со всеми
+признаками входа + два исхода (strategy_pnl = качество стратегии,
+return_*m = качество входа) + флаги цензуры. Закрытые сделки сначала попадают
+в pending_trades.json и ждут наступления горизонтов (устраняет selection bias
+быстро закрытых сделок), затем финализируются одной записью.
+
+Пороги входа НЕ калибруем по малой выборке — копим 200-300 сделок, потом
+двигаем по срезам trades_report.py.
 
 8 состояний:
   NEUTRAL → ACCUMULATION → EARLY_MOVE → CONFIRMED_TREND
   → ACCELERATION → EXHAUSTION → DISTRIBUTION → INVALIDATED
 
-Запуск: python coinalyze_monitor.py  (cron / GitHub Actions, каждые 5 мин)
+Запуск: python monitor.py  (cron / GitHub Actions, каждые 5 мин)
 """
 
 import os
@@ -21,6 +27,7 @@ import html as html_mod
 import logging
 from pathlib import Path
 from typing import Optional
+from bisect import bisect_left
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -42,7 +49,9 @@ MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
 SNAPSHOTS_FILE      = BASE / "snapshots.jsonl"
 HEARTBEAT_FILE      = BASE / "heartbeat.jsonl"
 WATCHLIST_FILE      = BASE / "watchlist.json"
-CALIBRATION_FILE    = BASE / "calibration.jsonl"   # метрики на переходах — для калибровки порогов
+CALIBRATION_FILE    = BASE / "calibration.jsonl"
+TRADES_FILE         = BASE / "trades.jsonl"          # журнал сделок (append-only)
+PENDING_FILE        = BASE / "pending_trades.json"   # закрытые, ждут наступления горизонтов
 DEBUG_HTML_FILE     = BASE / "debug_page.html"
 
 # ═══════════════════════════════════════════════════════════
@@ -60,9 +69,6 @@ QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL",
                                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
 
-# Discovery-фильтр (настроен в UI Coinalyze):
-#   Volume>2M, OI>1M, OI24>0, OI4h>0, CVD>45, LLS<60
-# Сортировка по объёму (desc): при пагинации обрезается неликвидный хвост.
 COINALYZE_URL = (
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -77,12 +83,33 @@ HEARTBEAT_TTL_DAYS = 3
 LIFECYCLE_WINDOW_MIN = 90
 MIN_SNAPS_LIFECYCLE  = 5
 
-MISS_EXIT_RUNS   = 2   # прогонов без данных → «на паузе»
-MISS_REMOVE_RUNS = 4   # прогонов без данных → удаление
+MISS_EXIT_RUNS   = 2
+MISS_REMOVE_RUNS = 4
 
-# Гистерезис снятия активной монеты: один шумовой/None-снимок
-# больше не рвёт наблюдение мгновенно.
 NEUTRAL_HYSTERESIS = 2
+
+# ── Журнал сделок ──
+TRADE_SCHEMA_VERSION = 2
+# Версия логики сигнала (lifecycle + паттерны + пороги входа). Инкрементировать при
+# любом изменении, влияющем на то, КАКИЕ сигналы генерируются — тогда v1 и v2 можно
+# честно сравнивать по дате входа, не смешивая выборки. НЕ равно schema_version.
+SIGNAL_LOGIC_VERSION = 1
+TRADE_TIMEOUT_MIN    = 240          # эвристика (≈ typical trend persistence); калибровать позже
+FEE_PCT              = 0.0          # «грязный» PnL; анализатор умеет net = gross - fee
+TP_PCT               = None         # выключено: сначала мерим голый сигнал
+SL_PCT               = None         # выключено
+TRADE_HORIZONS       = [30, 60, 120, 240]   # минуты, signal outcome
+TRADE_WIN_PCT        = 1.0
+PENDING_GRACE_MIN    = 10    # после наступления горизонта ждём ещё столько на приход цены
+PENDING_WAIT_MAX_MIN = 60    # сверх max-горизонта: если цены так и нет — пишем как есть
+PENDING = []                 # модульный буфер (один прогон = один процесс)
+
+# ── Класс актива (метка, НЕ фильтр — чтобы не смешивать распределения в анализе) ──
+EQUITY_SYMBOLS = {"META", "AMZN", "NVDA", "CRWV", "AXTI", "PLTR", "AVGO",
+                  "AAPL", "TSLA", "GOOGL", "MSTR", "COIN", "BZ"}
+EQUITY_HINTS   = ("Inc", "Corp", "Technologies", "Platforms")
+COMMODITY_SYMBOLS = {"CL"}
+COMMODITY_HINTS   = ("Crude", "Oil", "Gold", "Silver")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,6 +166,30 @@ def safe(val, default=0.0) -> float:
 
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
+
+
+def valid_price(p) -> bool:
+    return p is not None and p > 0
+
+
+def classify_asset_class(r: dict) -> str:
+    """crypto / equity / commodity. Метка для анализа, НЕ фильтр."""
+    sym = r.get("symbol", "")
+    name = r.get("name", "")
+    if sym in COMMODITY_SYMBOLS or any(h in name for h in COMMODITY_HINTS):
+        return "commodity"
+    if sym in EQUITY_SYMBOLS or any(h in name for h in EQUITY_HINTS):
+        return "equity"
+    return "crypto"
+
+
+def price_at(price_full: dict, sym: str, ts_target: int) -> Optional[float]:
+    """Цена на/после ts_target из полного индекса (для горизонтов)."""
+    idx = price_full.get(sym, [])
+    if not idx:
+        return None
+    i = bisect_left([t for t, _ in idx], ts_target)
+    return idx[i][1] if i < len(idx) else None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -281,10 +332,16 @@ def load_watchlist() -> dict:
     if not WATCHLIST_FILE.exists():
         return {}
     try:
-        return json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+        data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         log.warning("watchlist.json повреждён, начинаю с чистого")
         return {}
+    # Integrity: trade_id без open_trade = потерянная сделка (survivorship risk).
+    for sym, rec in data.items():
+        if rec.get("trade_id") and not rec.get("open_trade"):
+            log.error(f"CORRUPTION: {sym} has trade_id={rec.get('trade_id')} "
+                      f"but no open_trade — сделка могла потеряться")
+    return data
 
 
 def save_watchlist(wl: dict):
@@ -294,6 +351,7 @@ def save_watchlist(wl: dict):
 
 
 def load_market_history() -> dict[str, list[dict]]:
+    """Группировка по symbol за lifecycle-окно (для lifecycle)."""
     cutoff = now_ts() - LIFECYCLE_WINDOW_MIN * 60
     recs = load_jsonl(MARKET_HISTORY_FILE)
     grouped: dict[str, list[dict]] = {}
@@ -310,9 +368,52 @@ def load_market_history() -> dict[str, list[dict]]:
     return grouped
 
 
+def load_price_full() -> dict[str, list[tuple[int, float]]]:
+    """Полный индекс цен (в пределах TTL файла) — для дотяжки горизонтов сделок."""
+    recs = load_jsonl(MARKET_HISTORY_FILE)
+    idx: dict[str, list[tuple[int, float]]] = {}
+    for r in recs:
+        sym, ts, p = r.get("symbol"), r.get("ts"), r.get("price")
+        if sym and ts and valid_price(p):
+            idx.setdefault(sym, []).append((ts, p))
+    for sym in idx:
+        idx[sym].sort(key=lambda x: x[0])
+    return idx
+
+
+def load_pending() -> list:
+    if not PENDING_FILE.exists():
+        return []
+    try:
+        data = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.error("CORRUPTION: pending_trades.json бит — начинаю с пустого "
+                  "(закрытые сделки из него могли потеряться)")
+        return []
+    if not isinstance(data, list):
+        return []
+    # Дедуп по trade_id: страховка от дублей после любого не-serial мерджа.
+    seen, out = set(), []
+    for item in data:
+        tid = item.get("rec", {}).get("trade_id")
+        if tid and tid in seen:
+            continue
+        if tid:
+            seen.add(tid)
+        out.append(item)
+    if len(out) != len(data):
+        log.warning(f"pending dedup: {len(data)} → {len(out)} (убрано дублей)")
+    return out
+
+
+def save_pending(pending: list):
+    PENDING_FILE.write_text(
+        json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 # ═══════════════════════════════════════════════════════════
 # 3. ФИЛЬТР ДЛЯ АРХИВА (snapshots.jsonl)
-#    Не влияет на сигналы — только для истории кандидатов.
 # ═══════════════════════════════════════════════════════════
 
 def passes_filter(r: dict) -> bool:
@@ -418,7 +519,6 @@ def calc_derived(snaps: list[dict]) -> dict:
         if len(clean) < 2:
             return "flat"
         diff = clean[-1] - clean[0]
-        # При |first|<=1 порог 0.5 (base=10.0 → 10*0.05), а не 0.05.
         base = abs(clean[0]) if abs(clean[0]) > 1 else 10.0
         if diff > base * 0.05:
             return "up"
@@ -448,31 +548,25 @@ def calc_derived(snaps: list[dict]) -> dict:
         fr = [safe(s.get("fr_oiw")) for s in snaps[-3:]]
         d["funding_pressure"] = (fr[2] - fr[1]) - (fr[1] - fr[0])
 
-    # 5 дивергенций
     if d["price_trend"] == "up" and d["oi_trend"] == "down":
         d["divergence"] = "price_up_oi_down"
         d["note"] = "Цена ↑ OI ↓ — рост на закрытии шортов"
-
     elif d["price_trend"] == "up" and d["cvd_trend"] == "down":
         d["divergence"] = "price_up_cvd_down"
         d["note"] = "Цена ↑ CVD ↓ — покупатели ослабевают"
-
     elif d["price_trend"] == "down" and d["oi_trend"] == "up":
         d["divergence"] = "price_down_oi_up"
         d["note"] = "Цена ↓ OI ↑ — возможное накопление"
-
     elif d["oi_trend"] == "down" and n >= 3:
         fr_vals = [safe(s.get("fr_oiw")) for s in snaps[-3:]]
         if fr_vals[-1] > fr_vals[0] + 0.005:
             d["divergence"] = "funding_up_oi_down"
             d["note"] = "Funding ↑ OI ↓ — выход участников"
-
     elif d["price_trend"] == "up" and n >= 3:
         lls_vals = [safe(s.get("lls24")) for s in snaps[-3:]]
         if lls_vals[-1] > lls_vals[0] + 10:
             d["divergence"] = "lls_up_price_up"
             d["note"] = "LLS ↑ Price ↑ — поздняя стадия"
-
     elif d["oi_trend"] != "down" and d["cvd_trend"] != "down" and d["price_trend"] == "up":
         d["note"] = "Здоровое движение: Price↑ OI и CVD не падают"
 
@@ -521,7 +615,6 @@ def calc_momentum(derived: dict) -> tuple[int, list[str]]:
 
 # ═══════════════════════════════════════════════════════════
 # 7. PATTERN ENGINE
-#    Порядок: предупреждающие первыми, Healthy Trend последним.
 # ═══════════════════════════════════════════════════════════
 
 def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
@@ -530,12 +623,9 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
     cvd  = safe(r.get("cvd24"))
     lls  = safe(r.get("lls24"))
     fr   = safe(r.get("fr_oiw"))
-    # fail-closed: None не должен давать ложный Short Squeeze.
     ls   = r.get("ls_accounts")
     div  = derived["divergence"]
 
-    # Exhaustion согласован со стадией EXHAUSTION
-    # (lifecycle допускает funding_pressure>0.005 вместо fr>0.03).
     if cvd > 90 and (fr > 0.03 or derived["funding_pressure"] > 0.005) \
             and derived["oi_accel"] < 0:
         return "Exhaustion"
@@ -549,7 +639,6 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
     if pc > 10 and oi24 > 20 and derived["cvd_trend"] == "down":
         return "Late Trend"
 
-    # ситуативные
     if pc > 0 and oi24 > 5 and lls > 35 and ls is not None and ls < 1.0:
         return "Short Squeeze"
 
@@ -560,7 +649,6 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
     if momentum >= 7 and derived["oi_accel"] > 2 and derived["cvd_momentum"] > 10:
         return "Momentum Expansion"
 
-    # общий позитивный — последним
     if (pc > 0 and oi24 > 5 and cvd > 60 and lls < 30
             and derived["oi_trend"] != "down" and div == "none"):
         return "Healthy Trend"
@@ -570,7 +658,6 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
 
 # ═══════════════════════════════════════════════════════════
 # 8. MARKET PHASE DETECTION
-#    (BTC может не пройти discovery-фильтр → modifier 0, это ок)
 # ═══════════════════════════════════════════════════════════
 
 def detect_market_phase(rows: list[dict]) -> dict:
@@ -595,6 +682,8 @@ def detect_market_phase(rows: list[dict]) -> dict:
 
 # ═══════════════════════════════════════════════════════════
 # 9. LIFECYCLE ENGINE
+#    Возвращает (state, reasons, warnings, entry_path).
+#    entry_path = "classic" / "early" / None — для журнала сделок.
 # ═══════════════════════════════════════════════════════════
 
 ACTIONS = {
@@ -628,19 +717,20 @@ ALLOWED_FROM = {
 
 def detect_lifecycle(symbol: str, snaps: list[dict],
                      score: int, derived: dict,
-                     prev_state: str = "NEUTRAL") -> tuple[str, list[str], list[str]]:
+                     prev_state: str = "NEUTRAL"
+                     ) -> tuple[str, list[str], list[str], Optional[str]]:
 
     n = len(snaps)
     reasons: list[str] = []
     warnings: list[str] = []
 
     if n < 2:
-        return "NEUTRAL", ["недостаточно данных"], []
+        return "NEUTRAL", ["недостаточно данных"], [], None
 
     last = snaps[-1]
 
     if last.get("cvd24") is None or last.get("oi_chg24_pct") is None:
-        return "NEUTRAL", ["нет данных CVD/OI"], []
+        return "NEUTRAL", ["нет данных CVD/OI"], [], None
 
     pc   = safe(last.get("price_chg24"))
     oi24 = safe(last.get("oi_chg24_pct"))
@@ -657,14 +747,12 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
     def allowed(target: str) -> bool:
         return prev_state in ALLOWED_FROM.get(target, set())
 
-    # ── INVALIDATED ──
     if oi24 < -5 and cvd < 40:
         reasons.append(f"OI24={oi24:.1f}%<-5, CVD={cvd:.0f}<40")
         if pc < -3:
             reasons.append(f"Price={pc:.1f}% — структура сломана")
-        return "INVALIDATED", reasons, warnings
+        return "INVALIDATED", reasons, warnings, None
 
-    # ── DISTRIBUTION ──
     if allowed("DISTRIBUTION") and n >= 2:
         oi4h_prev = safe(snaps[-2].get("oi_chg4h_pct"))
         if oi4h < 0 and oi4h_prev < 0 and cvd_mom < -10:
@@ -673,20 +761,15 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
                 reasons.append(f"Price={pc:.1f}% — ещё высокая")
             if fr > 0.02:
                 reasons.append(f"FR={fr:.4f} — остаётся высоким")
-            return "DISTRIBUTION", reasons, warnings
+            return "DISTRIBUTION", reasons, warnings, None
 
-    # ── EXHAUSTION ──
     if allowed("EXHAUSTION"):
         if cvd > 90 and (fr > 0.03 or fund_press > 0.005) and oi_accel < 0 and pc > 15:
             reasons.append(f"CVD={cvd:.0f}>90, FR={fr:.4f}, fund_press={fund_press:.4f}")
             reasons.append(f"OI accel={oi_accel:.1f}<0 — замедление")
             warnings.append(f"Price={pc:.1f}% — вертикальный рост")
-            return "EXHAUSTION", reasons, warnings
+            return "EXHAUSTION", reasons, warnings, None
 
-    # ── ACCELERATION ──
-    # Явные тренды по всему окну (и OI, и CVD): cvd_momentum>10 по 4 снимкам
-    # не эквивалентен cvd_trend!=down по всему окну — закрываем edge case
-    # «просадка раньше в окне + рост последних снимков».
     if allowed("ACCELERATION"):
         if (n >= 3 and oi_accel > 2 and cvd_mom > 10 and price_accel >= 1
                 and derived["oi_trend"] != "down"
@@ -698,9 +781,8 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
                 warnings.append(f"CVD={cvd:.0f} — близко к максимуму")
             if pc > 10:
                 warnings.append(f"Price={pc:.1f}% — уже вырос")
-            return "ACCELERATION", reasons, warnings
+            return "ACCELERATION", reasons, warnings, None
 
-    # ── CONFIRMED_TREND (два пути) ──
     if allowed("CONFIRMED_TREND") and n >= MIN_SNAPS_LIFECYCLE:
         recent = snaps[-MIN_SNAPS_LIFECYCLE:]
 
@@ -715,7 +797,6 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             for i in range(1, len(recent))
         )
         all_oi4 = all(safe(s.get("oi_chg4h_pct")) > 0 for s in recent)
-        # fail-closed: None не проходит как «отлично».
         all_fr  = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.05
                       for s in recent)
         all_lls = all(s.get("lls24") is not None and s.get("lls24") < 40
@@ -735,13 +816,10 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             d2 = ov[2] - ov[1]
             oi_growing_faster = d2 > d1 and d1 > 0
 
-        # Путь А: классика
         path_a = (
             all(safe(s.get("oi_chg24_pct")) > 5 for s in recent)
             and all(safe(s.get("cvd24")) > 55 for s in recent)
         )
-
-        # Путь Б: ранний
         path_b = (
             all(safe(s.get("oi_chg24_pct")) > 2 for s in recent)
             and all(safe(s.get("cvd24")) > 50 for s in recent)
@@ -749,8 +827,6 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             and cvd_mom > 5
         )
 
-        # Тренды по всему окну не должны падать: закрывает кейс, где
-        # пошаговые допуски пропускают кумулятивное затухание CVD/OI.
         trends_ok = (derived["cvd_trend"] != "down"
                      and derived["oi_trend"] != "down")
 
@@ -760,7 +836,8 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
                 and oi_not_falling and cvd_not_falling
                 and trends_ok):
 
-            if path_b and not path_a:
+            is_early = path_b and not path_a
+            if is_early:
                 reasons.append("Раннее подтверждение: OI>2 CVD>50 + ускорение + momentum")
             else:
                 reasons.append(
@@ -769,9 +846,8 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             reasons.append("OI и CVD не снижаются (шагово и по тренду)")
             if oi_accel <= 0:
                 warnings.append("OI не ускоряется")
-            return "CONFIRMED_TREND", reasons, warnings
+            return "CONFIRMED_TREND", reasons, warnings, ("early" if is_early else "classic")
 
-    # ── EARLY_MOVE ──
     if allowed("EARLY_MOVE") and n >= 3:
         last3 = snaps[-3:]
         price_up = all(
@@ -792,24 +868,21 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
         )
         if price_up and oi_up and cvd_up and vol_up:
             reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑")
-            return "EARLY_MOVE", reasons, warnings
+            return "EARLY_MOVE", reasons, warnings, None
 
-    # ── ACCUMULATION ──
     if allowed("ACCUMULATION") and n >= 3:
         last3 = snaps[-3:]
         oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
         cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / 3
-        # fail-closed по funding.
         fr_ok   = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.03
                       for s in last3)
 
         if oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok:
             reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
             reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
-            return "ACCUMULATION", reasons, warnings
+            return "ACCUMULATION", reasons, warnings, None
 
-    # ── NEUTRAL ──
-    return "NEUTRAL", ["нет подтверждённого движения"], warnings
+    return "NEUTRAL", ["нет подтверждённого движения"], warnings, None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -939,6 +1012,30 @@ def format_signal(symbol: str, wl: dict, cur: dict,
     return msg
 
 
+def format_trade_close(rec: dict) -> str:
+    """Итог закрытой сделки для Telegram."""
+    pnl = rec.get("strategy_pnl_pct")
+    pnl_s = ("—" if pnl is None else f"{pnl:+.1f}%")
+    emoji = "💚" if (pnl is not None and pnl > 0) else "💔" if (pnl is not None and pnl < 0) else "➖"
+    peak = rec.get("max_pnl_pct")
+    dd = rec.get("drawdown_from_peak_pct")
+    line = "━━━━━━━━━━━━━━━━━━"
+    msg = (
+        f"{emoji} <b>{esc(rec.get('name', rec['symbol']))} ({esc(rec['symbol'])})</b> — сделка закрыта\n"
+        f"{line}\n"
+        f"Вход {rec.get('entry_price')} → Выход {rec.get('exit_price')}   <b>{pnl_s}</b>\n"
+        f"Держали {rec.get('hold_min')} мин · пик {fmt_pct(peak)} · просадка {fmt_pct(-dd if dd else None)}\n"
+        f"Выход по: {esc(rec.get('exit_reason'))}\n"
+        f"Вход был: {esc(rec.get('entry_path'))} · mom {rec.get('entry_momentum')} · "
+        f"cvd_m {rec.get('entry_cvd_momentum'):.0f} · {esc(rec.get('entry_pattern'))} · "
+        f"{esc(rec.get('entry_earliness_label'))}\n"
+    )
+    r60 = rec.get("return_60m")
+    if r60 is not None:
+        msg += f"Signal@60m: {r60:+.1f}%\n"
+    return msg
+
+
 # ═══════════════════════════════════════════════════════════
 # 13. LLM — ВЕРИФИКАТОР
 # ═══════════════════════════════════════════════════════════
@@ -998,43 +1095,243 @@ def llm_verify(symbol: str, wl: dict, cur: dict,
 
 
 # ═══════════════════════════════════════════════════════════
-# 14. ОСНОВНОЙ ПРОГОН
+# 14. ЖУРНАЛ СДЕЛОК
+# ═══════════════════════════════════════════════════════════
+
+def _fill_horizons(ot: dict, sym: str, as_of_ts: int, price_full: dict):
+    """Дотянуть наступившие к as_of_ts горизонты из полного индекса цен."""
+    ep = ot.get("entry_price")
+    if not ep:
+        return
+    for h in TRADE_HORIZONS:
+        key = f"return_{h}m"
+        if ot.get(key) is None and as_of_ts >= ot["entry_ts"] + h * 60:
+            ph = price_at(price_full, sym, ot["entry_ts"] + h * 60)
+            if ph:
+                ot[key] = round((ph - ep) / ep * 100, 3)
+                ot[f"{key}_available"] = True
+
+
+def open_trade_record(r: dict, ts: int, state: str, path: Optional[str],
+                      score: int, momentum: int, conf: int,
+                      early_val: float, early_label: str, pattern: str,
+                      derived: dict, market: dict,
+                      first_seen: int, snapshots: int, price: float) -> dict:
+    """Блок open_trade + все entry_* признаки (денормализованы на входе)."""
+    ot = {
+        "entry_ts": ts,
+        "entry_price": price,
+        "entry_state": state,
+        "entry_path": path,
+        "last_price": price,
+        "last_price_ts": ts,
+        "max_pnl_pct": 0.0,
+        "min_pnl_pct": 0.0,
+        "peak_ts": ts,
+        "signal_age_min": round((ts - first_seen) / 60, 1),
+        "snapshot_count_before_entry": snapshots,
+        "asset_class": classify_asset_class(r),
+        "name": r.get("name", r.get("symbol", "")),
+        "signal_logic_version": SIGNAL_LOGIC_VERSION,   # фиксируется на ВХОДЕ
+        # признаки входа
+        "entry_score": score,
+        "entry_momentum": momentum,
+        "entry_cvd_momentum": round(derived["cvd_momentum"], 2),
+        "entry_oi_accel": round(derived["oi_accel"], 3),
+        "entry_price_accel": round(derived["price_accel"], 3),
+        "entry_confidence": conf,
+        "entry_earliness": round(early_val, 2),
+        "entry_earliness_label": early_label,
+        "entry_pattern": pattern,
+        "entry_oi_trend": derived["oi_trend"],
+        "entry_cvd_trend": derived["cvd_trend"],
+        "entry_price_trend": derived["price_trend"],
+        "entry_divergence": derived["divergence"],
+        "entry_price_chg24": safe(r.get("price_chg24")),
+        "entry_oi_chg24": safe(r.get("oi_chg24_pct")),
+        "entry_oi_chg4h": safe(r.get("oi_chg4h_pct")),
+        "entry_cvd24": safe(r.get("cvd24")),
+        "entry_lls24": safe(r.get("lls24")),
+        "entry_fr_oiw": safe(r.get("fr_oiw")),
+        "entry_oi_vol_ratio": safe(r.get("oi_vol_ratio")),
+        "entry_oi_mktcap_ratio": safe(r.get("oi_mktcap_ratio")),
+        "entry_liq_short24": safe(r.get("liq_short24")),
+        "entry_liq_long24": safe(r.get("liq_long24")),
+        "entry_ls_accounts": r.get("ls_accounts"),
+        "entry_btc_corr7d": r.get("btc_corr7d"),
+        "entry_market_phase": market.get("phase", "unknown"),
+    }
+    for h in TRADE_HORIZONS:
+        ot[f"return_{h}m"] = None
+        ot[f"return_{h}m_available"] = False
+    return ot
+
+
+def close_trade(ot: dict, symbol: str, exit_ts: int, exit_price: Optional[float],
+                exit_reason: str, exit_state: str, price_full: dict):
+    """Собрать строку сделки → в pending (ждёт горизонтов) → TG-итог сразу."""
+    ep = ot.get("entry_price")
+    _fill_horizons(ot, symbol, exit_ts, price_full)
+
+    gross = round((exit_price - ep) / ep * 100, 3) if (exit_price and ep) else None
+    strategy_pnl = round(gross - FEE_PCT, 3) if gross is not None else None
+    hold_min = round((exit_ts - ot["entry_ts"]) / 60, 1)
+    max_pnl = ot.get("max_pnl_pct", 0.0)
+    min_pnl = ot.get("min_pnl_pct", 0.0)
+    drawdown = round(max_pnl - gross, 3) if (gross is not None) else None
+    time_to_peak = round((ot.get("peak_ts", ot["entry_ts"]) - ot["entry_ts"]) / 60, 1)
+
+    def winflag(h):
+        v = ot.get(f"return_{h}m")
+        if v is None:
+            return None
+        return 1 if v >= TRADE_WIN_PCT else 0
+
+    rec = {
+        "schema_version": TRADE_SCHEMA_VERSION,
+        "trade_id": f"{symbol}_{ot['entry_ts']}",
+        "symbol": symbol,
+        "name": ot.get("name", symbol),
+        "asset_class": ot.get("asset_class", classify_asset_class({"symbol": symbol})),
+        "entry_ts": ot["entry_ts"],
+        "entry_price": ep,
+        "exit_ts": exit_ts,
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "exit_state": exit_state,
+        "closed_before_60m": hold_min < 60,
+        "hold_min": hold_min,
+        "entry_state": ot.get("entry_state"),
+        "entry_path": ot.get("entry_path"),
+        "signal_age_min": ot.get("signal_age_min"),
+        "snapshot_count_before_entry": ot.get("snapshot_count_before_entry"),
+        "signal_logic_version": ot.get("signal_logic_version"),
+        "entry_score": ot.get("entry_score"),
+        "entry_momentum": ot.get("entry_momentum"),
+        "entry_cvd_momentum": ot.get("entry_cvd_momentum"),
+        "entry_oi_accel": ot.get("entry_oi_accel"),
+        "entry_price_accel": ot.get("entry_price_accel"),
+        "entry_confidence": ot.get("entry_confidence"),
+        "entry_earliness": ot.get("entry_earliness"),
+        "entry_earliness_label": ot.get("entry_earliness_label"),
+        "entry_pattern": ot.get("entry_pattern"),
+        "entry_oi_trend": ot.get("entry_oi_trend"),
+        "entry_cvd_trend": ot.get("entry_cvd_trend"),
+        "entry_price_trend": ot.get("entry_price_trend"),
+        "entry_divergence": ot.get("entry_divergence"),
+        "entry_price_chg24": ot.get("entry_price_chg24"),
+        "entry_oi_chg24": ot.get("entry_oi_chg24"),
+        "entry_oi_chg4h": ot.get("entry_oi_chg4h"),
+        "entry_cvd24": ot.get("entry_cvd24"),
+        "entry_lls24": ot.get("entry_lls24"),
+        "entry_fr_oiw": ot.get("entry_fr_oiw"),
+        "entry_oi_vol_ratio": ot.get("entry_oi_vol_ratio"),
+        "entry_oi_mktcap_ratio": ot.get("entry_oi_mktcap_ratio"),
+        "entry_liq_short24": ot.get("entry_liq_short24"),
+        "entry_liq_long24": ot.get("entry_liq_long24"),
+        "entry_ls_accounts": ot.get("entry_ls_accounts"),
+        "entry_btc_corr7d": ot.get("entry_btc_corr7d"),
+        "entry_market_phase": ot.get("entry_market_phase"),
+        "fee_pct": FEE_PCT,
+        "gross_pnl_pct": gross,
+        "strategy_pnl_pct": strategy_pnl,
+        "max_pnl_pct": max_pnl,
+        "min_pnl_pct": min_pnl,
+        "drawdown_from_peak_pct": drawdown,
+        "time_to_peak_min": time_to_peak,
+    }
+    for h in TRADE_HORIZONS:
+        rec[f"return_{h}m"] = ot.get(f"return_{h}m")
+        rec[f"return_{h}m_available"] = bool(ot.get(f"return_{h}m_available"))
+    rec["win_60m"] = winflag(60)
+    rec["win_120m"] = winflag(120)
+
+    # НЕ в trades.jsonl — в pending, пока горизонты не дотянутся.
+    PENDING.append({"rec": rec, "entry_ts": ot["entry_ts"],
+                    "symbol": symbol, "entry_price": ep})
+    log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} "
+             f"hold={hold_min}m (ждёт горизонты)")
+    send_tg(format_trade_close(rec))
+
+
+def flush_pending(price_full: dict, now: int):
+    """Дотянуть наступившие горизонты; готовые → trades.jsonl (append-only)."""
+    global PENDING
+    grace = PENDING_GRACE_MIN * 60
+    wait_max = (max(TRADE_HORIZONS) + PENDING_WAIT_MAX_MIN) * 60
+    still = []
+    for item in PENDING:
+        rec = item["rec"]
+        sym, ep, ets = item["symbol"], item["entry_price"], item["entry_ts"]
+        for h in TRADE_HORIZONS:
+            key = f"return_{h}m"
+            if rec.get(key) is None and now >= ets + h * 60:
+                ph = price_at(price_full, sym, ets + h * 60)
+                if ph and ep:
+                    rec[key] = round((ph - ep) / ep * 100, 3)
+                    rec[f"{key}_available"] = True
+        # пересчитать win-флаги по дотянутым горизонтам
+        for h in (60, 120):
+            v = rec.get(f"return_{h}m")
+            rec[f"win_{h}m"] = (1 if (v is not None and v >= TRADE_WIN_PCT)
+                                else (0 if v is not None else None))
+        # готова, если каждый горизонт либо дотянут, либо наступил+grace, либо общий таймаут
+        ready = all(
+            rec.get(f"return_{h}m") is not None or now >= ets + h * 60 + grace
+            for h in TRADE_HORIZONS
+        ) or now >= ets + wait_max
+        if ready:
+            all_complete = all(rec.get(f"return_{h}m") is not None
+                               for h in TRADE_HORIZONS)
+            if all_complete:
+                rec["pending_finalize_reason"] = "COMPLETE"
+            elif now >= ets + wait_max:
+                rec["pending_finalize_reason"] = "WAIT_TIMEOUT"
+            else:
+                rec["pending_finalize_reason"] = "MISSING_PRICE"
+            append_jsonl(TRADES_FILE, rec)
+            log.info(f"[{sym}] TRADE FINALIZED trade_id={rec['trade_id']} "
+                     f"reason={rec['pending_finalize_reason']}")
+        else:
+            still.append(item)
+    PENDING = still
+
+
+# ═══════════════════════════════════════════════════════════
+# 15. ОСНОВНОЙ ПРОГОН
 # ═══════════════════════════════════════════════════════════
 
 TG_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ACTIVE_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
+ENTRY_STATES = {"CONFIRMED_TREND", "ACCELERATION"}
+CLOSE_STATES = {"EXHAUSTION", "DISTRIBUTION"}   # INVALIDATED обработан отдельно
 
 
 def run():
     log.info("═══ Прогон ═══")
 
-    # 1. Сбор (таблица уже отфильтрована URL)
     rows = fetch_data()
     log.info(f"Монет после discovery-фильтра: {len(rows)}")
 
-    # 2. Market phase (BTC может не пройти фильтр → modifier 0)
     market = detect_market_phase(rows)
     log.info(f"Market: {market['phase']} {market['note']}")
 
-    # 3. Watchlist ЗАРАНЕЕ (до записи history)
     wl_all = load_watchlist()
-
-    # 4. Символы, присутствующие в текущей таблице
     current_symbols = {r["symbol"] for r in rows}
 
-    # 5. Heartbeat + market_history — пишем всё, что пришло (код НЕ фильтрует)
     ts = now_ts()
     for r in rows:
         append_jsonl(HEARTBEAT_FILE, {"ts": ts, "symbol": r["symbol"],
                                       "price": r.get("price")})
         append_jsonl(MARKET_HISTORY_FILE, r)
 
-    # 6. History (один раз)
     history_all = load_market_history()
+    price_full = load_price_full()   # полный индекс цен для горизонтов сделок
 
-    # 7. Анализ — только монеты, присутствующие в текущей таблице.
-    #    Выпавшие из фильтра здесь НЕ обрабатываются (иначе lifecycle по старым
-    #    снимкам сбрасывал бы missed_runs и сигнал выхода не срабатывал).
+    global PENDING
+    PENDING = load_pending()
+
+    # ── Анализ монет, присутствующих в таблице ──
     for sym, hist in history_all.items():
         if not hist:
             continue
@@ -1042,6 +1339,7 @@ def run():
             continue
 
         r = hist[-1]
+        cur_price = r.get("price") if valid_price(r.get("price")) else None
 
         raw_score, pros, cons = calculate_score(r)
         score = clamp(raw_score + market["modifier"], 0, 10)
@@ -1051,14 +1349,11 @@ def run():
         pattern = detect_pattern(r, derived, momentum)
 
         prev_state = wl_all.get(sym, {}).get("state", "NEUTRAL")
-
-        state, reasons, warnings = detect_lifecycle(
+        state, reasons, warnings, path = detect_lifecycle(
             sym, hist, score, derived, prev_state
         )
 
-        # NEUTRAL → не наблюдаем.
-        # Гистерезис для активных стадий: один шумовой/None-снимок больше
-        # не снимает монету и не шлёт ложное «разворот».
+        # ── NEUTRAL: гистерезис + закрытие сделки при снятии ──
         if state == "NEUTRAL":
             if sym in wl_all:
                 old = wl_all[sym]["state"]
@@ -1067,6 +1362,11 @@ def run():
                     wl_all[sym]["neutral_runs"] = nr
                     wl_all[sym]["last_seen"] = ts
                     if nr >= NEUTRAL_HYSTERESIS:
+                        ot = wl_all[sym].get("open_trade")
+                        if ot:
+                            close_trade(ot, sym, ts,
+                                        cur_price or ot.get("last_price"),
+                                        "NEUTRAL", old, price_full)
                         send_tg(
                             f"⚪ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1079,15 +1379,24 @@ def run():
                     else:
                         log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}, жду")
                 else:
-                    # ACCUMULATION/EARLY не шлют TG — удаляем сразу.
+                    ot = wl_all[sym].get("open_trade")
+                    if ot:
+                        close_trade(ot, sym, ts,
+                                    cur_price or ot.get("last_price"),
+                                    "NEUTRAL", old, price_full)
                     log.info(f"[{sym}] {old} → NEUTRAL, remove")
                     del wl_all[sym]
             continue
 
-        # INVALIDATED → терминальное состояние, сообщаем всегда.
+        # ── INVALIDATED: терминально + закрытие сделки ──
         if state == "INVALIDATED":
             if sym in wl_all:
                 old = wl_all[sym]["state"]
+                ot = wl_all[sym].get("open_trade")
+                if ot:
+                    close_trade(ot, sym, ts,
+                                cur_price or ot.get("last_price"),
+                                "INVALIDATED", state, price_full)
                 send_tg(
                     f"❌ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -1098,12 +1407,55 @@ def run():
                 del wl_all[sym]
             continue
 
-        # Confidence + earliness
         conf = calc_confidence(state, hist, score, derived, market["modifier"])
-        early_val, _ = entry_earliness(r)
+        early_val, early_label = entry_earliness(r)
 
-        # Watchlist (neutral_runs сброшен — монета снова подтверждена)
-        wl_all[sym] = {
+        # ── Управление открытой сделкой ──
+        existing = wl_all.get(sym, {})
+        ot = existing.get("open_trade")
+        tid = existing.get("trade_id")
+        new_ot, new_tid = None, None
+
+        if ot is not None:
+            close_reason = None
+            if state in CLOSE_STATES:
+                close_reason = state
+            elif ts - ot["entry_ts"] >= TRADE_TIMEOUT_MIN * 60:
+                close_reason = "TIMEOUT"
+
+            if close_reason:
+                close_trade(ot, sym, ts,
+                            cur_price or ot.get("last_price"),
+                            close_reason, state, price_full)
+                new_ot, new_tid = None, None
+            else:
+                ot = dict(ot)
+                if cur_price:
+                    ot["last_price"] = cur_price
+                    ot["last_price_ts"] = ts
+                    ep = ot.get("entry_price")
+                    if ep:
+                        pnl_now = (cur_price - ep) / ep * 100
+                        if pnl_now > ot.get("max_pnl_pct", 0.0):
+                            ot["max_pnl_pct"] = pnl_now
+                            ot["peak_ts"] = ts
+                        if pnl_now < ot.get("min_pnl_pct", 0.0):
+                            ot["min_pnl_pct"] = pnl_now
+                _fill_horizons(ot, sym, ts, price_full)
+                new_ot, new_tid = ot, tid
+        else:
+            if state in ENTRY_STATES and cur_price:
+                new_tid = f"{sym}_{ts}"
+                new_ot = open_trade_record(
+                    r, ts, state, path, score, momentum, conf,
+                    early_val, early_label, pattern, derived, market,
+                    existing.get("first_seen", ts),
+                    existing.get("snapshots", 0) + 1, cur_price,
+                )
+                log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
+
+        # ── Перезапись watchlist (сохраняем open_trade/trade_id, пока сделка жива) ──
+        entry = {
             "state": state,
             "previous_state": prev_state,
             "action": ACTIONS.get(state, ""),
@@ -1112,9 +1464,9 @@ def run():
             "momentum": momentum,
             "pattern": pattern,
             "name": r.get("name", sym),
-            "first_seen": wl_all.get(sym, {}).get("first_seen", ts),
+            "first_seen": existing.get("first_seen", ts),
             "last_seen": ts,
-            "snapshots": wl_all.get(sym, {}).get("snapshots", 0) + 1,
+            "snapshots": existing.get("snapshots", 0) + 1,
             "missed_runs": 0,
             "neutral_runs": 0,
             "entry_earliness": round(early_val, 2),
@@ -1122,17 +1474,18 @@ def run():
             "warnings": warnings,
             "mom_tags": mom_tags,
         }
+        if new_ot is not None:
+            entry["open_trade"] = new_ot
+            entry["trade_id"] = new_tid
+        wl_all[sym] = entry
 
         cur = {**r, "score": score, "pros": pros, "cons": cons,
                "derived": derived, "momentum": momentum, "pattern": pattern}
 
-        # Переход → Telegram
+        # ── Переход → Telegram (входа) ──
         if state != prev_state:
             log.info(f"[{sym}] {prev_state} → {state} | {reasons}")
-
             if state in TG_STATES:
-                # Лог для калибровки порогов (пункт C): сырые метрики на
-                # переходах — чтобы обоснованно настроить oi_accel/cvd_momentum.
                 append_jsonl(CALIBRATION_FILE, {
                     "ts": ts, "symbol": sym, "state": state,
                     "oi_accel": round(derived["oi_accel"], 3),
@@ -1143,7 +1496,6 @@ def run():
                     "cvd_trend": derived["cvd_trend"],
                     "score": score, "momentum": momentum, "confidence": conf,
                 })
-
                 llm_res = llm_verify(sym, wl_all[sym], cur, hist)
                 msg = format_signal(sym, wl_all[sym], cur, hist,
                                     reasons, warnings, market)
@@ -1154,10 +1506,7 @@ def run():
                     msg += f"\n🤖 {agree} {esc(risk)} · {esc(reason)}"
                 send_tg(msg)
 
-    # 8. Монеты, которые были в watchlist, но выпали из discovery-фильтра.
-    #    НЕ relabel в DISTRIBUTION — причина может быть в объёме/пагинации,
-    #    а не в OI/CVD. Стадия сохраняется, шлётся честное «на паузе»;
-    #    при возврате lifecycle пересчитает по свежим снимкам.
+    # ── Выпавшие из discovery-фильтра ──
     for sym in list(wl_all.keys()):
         if sym in current_symbols:
             continue
@@ -1179,26 +1528,31 @@ def run():
             )
 
         if missed >= MISS_REMOVE_RUNS:
+            ot = wl_all[sym].get("open_trade")
+            if ot:
+                close_trade(ot, sym, ts, ot.get("last_price"),
+                            "MISSED", stage, price_full)
             log.info(f"[{sym}] нет в данных {missed} прогонов → remove")
             del wl_all[sym]
 
-    # 9. Сохранение
+    flush_pending(price_full, ts)
+    save_pending(PENDING)
     save_watchlist(wl_all)
 
-    # 10. Кандидаты в snapshots (жёсткий фильтр, только архив)
     for r in rows:
         if passes_filter(r):
             sc, pr, co = calculate_score(r)
             append_jsonl(SNAPSHOTS_FILE, {**r, "score": sc,
                                           "pros": pr, "cons": co})
 
-    # 11. Cleanup
     cleanup_jsonl(MARKET_HISTORY_FILE, MARKET_TTL_DAYS)
     cleanup_jsonl(SNAPSHOTS_FILE, SNAPSHOTS_TTL_DAYS)
     cleanup_jsonl(HEARTBEAT_FILE, HEARTBEAT_TTL_DAYS)
     cleanup_jsonl(CALIBRATION_FILE, SNAPSHOTS_TTL_DAYS)
 
-    log.info(f"═══ Готово. Active: {len(wl_all)} ═══")
+    open_n = sum(1 for v in wl_all.values() if v.get("open_trade"))
+    log.info(f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} "
+             f"· pending: {len(PENDING)} ═══")
 
 
 # ═══════════════════════════════════════════════════════════
