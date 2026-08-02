@@ -160,6 +160,15 @@ def fmt_num(val, suffix="", dec=1) -> str:
     return f"{val:.{dec}f}{suffix}"
 
 
+def fmt_price(val) -> str:
+    """Цена с адаптивной точностью: 4 знака для обычных, без экспоненты для малых."""
+    if val is None:
+        return "—"
+    n = float(val)
+    dec = 4 if abs(n) >= 0.01 else 10
+    return f"{n:.{dec}f}".rstrip("0").rstrip(".")
+
+
 def safe(val, default=0.0) -> float:
     return val if val is not None else default
 
@@ -1023,7 +1032,7 @@ def format_trade_close(rec: dict) -> str:
     msg = (
         f"{emoji} <b>{esc(rec.get('name', rec['symbol']))} ({esc(rec['symbol'])})</b> — сделка закрыта\n"
         f"{line}\n"
-        f"Вход {rec.get('entry_price')} → Выход {rec.get('exit_price')}   <b>{pnl_s}</b>\n"
+        f"Вход {fmt_price(rec.get('entry_price'))} → Выход {fmt_price(rec.get('exit_price'))}   <b>{pnl_s}</b>\n"
         f"Держали {rec.get('hold_min')} мин · пик {fmt_pct(peak)} · просадка {fmt_pct(-dd if dd else None)}\n"
         f"Выход по: {esc(rec.get('exit_reason'))}\n"
         f"Вход был: {esc(rec.get('entry_path'))} · mom {rec.get('entry_momentum')} · "
