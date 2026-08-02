@@ -1109,15 +1109,29 @@ def open_trade_record(r: dict, ts: int, state: str, path: Optional[str],
         ot[f"return_{h}m_available"] = False
     return ot
 def _exit_meta(source: str, exit_ts: int, last_price_ts: Optional[int]) -> tuple[str, float]:
-    """[FIX R7] Метаданные о происхождении цены выхода.
+    """Метаданные о происхождении цены выхода.
     source: 'live' — цена взята из текущего прогона (свежая, current_symbols);
             'last_seen' — использована последняя известная last_price, т.к.
             монета выпала из фильтра/снята (MISSED, либо cur_price недоступна).
-    Возвращает (source, stale_min) — на сколько минут цена выхода старше exit_ts."""
+    Возвращает (source, stale_min) — на сколько минут цена выхода старше exit_ts.
+
+    [FIX R30] Раньше stale_min считался от last_price_ts независимо от source.
+    Проблема: last_price_ts в блоке ot обновляется только в ветке "сделка
+    продолжает жить" (в основном цикле run()), а НЕ в момент закрытия — то
+    есть на момент close_trade() last_price_ts всегда отражает ПРЕДЫДУЩИЙ
+    прогон, даже если exit_price в этом же вызове взят из текущего, свежего
+    cur_price (source="live"). Это давало ложные 5-10+ минут "устаревания"
+    для абсолютного большинства нормальных закрытий (NEUTRAL/INVALIDATED/
+    TIMEOUT/CLOSE_STATES), где цена на самом деле свежая. Реальная деградация
+    точности актуальна только для source="last_seen" (MISSED) — там last_price
+    действительно не обновлялась несколько прогонов подряд."""
+    if source != "last_seen":
+        return source, 0.0
     if last_price_ts is None:
         return source, 0.0
     stale_min = round(max(0, exit_ts - last_price_ts) / 60, 1)
     return source, stale_min
+  
 def close_trade(ot: dict, symbol: str, exit_ts: int, exit_price: Optional[float],
                 exit_reason: str, exit_state: str, price_full: dict,
                 exit_price_source: str = "live"):
