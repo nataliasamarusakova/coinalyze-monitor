@@ -2,92 +2,74 @@
 monitor.py
 ==========
 Система распознавания жизненного цикла деривативного движения + журнал сделок.
-
 Журнал сделок (trades.jsonl, append-only): одна строка = одна сделка со всеми
 признаками входа + два исхода (strategy_pnl = качество стратегии,
 return_*m = качество входа) + флаги цензуры. Закрытые сделки сначала попадают
 в pending_trades.json и ждут наступления горизонтов (устраняет selection bias
 быстро закрытых сделок), затем финализируются одной записью.
-
 Пороги входа НЕ калибруем по малой выборке — копим 200-300 сделок, потом
 двигаем по срезам trades_report.py.
-
 8 состояний:
   NEUTRAL → ACCUMULATION → EARLY_MOVE → CONFIRMED_TREND
   → ACCELERATION → EXHAUSTION → DISTRIBUTION → INVALIDATED
-
 Запуск: python monitor.py  (cron / GitHub Actions, каждые 5 мин)
 """
-
 import os
 import sys
 import time
 import json
+import shutil
 import html as html_mod
 import logging
 from pathlib import Path
 from typing import Optional
 from bisect import bisect_left
-
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
-
 try:
     from playwright_stealth import stealth_sync
 except ImportError:
     def stealth_sync(page):
         pass
-
 # ═══════════════════════════════════════════════════════════
 # ПУТИ
 # ═══════════════════════════════════════════════════════════
-
 BASE = Path(__file__).resolve().parent
-
 MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
 SNAPSHOTS_FILE      = BASE / "snapshots.jsonl"
 HEARTBEAT_FILE      = BASE / "heartbeat.jsonl"
 WATCHLIST_FILE      = BASE / "watchlist.json"
 CALIBRATION_FILE    = BASE / "calibration.jsonl"
 TRADES_FILE         = BASE / "trades.jsonl"          # журнал сделок (append-only)
-PENDING_FILE        = BASE / "pending_trades.json"   # закрытые, ждут наступления горизонтов
+PENDING_FILE        = BASE / "pending_trades.json"   # закрытые, ждут наступления горизонтов (JSONL-формат, имя файла оставлено для совместимости)
 DEBUG_HTML_FILE     = BASE / "debug_page.html"
-
 # ═══════════════════════════════════════════════════════════
 # КОНФИГ
 # ═══════════════════════════════════════════════════════════
-
 COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN       = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID         = os.environ.get("TG_CHAT_ID", "")
-
 ENABLE_LLM    = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY  = os.environ.get("QWEN_API_KEY", "")
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL",
                                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
-
 COINALYZE_URL = (
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
-
 MARKET_TTL_DAYS    = 1
 SNAPSHOTS_TTL_DAYS = 7
 HEARTBEAT_TTL_DAYS = 3
-
 LIFECYCLE_WINDOW_MIN = 90
 MIN_SNAPS_LIFECYCLE  = 5
-
 MISS_EXIT_RUNS   = 2
 MISS_REMOVE_RUNS = 4
-
 NEUTRAL_HYSTERESIS = 2
-
 # ── Журнал сделок ──
 TRADE_SCHEMA_VERSION = 2
 # Версия логики сигнала (lifecycle + паттерны + пороги входа). Инкрементировать при
@@ -102,27 +84,25 @@ TRADE_HORIZONS       = [30, 60, 120, 240]   # минуты, signal outcome
 TRADE_WIN_PCT        = 1.0
 PENDING_GRACE_MIN    = 10    # после наступления горизонта ждём ещё столько на приход цены
 PENDING_WAIT_MAX_MIN = 60    # сверх max-горизонта: если цены так и нет — пишем как есть
+HORIZON_MAX_LAG_MIN  = 15    # [FIX R6] макс. допустимое расстояние между целевым временем горизонта
+                              # и ближайшей найденной ценой; иначе горизонт остаётся None
+                              # (не подменяем return_30m ценой через 3 часа)
 PENDING = []                 # модульный буфер (один прогон = один процесс)
-
 # ── Класс актива (метка, НЕ фильтр — чтобы не смешивать распределения в анализе) ──
 EQUITY_SYMBOLS = {"META", "AMZN", "NVDA", "CRWV", "AXTI", "PLTR", "AVGO",
                   "AAPL", "TSLA", "GOOGL", "MSTR", "COIN", "BZ"}
 EQUITY_HINTS   = ("Inc", "Corp", "Technologies", "Platforms")
 COMMODITY_SYMBOLS = {"CL"}
 COMMODITY_HINTS   = ("Crude", "Oil", "Gold", "Silver")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("monitor")
-
-
 # ═══════════════════════════════════════════════════════════
 # УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════
-
 def parse_number(raw: Optional[str]) -> Optional[float]:
     if raw is None:
         return None
@@ -137,29 +117,19 @@ def parse_number(raw: Optional[str]) -> Optional[float]:
         return float(s) * mult
     except ValueError:
         return None
-
-
 def now_ts() -> int:
     return int(time.time())
-
-
 def esc(val) -> str:
     return html_mod.escape(str(val), quote=False)
-
-
 def fmt_pct(val) -> str:
     if val is None:
         return "—"
     sign = "+" if val > 0 else ""
     return f"{sign}{val:.1f}%"
-
-
 def fmt_num(val, suffix="", dec=1) -> str:
     if val is None:
         return "—"
     return f"{val:.{dec}f}{suffix}"
-
-
 def fmt_price(val) -> str:
     """Цена с адаптивной точностью: 4 знака для обычных, без экспоненты для малых."""
     if val is None:
@@ -167,20 +137,12 @@ def fmt_price(val) -> str:
     n = float(val)
     dec = 4 if abs(n) >= 0.01 else 10
     return f"{n:.{dec}f}".rstrip("0").rstrip(".")
-
-
 def safe(val, default=0.0) -> float:
     return val if val is not None else default
-
-
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
-
-
 def valid_price(p) -> bool:
     return p is not None and p > 0
-
-
 def classify_asset_class(r: dict) -> str:
     """crypto / equity / commodity. Метка для анализа, НЕ фильтр."""
     sym = r.get("symbol", "")
@@ -190,21 +152,26 @@ def classify_asset_class(r: dict) -> str:
     if sym in EQUITY_SYMBOLS or any(h in name for h in EQUITY_HINTS):
         return "equity"
     return "crypto"
-
-
-def price_at(price_full: dict, sym: str, ts_target: int) -> Optional[float]:
-    """Цена на/после ts_target из полного индекса (для горизонтов)."""
+def price_at(price_full: dict, sym: str, ts_target: int,
+             max_lag_sec: Optional[int] = None) -> Optional[float]:
+    """Цена на/после ts_target из полного индекса (для горизонтов).
+    [FIX R6] Если max_lag_sec задан и ближайшая доступная цена дальше от
+    ts_target, чем max_lag_sec — возвращаем None вместо «уехавшей» цены.
+    Это не даёт горизонту 30m стать по факту ценой через несколько часов
+    при пропусках снимков."""
     idx = price_full.get(sym, [])
     if not idx:
         return None
     i = bisect_left([t for t, _ in idx], ts_target)
-    return idx[i][1] if i < len(idx) else None
-
-
+    if i >= len(idx):
+        return None
+    found_ts, found_price = idx[i]
+    if max_lag_sec is not None and (found_ts - ts_target) > max_lag_sec:
+        return None
+    return found_price
 # ═══════════════════════════════════════════════════════════
 # 1. СБОР ДАННЫХ
 # ═══════════════════════════════════════════════════════════
-
 def fetch_html() -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -225,7 +192,6 @@ def fetch_html() -> str:
             cookies.append({"name": "cookies_accepted", "value": "1",
                             "domain": "coinalyze.net", "path": "/", "secure": True})
             ctx.add_cookies(cookies)
-
         page = ctx.new_page()
         stealth_sync(page)
         try:
@@ -249,14 +215,15 @@ def fetch_html() -> str:
         finally:
             browser.close()
     return html_text
-
-
 def parse_table(html_text: str) -> list[dict]:
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
     log.info(f"Строк: {len(rows)}")
     ts = now_ts()
     out = []
+    # [FIX R10] лёгкая sanity-проверка диапазонов — не блокирует прогон,
+    # только предупреждает о вероятном съезде колонок на сайте-источнике.
+    range_violations = 0
     for tr in rows:
         symbol = tr.get("data-coin")
         tds = tr.find_all("td")
@@ -264,7 +231,7 @@ def parse_table(html_text: str) -> list[dict]:
             continue
         spans = tds[1].find_all("span")
         name = spans[0].get_text(strip=True) if spans else (symbol or "?")
-        out.append({
+        rec = {
             "ts": ts, "symbol": symbol, "name": name,
             "price":           parse_number(tds[2].get_text(strip=True)),
             "price_chg24":     parse_number(tds[3].get_text(strip=True)),
@@ -285,10 +252,19 @@ def parse_table(html_text: str) -> list[dict]:
             "btc_corr7d":      parse_number(tds[20].get_text(strip=True)),
             "cvd24":           parse_number(tds[21].get_text(strip=True)),
             "lls24":           parse_number(tds[22].get_text(strip=True)),
-        })
+        }
+        cvd = rec.get("cvd24")
+        lls = rec.get("lls24")
+        if (cvd is not None and not (0 <= cvd <= 100)) or \
+           (lls is not None and not (0 <= lls <= 100)) or \
+           (rec.get("price") is not None and rec["price"] <= 0):
+            range_violations += 1
+        out.append(rec)
+    if range_violations:
+        log.warning(f"parse_table: {range_violations} строк с подозрительными "
+                    f"значениями (cvd24/lls24 вне 0-100 или price<=0) — "
+                    f"возможен съезд колонок на источнике")
     return out
-
-
 def fetch_data() -> list[dict]:
     html_text = fetch_html()
     DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
@@ -297,17 +273,12 @@ def fetch_data() -> list[dict]:
         send_tg("⚠️ <b>Monitor</b>\nДанные не получены. Проверь debug_page.html")
         sys.exit(1)
     return rows
-
-
 # ═══════════════════════════════════════════════════════════
 # 2. ХРАНЕНИЕ
 # ═══════════════════════════════════════════════════════════
-
 def append_jsonl(path: Path, rec: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -321,8 +292,6 @@ def load_jsonl(path: Path) -> list[dict]:
                 except json.JSONDecodeError:
                     continue
     return out
-
-
 def cleanup_jsonl(path: Path, ttl_days: int):
     if not path.exists():
         return
@@ -335,30 +304,52 @@ def cleanup_jsonl(path: Path, ttl_days: int):
             for r in fresh:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         log.info(f"Cleanup {path.name}: -{removed}")
-
-
+def _quarantine_corrupt_file(path: Path) -> Optional[Path]:
+    """[FIX R2/R4] Бэкапит битый файл рядом с оригиналом с меткой времени,
+    чтобы данные можно было руками восстановить/разобрать, а не потерять молча."""
+    if not path.exists():
+        return None
+    dest = path.with_name(f"{path.name}.corrupt.{now_ts()}")
+    try:
+        shutil.copy2(path, dest)
+        return dest
+    except Exception as e:
+        log.error(f"Не удалось сделать backup {path.name}: {e}")
+        return None
 def load_watchlist() -> dict:
+    """[FIX R2] При повреждении файла — backup + TG-алерт + остановка прогона.
+    Раньше здесь тихо возвращался {}, что могло привести к тому, что успешный
+    прогон перезапишет watchlist.json пустым/частичным состоянием и потеряет
+    все открытые сделки безвозвратно. Файл, который существует, но не парсится,
+    ЭТО НЕ «система молодая и файла ещё нет» (тот случай — FileNotFoundError,
+    обрабатывается веткой ниже и остаётся штатным поведением)."""
     if not WATCHLIST_FILE.exists():
         return {}
     try:
         data = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        log.warning("watchlist.json повреждён, начинаю с чистого")
-        return {}
+    except json.JSONDecodeError as e:
+        backup = _quarantine_corrupt_file(WATCHLIST_FILE)
+        msg = (f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\n"
+              f"Backup: {backup.name if backup else 'не создан'}\n"
+              f"Прогон остановлен, чтобы не потерять открытые сделки.")
+        log.error(msg.replace("<b>", "").replace("</b>", ""))
+        send_tg(msg)
+        sys.exit(1)
     # Integrity: trade_id без open_trade = потерянная сделка (survivorship risk).
     for sym, rec in data.items():
         if rec.get("trade_id") and not rec.get("open_trade"):
             log.error(f"CORRUPTION: {sym} has trade_id={rec.get('trade_id')} "
                       f"but no open_trade — сделка могла потеряться")
+        # [FIX R8] симметричная проверка обратного случая — инвариант
+        # "open_trade и trade_id — тогда и только тогда" должен работать в обе стороны.
+        if rec.get("open_trade") and not rec.get("trade_id"):
+            log.error(f"CORRUPTION: {sym} has open_trade but no trade_id — "
+                      f"нарушен инвариант открытой сделки")
     return data
-
-
 def save_watchlist(wl: dict):
     WATCHLIST_FILE.write_text(
         json.dumps(wl, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-
 def load_market_history() -> dict[str, list[dict]]:
     """Группировка по symbol за lifecycle-окно (для lifecycle)."""
     cutoff = now_ts() - LIFECYCLE_WINDOW_MIN * 60
@@ -375,8 +366,6 @@ def load_market_history() -> dict[str, list[dict]]:
     for sym in grouped:
         grouped[sym].sort(key=lambda x: x["ts"])
     return grouped
-
-
 def load_price_full() -> dict[str, list[tuple[int, float]]]:
     """Полный индекс цен (в пределах TTL файла) — для дотяжки горизонтов сделок."""
     recs = load_jsonl(MARKET_HISTORY_FILE)
@@ -388,19 +377,63 @@ def load_price_full() -> dict[str, list[tuple[int, float]]]:
     for sym in idx:
         idx[sym].sort(key=lambda x: x[0])
     return idx
-
-
+def load_existing_trade_ids() -> set:
+    """[FIX R3] Множество trade_id, уже финализированных в trades.jsonl.
+    Используется в flush_pending(), чтобы при повторном прогоне после
+    падения между append_jsonl(TRADES_FILE) и save_pending()/save_watchlist()
+    не записать ту же сделку дважды."""
+    ids = set()
+    for r in load_jsonl(TRADES_FILE):
+        tid = r.get("trade_id")
+        if tid:
+            ids.add(tid)
+    return ids
 def load_pending() -> list:
+    """Очередь закрытых сделок, ждущих горизонтов. Формат — JSONL (по записи
+    на строку); совместим с merge=union в .gitattributes. Умеет прочитать и
+    старый формат (единый JSON-массив) для миграции на лету."""
     if not PENDING_FILE.exists():
         return []
-    try:
-        data = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        log.error("CORRUPTION: pending_trades.json бит — начинаю с пустого "
-                  "(закрытые сделки из него могли потеряться)")
-        return []
+    raw = PENDING_FILE.read_text(encoding="utf-8")
+    stripped = raw.strip()
+    data = None
+    if stripped.startswith("["):
+        # Старый формат — единый JSON-массив. Разово мигрируем при чтении.
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            backup = _quarantine_corrupt_file(PENDING_FILE)
+            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json (legacy-формат) "
+                  f"повреждён: {e}\nBackup: {backup.name if backup else 'не создан'}\n"
+                  f"Прогон остановлен, чтобы не потерять закрытые сделки, "
+                  f"ждущие горизонтов.")
+            log.error(msg.replace("<b>", "").replace("</b>", ""))
+            send_tg(msg)
+            sys.exit(1)
+    else:
+        # Новый формат — JSONL. Битые отдельные строки пропускаем построчно
+        # (как и остальные *.jsonl в системе) — одна повреждённая строка не
+        # должна ронять всю очередь.
+        data = []
+        bad_lines = 0
+        for ln in raw.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                data.append(json.loads(ln))
+            except json.JSONDecodeError:
+                bad_lines += 1
+        if bad_lines:
+            log.warning(f"pending_trades.json: {bad_lines} битых строк пропущено")
     if not isinstance(data, list):
-        return []
+        backup = _quarantine_corrupt_file(PENDING_FILE)
+        msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json имеет неожиданный "
+              f"формат (не список). Backup: {backup.name if backup else 'не создан'}\n"
+              f"Прогон остановлен.")
+        log.error(msg.replace("<b>", "").replace("</b>", ""))
+        send_tg(msg)
+        sys.exit(1)
     # Дедуп по trade_id: страховка от дублей после любого не-serial мерджа.
     seen, out = set(), []
     for item in data:
@@ -413,18 +446,17 @@ def load_pending() -> list:
     if len(out) != len(data):
         log.warning(f"pending dedup: {len(data)} → {len(out)} (убрано дублей)")
     return out
-
-
 def save_pending(pending: list):
-    PENDING_FILE.write_text(
-        json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
+    """[FIX R19] JSONL-формат: по записи на строку, а не единый JSON-массив.
+    Это делает файл совместимым с merge=union (та же логика, что для
+    heartbeat.jsonl/snapshots.jsonl) — конфликт двух версий не бьёт весь
+    файл, а просто объединяет строки построчно."""
+    with open(PENDING_FILE, "w", encoding="utf-8") as f:
+        for item in pending:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 # ═══════════════════════════════════════════════════════════
 # 3. ФИЛЬТР ДЛЯ АРХИВА (snapshots.jsonl)
 # ═══════════════════════════════════════════════════════════
-
 def passes_filter(r: dict) -> bool:
     v = r.get("volume24")
     if v is None or v <= 1_000_000:
@@ -454,58 +486,44 @@ def passes_filter(r: dict) -> bool:
     if fr is not None and fr > 0.05:
         return False
     return True
-
-
 # ═══════════════════════════════════════════════════════════
 # 4. SCORING (0–10)
 # ═══════════════════════════════════════════════════════════
-
 def calculate_score(r: dict) -> tuple[int, list[str], list[str]]:
     score = 0
     pros: list[str] = []
     cons: list[str] = []
-
     cvd = r.get("cvd24")
     if cvd is not None:
         if cvd > 70:    score += 2; pros.append(f"CVD={cvd:.0f}>70")
         elif cvd >= 55: score += 1; pros.append(f"CVD={cvd:.0f}")
-
     lls = r.get("lls24")
     if lls is not None:
         if lls < 15:    score += 2; pros.append(f"LLS={lls:.0f}%<15")
         elif lls < 40:  score += 1; pros.append(f"LLS={lls:.0f}%")
         if lls > 50:    score -= 2; cons.append(f"LLS={lls:.0f}%>50")
-
     oi = r.get("oi_chg24_pct")
     if oi is not None:
         if 5 <= oi <= 35: score += 2; pros.append(f"OI24={oi:.1f}%")
         elif oi > 50:     score -= 2; cons.append(f"OI24={oi:.1f}%>50")
-
     oi4 = r.get("oi_chg4h_pct")
     if oi4 is not None and oi4 > 0:
         score += 1; pros.append(f"OI4h={oi4:.1f}%")
-
     pc = r.get("price_chg24")
     if pc is not None:
         if 2 <= pc <= 10: score += 1; pros.append(f"P={pc:.1f}%")
         elif pc > 20:     score -= 2; cons.append(f"P={pc:.1f}%>20")
-
     fr = r.get("fr_oiw")
     if fr is not None:
         if -0.01 <= fr <= 0.03: score += 1; pros.append(f"FR={fr:.4f}")
         elif fr > 0.05:         score -= 2; cons.append(f"FR={fr:.4f}>0.05")
-
     oim = r.get("oi_mktcap_ratio")
     if oim is not None and oim < 0.10:
         score += 1; pros.append(f"OI/Mc={oim:.3f}")
-
     return score, pros, cons
-
-
 # ═══════════════════════════════════════════════════════════
 # 5. ПРОИЗВОДНЫЕ МЕТРИКИ + ДИВЕРГЕНЦИИ
 # ═══════════════════════════════════════════════════════════
-
 def calc_derived(snaps: list[dict]) -> dict:
     n = len(snaps)
     d = {
@@ -522,7 +540,6 @@ def calc_derived(snaps: list[dict]) -> dict:
     }
     if n < 2:
         return d
-
     def trend(vals):
         clean = [v for v in vals if v is not None]
         if len(clean) < 2:
@@ -534,29 +551,23 @@ def calc_derived(snaps: list[dict]) -> dict:
         if diff < -base * 0.05:
             return "down"
         return "flat"
-
     d["oi_trend"]    = trend([s.get("oi_chg24_pct") for s in snaps])
     d["cvd_trend"]   = trend([s.get("cvd24") for s in snaps])
     d["price_trend"] = trend([s.get("price_chg24") for s in snaps])
     d["oi4h_trend"]  = trend([s.get("oi_chg4h_pct") for s in snaps])
-
     if n >= 3:
         oi = [safe(s.get("oi_chg24_pct")) for s in snaps[-3:]]
         d["oi_accel"] = (oi[2] - oi[1]) - (oi[1] - oi[0])
-
     if n >= 4:
         d["cvd_momentum"] = safe(snaps[-1].get("cvd24")) - safe(snaps[-4].get("cvd24"))
     elif n >= 2:
         d["cvd_momentum"] = safe(snaps[-1].get("cvd24")) - safe(snaps[0].get("cvd24"))
-
     if n >= 3:
         pc = [safe(s.get("price_chg24")) for s in snaps[-3:]]
         d["price_accel"] = (pc[2] - pc[1]) - (pc[1] - pc[0])
-
     if n >= 3:
         fr = [safe(s.get("fr_oiw")) for s in snaps[-3:]]
         d["funding_pressure"] = (fr[2] - fr[1]) - (fr[1] - fr[0])
-
     if d["price_trend"] == "up" and d["oi_trend"] == "down":
         d["divergence"] = "price_up_oi_down"
         d["note"] = "Цена ↑ OI ↓ — рост на закрытии шортов"
@@ -578,54 +589,39 @@ def calc_derived(snaps: list[dict]) -> dict:
             d["note"] = "LLS ↑ Price ↑ — поздняя стадия"
     elif d["oi_trend"] != "down" and d["cvd_trend"] != "down" and d["price_trend"] == "up":
         d["note"] = "Здоровое движение: Price↑ OI и CVD не падают"
-
     return d
-
-
 # ═══════════════════════════════════════════════════════════
 # 6. MOMENTUM SCORE
 # ═══════════════════════════════════════════════════════════
-
 def calc_momentum(derived: dict) -> tuple[int, list[str]]:
     m = 0
     tags: list[str] = []
-
     if derived["oi_accel"] > 0:
         m += 2; tags.append("OI accel↑")
     elif derived["oi_accel"] < 0:
         m -= 1; tags.append("OI accel↓")
-
     if derived["cvd_momentum"] > 5:
         m += 2; tags.append("CVD mom↑")
     elif derived["cvd_momentum"] < -5:
         m -= 1; tags.append("CVD mom↓")
-
     if derived["price_accel"] > 0:
         m += 1; tags.append("Price accel↑")
-
     if derived["funding_pressure"] <= 0:
         m += 1; tags.append("Funding stable")
     else:
         tags.append("Funding↑")
-
     if derived["oi4h_trend"] == "up":
         m += 1; tags.append("OI4h↑")
-
     if derived["divergence"] == "none":
         m += 2; tags.append("No divergence")
     else:
         m -= 2; tags.append(f"Div: {derived['divergence']}")
-
     if derived["oi_trend"] == "up" and derived["cvd_trend"] == "up":
         m += 1; tags.append("OI+CVD sync↑")
-
     return clamp(m, 0, 10), tags
-
-
 # ═══════════════════════════════════════════════════════════
 # 7. PATTERN ENGINE
 # ═══════════════════════════════════════════════════════════
-
 def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
     pc   = safe(r.get("price_chg24"))
     oi24 = safe(r.get("oi_chg24_pct"))
@@ -634,50 +630,39 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
     fr   = safe(r.get("fr_oiw"))
     ls   = r.get("ls_accounts")
     div  = derived["divergence"]
-
+    # [FIX R21] добавлено pc > 15 — синхронизировано с порогом EXHAUSTION в
+    # detect_lifecycle(), чтобы entry_pattern="Exhaustion" не записывался у
+    # сделок, чей entry_state фактически ACCELERATION/CONFIRMED_TREND.
     if cvd > 90 and (fr > 0.03 or derived["funding_pressure"] > 0.005) \
-            and derived["oi_accel"] < 0:
+            and derived["oi_accel"] < 0 and pc > 15:
         return "Exhaustion"
-
     if div == "funding_up_oi_down" or (pc > 5 and derived["oi_trend"] == "down"):
         return "Distribution"
-
     if oi24 < -10 and lls > 45 and derived["cvd_trend"] == "up":
         return "Capitulation"
-
     if pc > 10 and oi24 > 20 and derived["cvd_trend"] == "down":
         return "Late Trend"
-
     if pc > 0 and oi24 > 5 and lls > 35 and ls is not None and ls < 1.0:
         return "Short Squeeze"
-
     if (pc < 3 and derived["cvd_trend"] == "up" and fr < 0.005
             and oi24 > 0 and div == "none"):
         return "Stealth Accumulation"
-
     if momentum >= 7 and derived["oi_accel"] > 2 and derived["cvd_momentum"] > 10:
         return "Momentum Expansion"
-
     if (pc > 0 and oi24 > 5 and cvd > 60 and lls < 30
             and derived["oi_trend"] != "down" and div == "none"):
         return "Healthy Trend"
-
     return "—"
-
-
 # ═══════════════════════════════════════════════════════════
 # 8. MARKET PHASE DETECTION
 # ═══════════════════════════════════════════════════════════
-
 def detect_market_phase(rows: list[dict]) -> dict:
     btc = next((r for r in rows if r["symbol"] == "BTCUSDT"), None)
     if not btc:
         return {"phase": "unknown", "note": "", "modifier": 0}
-
     btc_pc = safe(btc.get("price_chg24"))
     up = sum(1 for r in rows if safe(r.get("price_chg24")) > 0)
     ratio = up / max(len(rows), 1)
-
     if btc_pc > 2 and ratio > 0.6:
         return {"phase": "risk-on", "note": "BTC↑ рынок широкий", "modifier": +1}
     if btc_pc > 2 and ratio < 0.4:
@@ -687,14 +672,11 @@ def detect_market_phase(rows: list[dict]) -> dict:
     if btc_pc < -2 and ratio > 0.5:
         return {"phase": "rotation", "note": "BTC↓ альты держатся", "modifier": 0}
     return {"phase": "neutral", "note": "", "modifier": 0}
-
-
 # ═══════════════════════════════════════════════════════════
 # 9. LIFECYCLE ENGINE
 #    Возвращает (state, reasons, warnings, entry_path).
 #    entry_path = "classic" / "early" / None — для журнала сделок.
 # ═══════════════════════════════════════════════════════════
-
 ACTIONS = {
     "NEUTRAL":         "IGNORE",
     "ACCUMULATION":    "WATCH",
@@ -705,13 +687,11 @@ ACTIONS = {
     "DISTRIBUTION":    "EXIT_AVOID",
     "INVALIDATED":     "REMOVE",
 }
-
 STATE_EMOJI = {
     "NEUTRAL": "⚪", "ACCUMULATION": "🔍", "EARLY_MOVE": "🌱",
     "CONFIRMED_TREND": "🟢", "ACCELERATION": "🚀",
     "EXHAUSTION": "🟠", "DISTRIBUTION": "🔴", "INVALIDATED": "❌",
 }
-
 ALLOWED_FROM = {
     "ACCUMULATION":    {"NEUTRAL", "ACCUMULATION"},
     "EARLY_MOVE":      {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE"},
@@ -722,46 +702,35 @@ ALLOWED_FROM = {
     "INVALIDATED":     {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE", "CONFIRMED_TREND",
                         "ACCELERATION", "EXHAUSTION", "DISTRIBUTION", "INVALIDATED"},
 }
-
-
 def detect_lifecycle(symbol: str, snaps: list[dict],
                      score: int, derived: dict,
                      prev_state: str = "NEUTRAL"
                      ) -> tuple[str, list[str], list[str], Optional[str]]:
-
     n = len(snaps)
     reasons: list[str] = []
     warnings: list[str] = []
-
     if n < 2:
         return "NEUTRAL", ["недостаточно данных"], [], None
-
     last = snaps[-1]
-
     if last.get("cvd24") is None or last.get("oi_chg24_pct") is None:
         return "NEUTRAL", ["нет данных CVD/OI"], [], None
-
     pc   = safe(last.get("price_chg24"))
     oi24 = safe(last.get("oi_chg24_pct"))
     oi4h = safe(last.get("oi_chg4h_pct"))
     cvd  = safe(last.get("cvd24"))
     lls  = safe(last.get("lls24"))
     fr   = safe(last.get("fr_oiw"))
-
     oi_accel    = derived["oi_accel"]
     cvd_mom     = derived["cvd_momentum"]
     price_accel = derived["price_accel"]
     fund_press  = derived["funding_pressure"]
-
     def allowed(target: str) -> bool:
         return prev_state in ALLOWED_FROM.get(target, set())
-
     if oi24 < -5 and cvd < 40:
         reasons.append(f"OI24={oi24:.1f}%<-5, CVD={cvd:.0f}<40")
         if pc < -3:
             reasons.append(f"Price={pc:.1f}% — структура сломана")
         return "INVALIDATED", reasons, warnings, None
-
     if allowed("DISTRIBUTION") and n >= 2:
         oi4h_prev = safe(snaps[-2].get("oi_chg4h_pct"))
         if oi4h < 0 and oi4h_prev < 0 and cvd_mom < -10:
@@ -771,14 +740,12 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             if fr > 0.02:
                 reasons.append(f"FR={fr:.4f} — остаётся высоким")
             return "DISTRIBUTION", reasons, warnings, None
-
     if allowed("EXHAUSTION"):
         if cvd > 90 and (fr > 0.03 or fund_press > 0.005) and oi_accel < 0 and pc > 15:
             reasons.append(f"CVD={cvd:.0f}>90, FR={fr:.4f}, fund_press={fund_press:.4f}")
             reasons.append(f"OI accel={oi_accel:.1f}<0 — замедление")
             warnings.append(f"Price={pc:.1f}% — вертикальный рост")
             return "EXHAUSTION", reasons, warnings, None
-
     if allowed("ACCELERATION"):
         if (n >= 3 and oi_accel > 2 and cvd_mom > 10 and price_accel >= 1
                 and derived["oi_trend"] != "down"
@@ -791,10 +758,8 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             if pc > 10:
                 warnings.append(f"Price={pc:.1f}% — уже вырос")
             return "ACCELERATION", reasons, warnings, None
-
     if allowed("CONFIRMED_TREND") and n >= MIN_SNAPS_LIFECYCLE:
         recent = snaps[-MIN_SNAPS_LIFECYCLE:]
-
         oi_not_falling = all(
             safe(recent[i].get("oi_chg24_pct")) >=
             safe(recent[i - 1].get("oi_chg24_pct")) - 1
@@ -817,14 +782,12 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
         )
         pc_net_up = (safe(recent[-1].get("price_chg24"))
                      >= safe(recent[0].get("price_chg24")) - 0.5)
-
         oi_growing_faster = False
         if len(recent) >= 3:
             ov = [safe(s.get("oi_chg24_pct")) for s in recent[-3:]]
             d1 = ov[1] - ov[0]
             d2 = ov[2] - ov[1]
             oi_growing_faster = d2 > d1 and d1 > 0
-
         path_a = (
             all(safe(s.get("oi_chg24_pct")) > 5 for s in recent)
             and all(safe(s.get("cvd24")) > 55 for s in recent)
@@ -835,16 +798,13 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             and oi_growing_faster
             and cvd_mom > 5
         )
-
         trends_ok = (derived["cvd_trend"] != "down"
                      and derived["oi_trend"] != "down")
-
         if ((path_a or path_b)
                 and all_oi4 and all_fr and all_lls
                 and all_pc and pc_net_up
                 and oi_not_falling and cvd_not_falling
                 and trends_ok):
-
             is_early = path_b and not path_a
             if is_early:
                 reasons.append("Раннее подтверждение: OI>2 CVD>50 + ускорение + momentum")
@@ -856,7 +816,6 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
             if oi_accel <= 0:
                 warnings.append("OI не ускоряется")
             return "CONFIRMED_TREND", reasons, warnings, ("early" if is_early else "classic")
-
     if allowed("EARLY_MOVE") and n >= 3:
         last3 = snaps[-3:]
         price_up = all(
@@ -878,26 +837,20 @@ def detect_lifecycle(symbol: str, snaps: list[dict],
         if price_up and oi_up and cvd_up and vol_up:
             reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑")
             return "EARLY_MOVE", reasons, warnings, None
-
     if allowed("ACCUMULATION") and n >= 3:
         last3 = snaps[-3:]
         oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
         cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / 3
         fr_ok   = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.03
                       for s in last3)
-
         if oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok:
             reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
             reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
             return "ACCUMULATION", reasons, warnings, None
-
     return "NEUTRAL", ["нет подтверждённого движения"], warnings, None
-
-
 # ═══════════════════════════════════════════════════════════
 # 10. CONFIDENCE (0–100)
 # ═══════════════════════════════════════════════════════════
-
 def calc_confidence(state: str, snaps: list[dict], score: int,
                     derived: dict, market_mod: int) -> int:
     base = {
@@ -905,11 +858,9 @@ def calc_confidence(state: str, snaps: list[dict], score: int,
         "CONFIRMED_TREND": 70, "ACCELERATION": 80,
         "EXHAUSTION": 75, "DISTRIBUTION": 70, "INVALIDATED": 90,
     }.get(state, 50)
-
     snap_bonus   = min(len(snaps), 10) * 2
     score_bonus  = score
     market_bonus = market_mod * 3
-
     penalty = 0
     if derived["divergence"] != "none":
         penalty += 15
@@ -917,14 +868,10 @@ def calc_confidence(state: str, snaps: list[dict], score: int,
         penalty += 10
     if len(snaps) > 0 and safe(snaps[-1].get("cvd24")) > 95 and state == "ACCELERATION":
         penalty += 5
-
     return clamp(base + snap_bonus + score_bonus + market_bonus - penalty, 0, 100)
-
-
 # ═══════════════════════════════════════════════════════════
 # 11. ENTRY EARLINESS
 # ═══════════════════════════════════════════════════════════
-
 def entry_earliness(r: dict) -> tuple[float, str]:
     pc_pos = min(safe(r.get("price_chg24")) / 15.0, 1.0)
     oi_pos = min(safe(r.get("oi_chg24_pct")) / 50.0, 1.0)
@@ -932,12 +879,9 @@ def entry_earliness(r: dict) -> tuple[float, str]:
     avg = (pc_pos + oi_pos + fr_pos) / 3
     label = "ранняя" if avg < 0.35 else "средняя" if avg < 0.65 else "поздняя"
     return avg, label
-
-
 # ═══════════════════════════════════════════════════════════
 # 12. TELEGRAM
 # ═══════════════════════════════════════════════════════════
-
 def send_tg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("TG не настроен")
@@ -965,8 +909,6 @@ def send_tg(text: str):
             time.sleep(0.4)
         except Exception as e:
             log.error(f"TG: {e}")
-
-
 def format_signal(symbol: str, wl: dict, cur: dict,
                   snaps: list[dict], reasons: list[str],
                   warnings: list[str], market: dict) -> str:
@@ -980,20 +922,15 @@ def format_signal(symbol: str, wl: dict, cur: dict,
     derived = cur.get("derived", {})
     prev    = wl.get("previous_state", "")
     s = snaps[-1] if snaps else {}
-
     ar = {"up": "↑", "down": "↓", "flat": "→"}
     oi_t  = ar.get(derived.get("oi_trend"), "→")
     cvd_t = ar.get(derived.get("cvd_trend"), "→")
     prc_t = ar.get(derived.get("price_trend"), "→")
-
     _, early_label = entry_earliness(s)
     line = "━━━━━━━━━━━━━━━━━━"
-
     reas  = " · ".join(reasons[:3]) if reasons else ""
     warns = " · ".join(warnings[:3]) if warnings else ""
-
     prev_line = f" ({esc(prev)} →)" if prev and prev != state else ""
-
     msg = (
         f"{emoji} <b>{esc(cur.get('name', symbol))} ({esc(symbol)})</b>\n"
         f"{line}\n"
@@ -1019,46 +956,46 @@ def format_signal(symbol: str, wl: dict, cur: dict,
     if warns:
         msg += f"⚠️ {esc(warns)}\n"
     return msg
-
-
 def format_trade_close(rec: dict) -> str:
-    """Итог закрытой сделки для Telegram."""
+    """Итог закрытой сделки для Telegram.
+    [FIX R9] Все потенциально-None поля идут через fmt_num()/безопасные
+    форматтеры вместо f"{...:.0f}", которое падало на legacy/повреждённых
+    open_trade без entry_cvd_momentum — исключение здесь раньше могло
+    происходить уже ПОСЛЕ PENDING.append(), но ДО save_pending()/
+    save_watchlist(), т.е. роняло прогон с несохранённым состоянием."""
     pnl = rec.get("strategy_pnl_pct")
     pnl_s = ("—" if pnl is None else f"{pnl:+.1f}%")
     emoji = "💚" if (pnl is not None and pnl > 0) else "💔" if (pnl is not None and pnl < 0) else "➖"
     peak = rec.get("max_pnl_pct")
     dd = rec.get("drawdown_from_peak_pct")
     line = "━━━━━━━━━━━━━━━━━━"
+    stale_min = rec.get("exit_price_stale_min")
+    stale_note = f" (цена устарела на {fmt_num(stale_min, ' мин', 0)})" if stale_min else ""
     msg = (
         f"{emoji} <b>{esc(rec.get('name', rec['symbol']))} ({esc(rec['symbol'])})</b> — сделка закрыта\n"
         f"{line}\n"
-        f"Вход {fmt_price(rec.get('entry_price'))} → Выход {fmt_price(rec.get('exit_price'))}   <b>{pnl_s}</b>\n"
+        f"Вход {fmt_price(rec.get('entry_price'))} → Выход {fmt_price(rec.get('exit_price'))}{esc(stale_note)}   <b>{pnl_s}</b>\n"
         f"Держали {rec.get('hold_min')} мин · пик {fmt_pct(peak)} · просадка {fmt_pct(-dd if dd else None)}\n"
         f"Выход по: {esc(rec.get('exit_reason'))}\n"
         f"Вход был: {esc(rec.get('entry_path'))} · mom {rec.get('entry_momentum')} · "
-        f"cvd_m {rec.get('entry_cvd_momentum'):.0f} · {esc(rec.get('entry_pattern'))} · "
+        f"cvd_m {fmt_num(rec.get('entry_cvd_momentum'), dec=0)} · {esc(rec.get('entry_pattern'))} · "
         f"{esc(rec.get('entry_earliness_label'))}\n"
     )
     r60 = rec.get("return_60m")
     if r60 is not None:
         msg += f"Signal@60m: {r60:+.1f}%\n"
     return msg
-
-
 # ═══════════════════════════════════════════════════════════
 # 13. LLM — ВЕРИФИКАТОР
 # ═══════════════════════════════════════════════════════════
-
 def llm_verify(symbol: str, wl: dict, cur: dict,
                snaps: list[dict]) -> Optional[dict]:
     if not ENABLE_LLM or not QWEN_API_KEY:
         return None
-
     state   = wl["state"]
     conf    = wl.get("confidence", 0)
     action  = ACTIONS.get(state, "")
     derived = cur.get("derived", {})
-
     recent = snaps[-5:]
     snap_txt = "\n".join(
         f"  ts={s['ts']} P={s.get('price_chg24')} OI24={s.get('oi_chg24_pct')} "
@@ -1066,7 +1003,6 @@ def llm_verify(symbol: str, wl: dict, cur: dict,
         f"FR={s.get('fr_oiw')}"
         for s in recent
     )
-
     user_msg = (
         f"Монета: {symbol}\n"
         f"State: {state}\nConfidence: {conf}%\nAction: {action}\n"
@@ -1081,7 +1017,6 @@ def llm_verify(symbol: str, wl: dict, cur: dict,
         f'Верни JSON: {{"agree": true/false, "reason": "одно предложение", '
         f'"risk": "low/medium/high"}}'
     )
-
     try:
         resp = requests.post(
             f"{QWEN_BASE_URL.rstrip('/')}/chat/completions",
@@ -1101,26 +1036,25 @@ def llm_verify(symbol: str, wl: dict, cur: dict,
     except Exception as e:
         log.warning(f"LLM: {e}")
     return None
-
-
 # ═══════════════════════════════════════════════════════════
 # 14. ЖУРНАЛ СДЕЛОК
 # ═══════════════════════════════════════════════════════════
-
 def _fill_horizons(ot: dict, sym: str, as_of_ts: int, price_full: dict):
-    """Дотянуть наступившие к as_of_ts горизонты из полного индекса цен."""
+    """Дотянуть наступившие к as_of_ts горизонты из полного индекса цен.
+    [FIX R6] price_at() теперь ограничен max_lag_sec — горизонт остаётся
+    None, если ближайшая цена дальше HORIZON_MAX_LAG_MIN от целевого времени,
+    вместо того чтобы подставить сильно устаревшую/будущую цену."""
     ep = ot.get("entry_price")
     if not ep:
         return
+    max_lag = HORIZON_MAX_LAG_MIN * 60
     for h in TRADE_HORIZONS:
         key = f"return_{h}m"
         if ot.get(key) is None and as_of_ts >= ot["entry_ts"] + h * 60:
-            ph = price_at(price_full, sym, ot["entry_ts"] + h * 60)
+            ph = price_at(price_full, sym, ot["entry_ts"] + h * 60, max_lag_sec=max_lag)
             if ph:
                 ot[key] = round((ph - ep) / ep * 100, 3)
                 ot[f"{key}_available"] = True
-
-
 def open_trade_record(r: dict, ts: int, state: str, path: Optional[str],
                       score: int, momentum: int, conf: int,
                       early_val: float, early_label: str, pattern: str,
@@ -1174,28 +1108,52 @@ def open_trade_record(r: dict, ts: int, state: str, path: Optional[str],
         ot[f"return_{h}m"] = None
         ot[f"return_{h}m_available"] = False
     return ot
-
-
+def _exit_meta(source: str, exit_ts: int, last_price_ts: Optional[int]) -> tuple[str, float]:
+    """[FIX R7] Метаданные о происхождении цены выхода.
+    source: 'live' — цена взята из текущего прогона (свежая, current_symbols);
+            'last_seen' — использована последняя известная last_price, т.к.
+            монета выпала из фильтра/снята (MISSED, либо cur_price недоступна).
+    Возвращает (source, stale_min) — на сколько минут цена выхода старше exit_ts."""
+    if last_price_ts is None:
+        return source, 0.0
+    stale_min = round(max(0, exit_ts - last_price_ts) / 60, 1)
+    return source, stale_min
 def close_trade(ot: dict, symbol: str, exit_ts: int, exit_price: Optional[float],
-                exit_reason: str, exit_state: str, price_full: dict):
-    """Собрать строку сделки → в pending (ждёт горизонтов) → TG-итог сразу."""
+                exit_reason: str, exit_state: str, price_full: dict,
+                exit_price_source: str = "live"):
+    """Собрать строку сделки → в pending (ждёт горизонтов) → TG-итог сразу.
+    [FIX R5] max_pnl_pct/min_pnl_pct/peak_ts пересчитываются с учётом цены
+    ВЫХОДА перед вычислением drawdown/time_to_peak — раньше экстремумы
+    отражали только последний прогон ДО закрытия и не учитывали случай,
+    когда сама цена выхода является новым пиком/дном (эмпирически
+    подтверждено на реальных данных: ADA_1785667563, min_pnl_pct=-0.106%
+    при gross_pnl_pct=-0.903%).
+    [FIX R7] exit_price_source/exit_price_stale_min — прозрачность
+    происхождения цены выхода (особенно для MISSED, где last_price может
+    быть устаревшей на несколько прогонов)."""
     ep = ot.get("entry_price")
     _fill_horizons(ot, symbol, exit_ts, price_full)
-
     gross = round((exit_price - ep) / ep * 100, 3) if (exit_price and ep) else None
-    strategy_pnl = round(gross - FEE_PCT, 3) if gross is not None else None
-    hold_min = round((exit_ts - ot["entry_ts"]) / 60, 1)
+    # [FIX R5] Обновить экстремумы ценой выхода ДО расчёта drawdown/time_to_peak.
     max_pnl = ot.get("max_pnl_pct", 0.0)
     min_pnl = ot.get("min_pnl_pct", 0.0)
+    peak_ts = ot.get("peak_ts", ot["entry_ts"])
+    if gross is not None:
+        if gross > max_pnl:
+            max_pnl = gross
+            peak_ts = exit_ts
+        if gross < min_pnl:
+            min_pnl = gross
+    strategy_pnl = round(gross - FEE_PCT, 3) if gross is not None else None
+    hold_min = round((exit_ts - ot["entry_ts"]) / 60, 1)
     drawdown = round(max_pnl - gross, 3) if (gross is not None) else None
-    time_to_peak = round((ot.get("peak_ts", ot["entry_ts"]) - ot["entry_ts"]) / 60, 1)
-
+    time_to_peak = round((peak_ts - ot["entry_ts"]) / 60, 1)
+    _, stale_min = _exit_meta(exit_price_source, exit_ts, ot.get("last_price_ts"))
     def winflag(h):
         v = ot.get(f"return_{h}m")
         if v is None:
             return None
         return 1 if v >= TRADE_WIN_PCT else 0
-
     rec = {
         "schema_version": TRADE_SCHEMA_VERSION,
         "trade_id": f"{symbol}_{ot['entry_ts']}",
@@ -1208,6 +1166,8 @@ def close_trade(ot: dict, symbol: str, exit_ts: int, exit_price: Optional[float]
         "exit_price": exit_price,
         "exit_reason": exit_reason,
         "exit_state": exit_state,
+        "exit_price_source": exit_price_source,
+        "exit_price_stale_min": stale_min,
         "closed_before_60m": hold_min < 60,
         "hold_min": hold_min,
         "entry_state": ot.get("entry_state"),
@@ -1254,17 +1214,19 @@ def close_trade(ot: dict, symbol: str, exit_ts: int, exit_price: Optional[float]
         rec[f"return_{h}m_available"] = bool(ot.get(f"return_{h}m_available"))
     rec["win_60m"] = winflag(60)
     rec["win_120m"] = winflag(120)
-
     # НЕ в trades.jsonl — в pending, пока горизонты не дотянутся.
     PENDING.append({"rec": rec, "entry_ts": ot["entry_ts"],
                     "symbol": symbol, "entry_price": ep})
     log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} "
              f"hold={hold_min}m (ждёт горизонты)")
     send_tg(format_trade_close(rec))
-
-
-def flush_pending(price_full: dict, now: int):
-    """Дотянуть наступившие горизонты; готовые → trades.jsonl (append-only)."""
+def flush_pending(price_full: dict, now: int, existing_trade_ids: set):
+    """Дотянуть наступившие горизонты; готовые → trades.jsonl (append-only).
+    [FIX R3] existing_trade_ids — множество trade_id, уже присутствующих в
+    trades.jsonl на момент старта прогона. Если запись из PENDING имеет
+    trade_id, который уже там есть (например, из-за падения между append и
+    save_pending()/save_watchlist() в прошлом прогоне) — пропускаем повторную
+    запись, а не дублируем строку."""
     global PENDING
     grace = PENDING_GRACE_MIN * 60
     wait_max = (max(TRADE_HORIZONS) + PENDING_WAIT_MAX_MIN) * 60
@@ -1272,10 +1234,16 @@ def flush_pending(price_full: dict, now: int):
     for item in PENDING:
         rec = item["rec"]
         sym, ep, ets = item["symbol"], item["entry_price"], item["entry_ts"]
+        tid = rec.get("trade_id")
+        if tid and tid in existing_trade_ids:
+            log.warning(f"[{sym}] DUP_FINALIZED_SKIP trade_id={tid} — "
+                        f"уже есть в trades.jsonl, не дублирую")
+            continue
         for h in TRADE_HORIZONS:
             key = f"return_{h}m"
             if rec.get(key) is None and now >= ets + h * 60:
-                ph = price_at(price_full, sym, ets + h * 60)
+                ph = price_at(price_full, sym, ets + h * 60,
+                             max_lag_sec=HORIZON_MAX_LAG_MIN * 60)
                 if ph and ep:
                     rec[key] = round((ph - ep) / ep * 100, 3)
                     rec[f"{key}_available"] = True
@@ -1299,69 +1267,60 @@ def flush_pending(price_full: dict, now: int):
             else:
                 rec["pending_finalize_reason"] = "MISSING_PRICE"
             append_jsonl(TRADES_FILE, rec)
+            if tid:
+                existing_trade_ids.add(tid)
             log.info(f"[{sym}] TRADE FINALIZED trade_id={rec['trade_id']} "
                      f"reason={rec['pending_finalize_reason']}")
         else:
             still.append(item)
     PENDING = still
-
-
 # ═══════════════════════════════════════════════════════════
 # 15. ОСНОВНОЙ ПРОГОН
 # ═══════════════════════════════════════════════════════════
-
 TG_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ACTIVE_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ENTRY_STATES = {"CONFIRMED_TREND", "ACCELERATION"}
 CLOSE_STATES = {"EXHAUSTION", "DISTRIBUTION"}   # INVALIDATED обработан отдельно
-
-
 def run():
     log.info("═══ Прогон ═══")
-
+    # [FIX R2/R4] Загрузка состояния — в самом начале, до записи текущего
+    # прогона в market_history/heartbeat. Если watchlist/pending биты,
+    # load_watchlist()/load_pending() остановят прогон (sys.exit(1)) ДО
+    # того, как что-либо будет дописано — так проще диагностировать и
+    # восстановить состояние вручную из .corrupt.<ts> бэкапа.
+    wl_all = load_watchlist()
+    global PENDING
+    PENDING = load_pending()
+    existing_trade_ids = load_existing_trade_ids()
     rows = fetch_data()
     log.info(f"Монет после discovery-фильтра: {len(rows)}")
-
     market = detect_market_phase(rows)
     log.info(f"Market: {market['phase']} {market['note']}")
-
-    wl_all = load_watchlist()
     current_symbols = {r["symbol"] for r in rows}
-
     ts = now_ts()
     for r in rows:
         append_jsonl(HEARTBEAT_FILE, {"ts": ts, "symbol": r["symbol"],
                                       "price": r.get("price")})
         append_jsonl(MARKET_HISTORY_FILE, r)
-
     history_all = load_market_history()
     price_full = load_price_full()   # полный индекс цен для горизонтов сделок
-
-    global PENDING
-    PENDING = load_pending()
-
     # ── Анализ монет, присутствующих в таблице ──
     for sym, hist in history_all.items():
         if not hist:
             continue
         if sym not in current_symbols:
             continue
-
         r = hist[-1]
         cur_price = r.get("price") if valid_price(r.get("price")) else None
-
         raw_score, pros, cons = calculate_score(r)
         score = clamp(raw_score + market["modifier"], 0, 10)
-
         derived = calc_derived(hist)
         momentum, mom_tags = calc_momentum(derived)
         pattern = detect_pattern(r, derived, momentum)
-
         prev_state = wl_all.get(sym, {}).get("state", "NEUTRAL")
         state, reasons, warnings, path = detect_lifecycle(
             sym, hist, score, derived, prev_state
         )
-
         # ── NEUTRAL: гистерезис + закрытие сделки при снятии ──
         if state == "NEUTRAL":
             if sym in wl_all:
@@ -1373,9 +1332,11 @@ def run():
                     if nr >= NEUTRAL_HYSTERESIS:
                         ot = wl_all[sym].get("open_trade")
                         if ot:
-                            close_trade(ot, sym, ts,
-                                        cur_price or ot.get("last_price"),
-                                        "NEUTRAL", old, price_full)
+                            exit_price = cur_price or ot.get("last_price")
+                            src = "live" if cur_price else "last_seen"
+                            close_trade(ot, sym, ts, exit_price,
+                                        "NEUTRAL", old, price_full,
+                                        exit_price_source=src)
                         send_tg(
                             f"⚪ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1390,22 +1351,25 @@ def run():
                 else:
                     ot = wl_all[sym].get("open_trade")
                     if ot:
-                        close_trade(ot, sym, ts,
-                                    cur_price or ot.get("last_price"),
-                                    "NEUTRAL", old, price_full)
+                        exit_price = cur_price or ot.get("last_price")
+                        src = "live" if cur_price else "last_seen"
+                        close_trade(ot, sym, ts, exit_price,
+                                    "NEUTRAL", old, price_full,
+                                    exit_price_source=src)
                     log.info(f"[{sym}] {old} → NEUTRAL, remove")
                     del wl_all[sym]
             continue
-
         # ── INVALIDATED: терминально + закрытие сделки ──
         if state == "INVALIDATED":
             if sym in wl_all:
                 old = wl_all[sym]["state"]
                 ot = wl_all[sym].get("open_trade")
                 if ot:
-                    close_trade(ot, sym, ts,
-                                cur_price or ot.get("last_price"),
-                                "INVALIDATED", state, price_full)
+                    exit_price = cur_price or ot.get("last_price")
+                    src = "live" if cur_price else "last_seen"
+                    close_trade(ot, sym, ts, exit_price,
+                                "INVALIDATED", state, price_full,
+                                exit_price_source=src)
                 send_tg(
                     f"❌ <b>{esc(wl_all[sym].get('name', sym))} ({esc(sym)})</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -1415,27 +1379,25 @@ def run():
                 log.info(f"[{sym}] INVALIDATED → remove")
                 del wl_all[sym]
             continue
-
         conf = calc_confidence(state, hist, score, derived, market["modifier"])
         early_val, early_label = entry_earliness(r)
-
         # ── Управление открытой сделкой ──
         existing = wl_all.get(sym, {})
         ot = existing.get("open_trade")
         tid = existing.get("trade_id")
         new_ot, new_tid = None, None
-
         if ot is not None:
             close_reason = None
             if state in CLOSE_STATES:
                 close_reason = state
             elif ts - ot["entry_ts"] >= TRADE_TIMEOUT_MIN * 60:
                 close_reason = "TIMEOUT"
-
             if close_reason:
-                close_trade(ot, sym, ts,
-                            cur_price or ot.get("last_price"),
-                            close_reason, state, price_full)
+                exit_price = cur_price or ot.get("last_price")
+                src = "live" if cur_price else "last_seen"
+                close_trade(ot, sym, ts, exit_price,
+                            close_reason, state, price_full,
+                            exit_price_source=src)
                 new_ot, new_tid = None, None
             else:
                 ot = dict(ot)
@@ -1462,7 +1424,6 @@ def run():
                     existing.get("snapshots", 0) + 1, cur_price,
                 )
                 log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
-
         # ── Перезапись watchlist (сохраняем open_trade/trade_id, пока сделка жива) ──
         entry = {
             "state": state,
@@ -1487,10 +1448,8 @@ def run():
             entry["open_trade"] = new_ot
             entry["trade_id"] = new_tid
         wl_all[sym] = entry
-
         cur = {**r, "score": score, "pros": pros, "cons": cons,
                "derived": derived, "momentum": momentum, "pattern": pattern}
-
         # ── Переход → Telegram (входа) ──
         if state != prev_state:
             log.info(f"[{sym}] {prev_state} → {state} | {reasons}")
@@ -1514,16 +1473,13 @@ def run():
                     reason = llm_res.get("reason", "")
                     msg += f"\n🤖 {agree} {esc(risk)} · {esc(reason)}"
                 send_tg(msg)
-
     # ── Выпавшие из discovery-фильтра ──
     for sym in list(wl_all.keys()):
         if sym in current_symbols:
             continue
-
         missed = wl_all[sym].get("missed_runs", 0) + 1
         wl_all[sym]["missed_runs"] = missed
         wl_all[sym]["last_seen"] = ts
-
         stage = wl_all[sym]["state"]
         if stage in ACTIVE_STATES and missed == MISS_EXIT_RUNS:
             log.info(f"[{sym}] выпала из фильтра {missed} прогона → пауза")
@@ -1535,37 +1491,32 @@ def run():
                 f"<i>Возможно просел объём/ликвидность или сменилась пагинация. "
                 f"Стадия сохранена — при возврате пересчитается по свежим данным.</i>\n"
             )
-
         if missed >= MISS_REMOVE_RUNS:
             ot = wl_all[sym].get("open_trade")
             if ot:
+                # [FIX R7] MISSED всегда использует потенциально устаревшую
+                # last_price — источник и "возраст" цены явно фиксируем в записи.
                 close_trade(ot, sym, ts, ot.get("last_price"),
-                            "MISSED", stage, price_full)
+                            "MISSED", stage, price_full,
+                            exit_price_source="last_seen")
             log.info(f"[{sym}] нет в данных {missed} прогонов → remove")
             del wl_all[sym]
-
-    flush_pending(price_full, ts)
+    flush_pending(price_full, ts, existing_trade_ids)
     save_pending(PENDING)
     save_watchlist(wl_all)
-
     for r in rows:
         if passes_filter(r):
             sc, pr, co = calculate_score(r)
             append_jsonl(SNAPSHOTS_FILE, {**r, "score": sc,
                                           "pros": pr, "cons": co})
-
     cleanup_jsonl(MARKET_HISTORY_FILE, MARKET_TTL_DAYS)
     cleanup_jsonl(SNAPSHOTS_FILE, SNAPSHOTS_TTL_DAYS)
     cleanup_jsonl(HEARTBEAT_FILE, HEARTBEAT_TTL_DAYS)
     cleanup_jsonl(CALIBRATION_FILE, SNAPSHOTS_TTL_DAYS)
-
     open_n = sum(1 for v in wl_all.values() if v.get("open_trade"))
     log.info(f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} "
              f"· pending: {len(PENDING)} ═══")
-
-
 # ═══════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     try:
         run()
