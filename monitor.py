@@ -680,10 +680,14 @@ def fetch_btc_price_chg() -> Optional[float]:
     """[FIX R20] BTC из Binance public API, если BTCUSDT не прошёл discovery."""
     try:
         r = requests.get(
-            "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
-            timeout=10)
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",
+            timeout=8)
         if r.status_code == 200:
-            return float(r.json().get("priceChangePercent", 0))
+            data = r.json()
+            chg = data.get("bitcoin", {}).get("usd_24h_change")
+            if chg is not None:
+                return float(chg)
     except Exception as e:
         log.warning(f"Binance API недоступен: {e}")
     return None
