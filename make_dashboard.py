@@ -1,16 +1,11 @@
 """make_dashboard.py — генерирует docs/index.html (дашборд сделок) из trades.jsonl
-+ живые открытые позиции из watchlist.json + упущенные движения из market_history.jsonl.
++ живые открытые позиции из watchlist.json + упущенные движения из unentered_analysis.jsonl.
 
 Данные инлайнятся → самодостаточный HTML (GitHub Pages + локально без сервера).
-Закрытые сделки = trades.jsonl. Открытые = watchlist.json (блок LIVE).
-Упущенные = market_history.jsonl (монеты с ростом > порога без нашей сделки).
 
-ФИКСЫ:
-  - F6: load_trades() считает и печатает битые строки.
-  - F7: assert заменён на raise RuntimeError (не отключается -O).
-  - Статистика по дням (открыто/закрыто/плюс/минус/win%/PnL).
-  - Упущенные движения за 24ч.
-  - Порядок: Статистика по дням поставлена перед Win-rate графиками.
+Упущенные движения: для каждой монеты с ростом > порога, по которой нет сделки,
+показывается стадия lifecycle, форвардная классификация (good/noise/late) и
+причины, по которым не дошла до CONFIRMED.
 
 Запуск:  python make_dashboard.py
 """
@@ -22,9 +17,11 @@ BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
 WATCHLIST = BASE / "watchlist.json"
 MARKET_HISTORY = BASE / "market_history.jsonl"
+UNENTERED_ANALYSIS = BASE / "unentered_analysis.jsonl"
+UNENTERED_CANDIDATES = BASE / "unentered_candidates.jsonl"
 OUT = BASE / "docs" / "index.html"
 
-MISSED_THRESHOLD = 5.0   # порог "значимого роста" (% за 24ч) для упущенных
+MISSED_THRESHOLD = 5.0
 
 try:
     from monitor import TRADE_TIMEOUT_MIN
@@ -46,7 +43,6 @@ FIELDS = [
 
 
 def load_trades():
-    """[FIX F6] Считает битые строки и печатает warning."""
     if not TRADES.exists():
         return [], 0
     out, bad = [], 0
@@ -112,52 +108,103 @@ def load_open():
     return out
 
 
-def load_market_history():
-    """Последний снимок каждой монеты из market_history.jsonl (глубина ~24ч)."""
-    if not MARKET_HISTORY.exists():
+def load_unentered():
+    """Загружает финализированные упущенные движения из unentered_analysis.jsonl."""
+    if not UNENTERED_ANALYSIS.exists():
         return []
-    latest = {}
-    for ln in MARKET_HISTORY.read_text(encoding="utf-8").splitlines():
+    out = []
+    for ln in UNENTERED_ANALYSIS.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
             continue
         try:
-            r = json.loads(ln)
+            out.append(json.loads(ln))
         except json.JSONDecodeError:
             continue
-        sym = r.get("symbol")
-        ts = r.get("ts", 0)
-        if not sym:
+    return out
+
+
+def load_pending_unentered():
+    """Загружает ожидающих классификации из unentered_candidates.jsonl."""
+    if not UNENTERED_CANDIDATES.exists():
+        return 0
+    count = 0
+    for ln in UNENTERED_CANDIDATES.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
             continue
-        if sym not in latest or ts > latest[sym]["ts"]:
-            latest[sym] = {
-                "symbol": sym,
-                "name": r.get("name", sym),
-                "price": r.get("price"),
-                "price_chg24": r.get("price_chg24"),
-                "ts": ts,
-            }
-    return list(latest.values())
+        try:
+            rec = json.loads(ln)
+            if rec.get("status") != "finalized":
+                count += 1
+        except json.JSONDecodeError:
+            continue
+    return count
 
 
-def compute_missed(market_data, trades, open_positions, threshold_pct=MISSED_THRESHOLD):
-    """Упущенные: монеты с ростом > порога, по которым нет сделки (открытой или закрытой за 24ч)."""
+def compute_capture_rate(trades, unentered, cutoff_h=24):
+    """Коэффициент захвата: поймали vs упустили хороших лонгов за cutoff_h часов."""
     now = time.time()
-    cutoff_24h = now - 24 * 3600
-    active_symbols = set()
-    for op in open_positions:
-        active_symbols.add(op["symbol"])
-    for t in trades:
-        if t.get("entry_ts") and t["entry_ts"] >= cutoff_24h:
-            active_symbols.add(t["symbol"])
+    cutoff = now - cutoff_h * 3600
 
-    missed = []
-    for m in market_data:
-        chg = m.get("price_chg24")
-        if chg is not None and chg > threshold_pct and m["symbol"] not in active_symbols:
-            missed.append(m)
-    missed.sort(key=lambda x: x.get("price_chg24") or 0, reverse=True)
-    return missed
+    # Хорошие лонги, которые поймали (return_60m >= 1% или strategy_pnl > 0)
+    caught_good = []
+    for t in trades:
+        if t.get("entry_ts") and t["entry_ts"] >= cutoff:
+            r60 = t.get("return_60m")
+            strat = t.get("strategy_pnl_pct")
+            if (r60 is not None and r60 >= 1.0) or (strat is not None and strat > 0):
+                caught_good.append(t)
+
+    # Хорошие лонги, которые упустили (quality == good)
+    missed_good = [u for u in unentered
+                   if u.get("detect_ts", 0) >= cutoff
+                   and u.get("quality", {}).get("label") == "good"]
+
+    total_good = len(caught_good) + len(missed_good)
+    capture_rate = len(caught_good) / total_good * 100 if total_good > 0 else 0
+
+    return {
+        "caught": len(caught_good),
+        "missed": len(missed_good),
+        "total": total_good,
+        "capture_rate": round(capture_rate, 1),
+    }
+
+
+def aggregate_fail_points(unentered):
+    """Агрегация fail_point по условию/стадии."""
+    by_condition = {}
+    by_stage = {}
+    for u in unentered:
+        if u.get("quality", {}).get("label") != "good":
+            continue
+        fp = u.get("fail_point", {})
+        stage = fp.get("stage", "unknown")
+        condition = fp.get("condition", "unknown")
+        deficit = fp.get("deficit")
+
+        key_cond = f"{stage}:{condition}"
+        if key_cond not in by_condition:
+            by_condition[key_cond] = {"count": 0, "deficits": [], "stage": stage, "condition": condition}
+        by_condition[key_cond]["count"] += 1
+        if deficit is not None and deficit != float("inf"):
+            by_condition[key_cond]["deficits"].append(deficit)
+
+        if stage not in by_stage:
+            by_stage[stage] = 0
+        by_stage[stage] += 1
+
+    # Сортируем по count desc
+    sorted_cond = sorted(by_condition.values(), key=lambda x: x["count"], reverse=True)
+    for item in sorted_cond:
+        if item["deficits"]:
+            item["avg_deficit"] = round(sum(item["deficits"]) / len(item["deficits"]), 3)
+        else:
+            item["avg_deficit"] = None
+        del item["deficits"]
+
+    return {"by_condition": sorted_cond, "by_stage": by_stage}
 
 
 HTML = r"""<!doctype html>
@@ -221,7 +268,6 @@ HTML = r"""<!doctype html>
   select:hover{border-color:var(--teal);}
   select:focus{outline:none;border-color:var(--teal);transform:translateY(-1px);}
 
-  /* ── DAILY STATS ── */
   .daygrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
     gap:12px;margin-bottom:20px;}
   .daycard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
@@ -244,7 +290,6 @@ HTML = r"""<!doctype html>
   .dailytbl td.l,.dailytbl th.l{text-align:left;}
   .dailytbl tr:hover td{background:var(--panel-2);}
 
-  /* ── LIVE POSITIONS ── */
   .livehead{display:flex;align-items:center;gap:11px;margin:6px 0 14px;}
   .livehead h2{font-family:var(--display);font-weight:700;font-size:15px;margin:0;
     letter-spacing:.18em;text-transform:uppercase;color:var(--txt);}
@@ -342,6 +387,20 @@ HTML = r"""<!doctype html>
   .sec-title{font-family:var(--display);font-weight:700;font-size:15px;margin:30px 0 14px;
     letter-spacing:.14em;text-transform:uppercase;color:var(--txt);display:flex;align-items:center;gap:10px;}
   .sec-title::before{content:"";width:4px;height:16px;border-radius:3px;background:var(--teal);}
+  .reason-tag{display:inline-block;padding:1px 6px;border-radius:5px;background:rgba(251,113,133,.12);
+    border:1px solid rgba(251,113,133,.25);color:var(--red);font-size:10.5px;margin:1px 2px 1px 0;}
+  .capture-card{background:linear-gradient(160deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:20px;}
+  .capture-card .big-num{font-family:var(--display);font-weight:700;font-size:48px;line-height:1;
+    margin:10px 0;}
+  .capture-card .breakdown{display:flex;gap:20px;margin-top:14px;font-family:var(--mono);font-size:13px;}
+  .fail-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+    gap:12px;margin-top:14px;}
+  .fail-item{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px;}
+  .fail-item .stage{font-size:11px;text-transform:uppercase;color:var(--mut-2);letter-spacing:.08em;}
+  .fail-item .cond{font-family:var(--display);font-weight:600;font-size:15px;margin:4px 0;}
+  .fail-item .count{font-family:var(--display);font-weight:700;font-size:24px;color:var(--teal);}
+  .fail-item .deficit{font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:4px;}
 </style>
 </head>
 <body>
@@ -370,7 +429,6 @@ HTML = r"""<!doctype html>
       </select></div>
   </div>
 
-  <!-- ═══ LIVE POSITIONS ═══ -->
   <div class="livehead">
     <span class="pdot idle" id="liveDot"></span>
     <h2>Live positions</h2>
@@ -378,10 +436,8 @@ HTML = r"""<!doctype html>
   </div>
   <div class="livegrid" id="liveGrid"></div>
 
-  <!-- ═══ KPI BENTO ═══ -->
   <div class="bento" id="bento"></div>
 
-  <!-- ═══ DAILY STATS (перед Win-rate) ═══ -->
   <div class="sec-title">Статистика по дням</div>
   <div class="daygrid" id="dayGrid"></div>
   <div class="panel reveal" style="margin-bottom:26px">
@@ -389,14 +445,12 @@ HTML = r"""<!doctype html>
     <div style="overflow-x:auto"><table class="dailytbl" id="dailyTbl"></table></div>
   </div>
 
-  <!-- ═══ MISSED OPPORTUNITIES (перед Win-rate) ═══ -->
-  <div class="sec-title">Упущенные движения · 24ч</div>
+  <div class="sec-title">Упущенные хорошие лонги · 24ч</div>
   <div class="panel reveal" style="margin-bottom:26px">
-    <h3>Рост > __MISSED_THRESHOLD__% без нашей сделки</h3>
-    <div style="overflow-x:auto"><table class="dailytbl" id="missedTbl"></table></div>
+    <h3>Коэффициент захвата и анализ fail_point</h3>
+    <div id="captureSection"></div>
   </div>
 
-  <!-- ═══ WIN-RATE CHARTS ═══ -->
   <div class="grid2">
     <div class="panel reveal"><h3>Win-rate ≥1% по MOMENTUM входа</h3><canvas id="chMom"></canvas></div>
     <div class="panel reveal"><h3>Win-rate ≥1% по CVD_MOMENTUM входа</h3><canvas id="chCvd"></canvas></div>
@@ -404,7 +458,6 @@ HTML = r"""<!doctype html>
     <div class="panel reveal"><h3>Накопленный strategy PnL</h3><canvas id="chEquity"></canvas></div>
   </div>
 
-  <!-- ═══ TOP 10 ═══ -->
   <div class="grid2">
     <div class="panel reveal"><h3>TOP 10 — лучший сигнал (return@60m)</h3><div id="topSig"></div></div>
     <div class="panel reveal"><h3>TOP 10 — лучшая стратегия (PnL)</h3><div id="topStr"></div></div>
@@ -412,7 +465,6 @@ HTML = r"""<!doctype html>
   <div class="panel reveal" style="margin-bottom:18px">
     <h3>Расхождение: отличный вход, плохой выход</h3><div id="topDiv"></div></div>
 
-  <!-- ═══ TRADE HISTORY TABLE ═══ -->
   <div class="panel reveal">
     <h3>Архив сделок <span style="color:var(--mut-2);font-weight:400;font-size:12px">· клик по заголовку — сортировка</span></h3>
     <div class="tblwrap"><table class="main" id="tbl"></table></div>
@@ -424,7 +476,10 @@ HTML = r"""<!doctype html>
 <script>
 const TRADES = __DATA__;
 const OPEN   = __OPEN__;
-const MISSED = __MISSED__;
+const UNENTERED = __UNENTERED__;
+const PENDING_UNENTERED = __PENDING_UNENTERED__;
+const CAPTURE = __CAPTURE__;
+const FAIL_POINTS = __FAIL_POINTS__;
 const MOM_B=[3,5,7], CVD_B=[0,3,6,10];
 const LOW=20;
 const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED_TREND:"🟢",
@@ -481,16 +536,12 @@ function filtered(){
 }
 function openFiltered(){ return OPEN.filter(o=>assetOk(o.asset_class)); }
 
-/* ═══════════════════════════════════════════════════════════
-   DAILY STATISTICS
-   ═══════════════════════════════════════════════════════════ */
 function computeDaily(rows){
   const days={};
   const now=new Date();
   const todayStr=now.toISOString().slice(0,10);
   const yest=new Date(now); yest.setDate(yest.getDate()-1);
   const yestStr=yest.toISOString().slice(0,10);
-
   for(const t of rows){
     const d=dayStr(t.entry_ts);
     if(!d) continue;
@@ -517,7 +568,6 @@ function renderDaily(rows){
   const {days, todayStr, yestStr}=computeDaily(rows);
   const grid=document.getElementById('dayGrid');
   const tbl=document.getElementById('dailyTbl');
-
   const periods=[
     {label:'Сегодня', filter:d=>d===todayStr},
     {label:'Вчера', filter:d=>d===yestStr},
@@ -525,7 +575,6 @@ function renderDaily(rows){
     {label:'30 дней', filter:d=>{const diff=(Date.now()-new Date(d).getTime())/864e5; return diff<30;}},
     {label:'Всё время', filter:()=>true},
   ];
-
   let cardsHtml='';
   periods.forEach((p,i)=>{
     let opened=0,closed=0,pos=0,neg=0,pnl=0;
@@ -549,7 +598,6 @@ function renderDaily(rows){
     </div>`;
   });
   grid.innerHTML=cardsHtml;
-
   const sorted=Object.keys(days).sort().reverse().slice(0,14);
   let thead=`<tr><th class="l">Дата</th><th>Открыто</th><th>Закрыто</th>
     <th>▲ Плюс</th><th>▼ Минус</th><th>Win%</th><th>PnL</th><th>Медиана r60</th><th>Лучшая</th><th>Худшая</th></tr>`;
@@ -577,31 +625,43 @@ function renderDaily(rows){
   tbl.innerHTML=thead+(tbody||'<tr><td class="l empty" colspan="10">Нет данных за последние 14 дней</td></tr>');
 }
 
-/* ═══════════════════════════════════════════════════════════
-   MISSED OPPORTUNITIES
-   ═══════════════════════════════════════════════════════════ */
-function renderMissed(){
-  const tbl=document.getElementById('missedTbl');
-  if(!MISSED.length){
-    tbl.innerHTML='<tr><td class="l empty">Нет упущенных движений за последние 24ч</td></tr>';
+function renderCapture(){
+  const sec=document.getElementById('captureSection');
+  if(!CAPTURE || CAPTURE.total===0){
+    sec.innerHTML='<div class="empty">Нет данных за последние 24ч для расчёта коэффициента захвата</div>';
     return;
   }
-  let head=`<tr><th class="l">Монета</th><th>Рост 24ч</th><th>Цена</th><th>Последний снимок</th></tr>`;
-  let body='';
-  for(const m of MISSED){
-    body+=`<tr>
-      <td class="l">${m.name||m.symbol} (${m.symbol})</td>
-      <td class="pos2">${pctf(m.price_chg24)}</td>
-      <td>${pricef(m.price)}</td>
-      <td>${dstr(m.ts)}</td>
-    </tr>`;
+  let html=`<div class="capture-card">
+    <div style="font-size:12px;text-transform:uppercase;color:var(--mut-2);letter-spacing:.1em">Коэффициент захвата хороших лонгов</div>
+    <div class="big-num ${CAPTURE.capture_rate>=50?'pos2':'neg'}">${CAPTURE.capture_rate.toFixed(0)}%</div>
+    <div class="breakdown">
+      <span class="pos2">Поймали: ${CAPTURE.caught}</span>
+      <span class="neg">Упустили: ${CAPTURE.missed}</span>
+      <span class="neu">Всего хороших: ${CAPTURE.total}</span>
+    </div>
+    ${PENDING_UNENTERED>0?`<div style="margin-top:12px;font-size:12px;color:var(--amb)">⏳ Ожидают классификации: ${PENDING_UNENTERED} кандидатов</div>`:''}
+  </div>`;
+
+  if(FAIL_POINTS && FAIL_POINTS.by_condition && FAIL_POINTS.by_condition.length>0){
+    html+='<h4 style="font-size:13px;margin:20px 0 10px;color:var(--txt)">Топ условий, отсекающих хорошие лонги</h4>';
+    html+='<div class="fail-grid">';
+    FAIL_POINTS.by_condition.slice(0,8).forEach(fp=>{
+      const deficitStr=fp.avg_deficit!=null? `avg deficit: ${fp.avg_deficit.toFixed(2)}` : 'deficit: n/a';
+      html+=`<div class="fail-item">
+        <div class="stage">${fp.stage}</div>
+        <div class="cond">${fp.condition}</div>
+        <div class="count">${fp.count}</div>
+        <div class="deficit">${deficitStr}</div>
+      </div>`;
+    });
+    html+='</div>';
+    if(FAIL_POINTS.by_condition.length<LOW){
+      html+=`<div style="margin-top:14px;font-size:11px;color:var(--amb)">⚠ LOW SAMPLE (${FAIL_POINTS.by_condition.length}<${LOW}) — выводов пока не делать</div>`;
+    }
   }
-  tbl.innerHTML=head+body;
+  sec.innerHTML=html;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   LIVE POSITIONS
-   ═══════════════════════════════════════════════════════════ */
 function renderLive(){
   const ops=openFiltered();
   const grid=document.getElementById('liveGrid');
@@ -656,9 +716,6 @@ function renderLive(){
   });
 }
 
-/* ═══════════════════════════════════════════════════════════
-   KPI BENTO
-   ═══════════════════════════════════════════════════════════ */
 function kpi(label,valHtml,rawNum,opts={}){
   const d=document.createElement('div');
   d.className='kpi'+(opts.big?' big':'');
@@ -709,9 +766,6 @@ function renderBento(rows,openN){
     : (last ? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}` : 'нет сделок');
 }
 
-/* ═══════════════════════════════════════════════════════════
-   CHARTS
-   ═══════════════════════════════════════════════════════════ */
 function barByBucket(rows,key,edges,canvas){
   const g={};
   for(const r of rows){ const k=bucket(r[key],edges); (g[k]=g[k]||[]).push(r.return_60m); }
@@ -760,9 +814,6 @@ function equity(rows,canvas){
       plugins:{legend:{labels:{color:'#93a0b8'}}}}});
 }
 
-/* ═══════════════════════════════════════════════════════════
-   TABLE + TOP
-   ═══════════════════════════════════════════════════════════ */
 const COLS=[
   ['entry_ts','Дата',t=>dstr(t.entry_ts),1],
   ['symbol','Монета',t=>t.symbol,1],
@@ -817,16 +868,13 @@ function topDiv(rows){
   }).join('') : '<div class="empty">Нет данных</div>';
 }
 
-/* ═══════════════════════════════════════════════════════════
-   RENDER ALL
-   ═══════════════════════════════════════════════════════════ */
 function renderAll(){
   const rows=filtered();
   const ops=openFiltered();
   renderLive();
   renderBento(rows,ops.length);
   renderDaily(rows);
-  renderMissed();
+  renderCapture();
   barByBucket(rows,'entry_momentum',MOM_B,'chMom');
   barByBucket(rows,'entry_cvd_momentum',CVD_B,'chCvd');
   scatter(rows,'chScatter');
@@ -836,7 +884,7 @@ function renderAll(){
   topDiv(rows);
   renderTable(rows);
   document.getElementById('foot').textContent =
-    `live: ${ops.length} · архив: ${rows.length} · упущено 24ч: ${MISSED.length} · LOW SAMPLE < ${LOW}`;
+    `live: ${ops.length} · архив: ${rows.length} · упущено 24ч: ${CAPTURE?CAPTURE.missed:0} · LOW SAMPLE < ${LOW}`;
 }
 
 const io = new IntersectionObserver(entries=>{
@@ -855,27 +903,30 @@ renderAll(); observeReveals();
 def main():
     trades, bad_lines = load_trades()
     open_positions = load_open()
-    market_data = load_market_history()
-    missed = compute_missed(market_data, trades, open_positions)
+    unentered = load_unentered()
+    pending_unentered = load_pending_unentered()
+    capture = compute_capture_rate(trades, unentered, cutoff_h=24)
+    fail_points = aggregate_fail_points(unentered)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     html = (HTML
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
             .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
             .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN))
-            .replace("__MISSED__", json.dumps(missed, ensure_ascii=False))
-            .replace("__MISSED_THRESHOLD__", str(MISSED_THRESHOLD)))
-    # [FIX F7] raise вместо assert (не отключается -O)
-    for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__",
-                        "__MISSED__", "__MISSED_THRESHOLD__"):
+            .replace("__UNENTERED__", json.dumps(unentered, ensure_ascii=False))
+            .replace("__PENDING_UNENTERED__", json.dumps(pending_unentered))
+            .replace("__CAPTURE__", json.dumps(capture, ensure_ascii=False))
+            .replace("__FAIL_POINTS__", json.dumps(fail_points, ensure_ascii=False)))
+    for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__", "__UNENTERED__",
+                        "__PENDING_UNENTERED__", "__CAPTURE__", "__FAIL_POINTS__"):
         if placeholder in html:
             raise RuntimeError(
                 f"make_dashboard.py: плейсхолдер {placeholder} не подставлен — "
-                f"генерация остановлена, чтобы не закоммитить битый HTML")
+                f"генерация остановлена")
     OUT.write_text(html, encoding="utf-8")
     bad_note = f" · ⚠ {bad_lines} битых строк" if bad_lines else ""
     print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых"
-          f" · {len(missed)} упущенных{bad_note})")
+          f" · {len(unentered)} упущенных · {pending_unentered} ожидают{bad_note})")
 
 
 if __name__ == "__main__":
