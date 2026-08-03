@@ -4,29 +4,26 @@
 Закрытые сделки = trades.jsonl (история исходов). Открытые = watchlist.json
 (блок LIVE с текущим PnL). Запуск:  python make_dashboard.py
 
-ИЗМЕНЕНИЯ (аудит, раунд 2 фиксов):
-  - <script>: полностью пересобран конец файла (был незакрытый template
-    literal + пропавший IntersectionObserver — R31, CRITICAL, дашборд не
-    рендерился вообще).
-  - Добавлены реальные обработчики change на #asset/#life (R26 — в прошлой
-    доставке это было заявлено в чейнджлоге, но не попало в код).
-  - barByBucket(): числовая сортировка бакетов вместо Object.keys(g).sort()
-    (R28 — JS-версия того же бага, что chинил в trades_report.py: sort_key()).
-  - winrate()/median(): возвращают null на пустых данных вместо 0 (R27) —
-    KPI "Win ≥1%"/"Медиана" показывают "—", а не вводящий в заблуждение "0%".
+ФИКСЫ:
+  - F6: load_trades() считает и печатает битые строки.
+  - F7: assert заменён на raise RuntimeError (не отключается -O).
+  - НОВОЕ: подробная статистика по дням (открыто/закрыто/плюс/минус/win%/PnL).
 """
 import json
 from pathlib import Path
+
 BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
 WATCHLIST = BASE / "watchlist.json"
 OUT = BASE / "docs" / "index.html"
+
 try:
     from monitor import TRADE_TIMEOUT_MIN
 except Exception as e:
-    TRADE_TIMEOUT_MIN = 240  # fallback — держи в синхроне с monitor.py вручную
+    TRADE_TIMEOUT_MIN = 240
     print(f"WARNING: не удалось импортировать TRADE_TIMEOUT_MIN из monitor.py "
-          f"({e}); используется fallback=240 — проверь синхронизацию вручную")
+          f"({e}); используется fallback=240")
+
 FIELDS = [
     "symbol", "name", "asset_class", "entry_ts", "entry_price", "exit_price",
     "strategy_pnl_pct", "gross_pnl_pct", "return_60m", "return_120m", "return_240m",
@@ -37,10 +34,13 @@ FIELDS = [
     "signal_logic_version", "pending_finalize_reason",
     "exit_price_source", "exit_price_stale_min",
 ]
+
+
 def load_trades():
+    """[FIX F6] Считает битые строки и печатает warning."""
     if not TRADES.exists():
-        return []
-    out = []
+        return [], 0
+    out, bad = [], 0
     for ln in TRADES.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
@@ -48,21 +48,21 @@ def load_trades():
         try:
             r = json.loads(ln)
         except json.JSONDecodeError:
+            bad += 1
             continue
         out.append({k: r.get(k) for k in FIELDS})
-    return out
+    if bad:
+        print(f"WARNING: trades.jsonl — {bad} битых строк пропущено")
+    return out, bad
+
+
 def load_open():
-    """Открытые сделки из watchlist.json → объекты live-позиций с текущим PnL.
-    При повреждённом watchlist.json печатаем предупреждение вместо тихого
-    возврата [] — иначе "0 live positions" неотличимо от честного
-    "сейчас нет открытых сделок" (R14)."""
     if not WATCHLIST.exists():
         return []
     try:
         data = json.loads(WATCHLIST.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        print(f"WARNING: watchlist.json повреждён ({e}) — live-позиции "
-              f"недоступны на этой сборке дашборда")
+        print(f"WARNING: watchlist.json повреждён ({e}) — live-позиции недоступны")
         return []
     out = []
     for sym, rec in data.items():
@@ -101,6 +101,8 @@ def load_open():
     out.sort(key=lambda x: (x["cur_pnl_pct"] if x["cur_pnl_pct"] is not None else -999),
              reverse=True)
     return out
+
+
 HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
@@ -161,6 +163,30 @@ HTML = r"""<!doctype html>
     transition:border-color .2s,transform .15s;}
   select:hover{border-color:var(--teal);}
   select:focus{outline:none;border-color:var(--teal);transform:translateY(-1px);}
+
+  /* ── DAILY STATS ── */
+  .daygrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+    gap:12px;margin-bottom:20px;}
+  .daycard{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:14px 16px;transition:transform .2s,border-color .2s;animation:pop .4s both;}
+  .daycard:hover{transform:translateY(-2px);border-color:var(--teal);}
+  .daycard.today{border-color:var(--teal);box-shadow:0 0 12px -4px rgba(45,212,191,.3);}
+  .daycard .dlabel{font-size:11px;text-transform:uppercase;letter-spacing:.1em;
+    color:var(--mut-2);margin-bottom:6px;}
+  .daycard .dcount{font-family:var(--display);font-weight:700;font-size:28px;line-height:1;}
+  .daycard .dbreak{display:flex;gap:10px;margin-top:8px;font-family:var(--mono);font-size:11.5px;}
+  .daycard .dbreak .pos{color:var(--grn);}
+  .daycard .dbreak .neg{color:var(--red);}
+  .daycard .dbreak .neu{color:var(--mut);}
+  .daycard .dmeta{margin-top:6px;font-family:var(--mono);font-size:11px;color:var(--mut);}
+
+  .dailytbl{width:100%;border-collapse:collapse;font:12px/1.3 var(--mono);margin-top:12px;}
+  .dailytbl th,.dailytbl td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--line);}
+  .dailytbl th{color:var(--mut-2);text-transform:uppercase;font-size:10px;letter-spacing:.06em;
+    font-family:var(--body);font-weight:600;}
+  .dailytbl td.l,.dailytbl th.l{text-align:left;}
+  .dailytbl tr:hover td{background:var(--panel-2);}
+
   /* ── LIVE POSITIONS ── */
   .livehead{display:flex;align-items:center;gap:11px;margin:6px 0 14px;}
   .livehead h2{font-family:var(--display);font-weight:700;font-size:15px;margin:0;
@@ -172,34 +198,35 @@ HTML = r"""<!doctype html>
     background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:2px 10px;}
   .livegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
     gap:14px;margin-bottom:30px;}
-  .pos{position:relative;background:linear-gradient(155deg,var(--panel-2),var(--panel));
+  .pos-card{position:relative;background:linear-gradient(155deg,var(--panel-2),var(--panel));
     border:1px solid var(--line);border-radius:16px;padding:16px 18px 16px 22px;
     overflow:hidden;transition:transform .22s cubic-bezier(.2,.7,.3,1),border-color .22s,box-shadow .22s;
     animation:pop .5s both;}
-  .pos::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--teal);}
-  .pos.eq::before{background:var(--amb);} .pos.co::before{background:var(--teal);}
-  .pos:hover{transform:translateY(-3px);border-color:var(--teal);
+  .pos-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--teal);}
+  .pos-card.eq::before{background:var(--amb);}
+  .pos-card:hover{transform:translateY(-3px);border-color:var(--teal);
     box-shadow:0 16px 34px -18px rgba(45,212,191,.45);}
-  .pos .row1{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
-  .pos .sym{font-family:var(--display);font-weight:700;font-size:20px;letter-spacing:-.01em;line-height:1;}
-  .pos .nm{color:var(--mut);font-size:11.5px;margin-top:3px;}
-  .pos .pnl{font-family:var(--display);font-weight:700;font-size:26px;line-height:1;
+  .pos-card .row1{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
+  .pos-card .sym{font-family:var(--display);font-weight:700;font-size:20px;letter-spacing:-.01em;line-height:1;}
+  .pos-card .nm{color:var(--mut);font-size:11.5px;margin-top:3px;}
+  .pos-card .pnl{font-family:var(--display);font-weight:700;font-size:26px;line-height:1;
     font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;}
-  .pos .stg{display:inline-flex;align-items:center;gap:5px;margin-top:7px;
+  .pos-card .stg{display:inline-flex;align-items:center;gap:5px;margin-top:7px;
     font-family:var(--mono);font-size:11px;color:var(--mut);}
-  .pos .stg .se{font-size:13px;}
-  .pos .bars{margin:13px 0 4px;}
-  .pos .barlab{display:flex;justify-content:space-between;font-family:var(--mono);
+  .pos-card .stg .se{font-size:13px;}
+  .pos-card .bars{margin:13px 0 4px;}
+  .pos-card .barlab{display:flex;justify-content:space-between;font-family:var(--mono);
     font-size:10.5px;color:var(--mut-2);margin-bottom:4px;}
-  .pos .track{height:5px;border-radius:4px;background:var(--bg-deep);overflow:hidden;}
-  .pos .fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--teal),#22a89a);
+  .pos-card .track{height:5px;border-radius:4px;background:var(--bg-deep);overflow:hidden;}
+  .pos-card .fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--teal),#22a89a);
     width:0;transition:width 1s cubic-bezier(.2,.7,.3,1);}
-  .pos .fill.warn{background:linear-gradient(90deg,var(--amb),#d99a16);}
-  .pos .metrics{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:12px;
+  .pos-card .fill.warn{background:linear-gradient(90deg,var(--amb),#d99a16);}
+  .pos-card .metrics{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:12px;
     font-family:var(--mono);font-size:11px;color:var(--mut);}
-  .pos .metrics b{color:var(--txt);font-weight:600;}
-  .pos .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px;}
+  .pos-card .metrics b{color:var(--txt);font-weight:600;}
+  .pos-card .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px;}
   .emptybox{color:var(--mut-2);font-style:italic;padding:22px 4px;font-size:13.5px;}
+
   .bento{display:grid;grid-template-columns:repeat(4,1fr);
     grid-auto-rows:minmax(96px,auto);gap:14px;margin-bottom:26px;}
   .kpi{position:relative;background:linear-gradient(160deg,var(--panel-2),var(--panel));
@@ -220,6 +247,7 @@ HTML = r"""<!doctype html>
   .kpi .m{font-family:var(--mono);font-size:12px;color:var(--mut);margin-top:8px;}
   .pos2{color:var(--grn);} .neg{color:var(--red);} .neu{color:var(--amb);}
   @keyframes pop{from{opacity:0;transform:translateY(10px) scale(.98);}to{opacity:1;transform:none;}}
+
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px;}
   @media(max-width:860px){.grid2{grid-template-columns:1fr;}.bento{grid-template-columns:repeat(2,1fr);}.kpi.big{grid-column:span 2;}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 20px;}
@@ -228,15 +256,16 @@ HTML = r"""<!doctype html>
   .panel h3::before{content:"";width:4px;height:15px;border-radius:3px;background:var(--teal);}
   .reveal{opacity:0;transform:translateY(22px);transition:opacity .6s ease,transform .6s cubic-bezier(.2,.7,.3,1);}
   .reveal.in{opacity:1;transform:none;}
-  table{width:100%;border-collapse:collapse;font:12.5px/1.3 var(--mono);}
-  th,td{padding:7px 9px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;}
-  th{color:var(--mut-2);cursor:pointer;user-select:none;position:sticky;top:0;
+
+  table.main{width:100%;border-collapse:collapse;font:12.5px/1.3 var(--mono);}
+  table.main th,table.main td{padding:7px 9px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;}
+  table.main th{color:var(--mut-2);cursor:pointer;user-select:none;position:sticky;top:0;
     background:var(--panel);text-transform:uppercase;letter-spacing:.06em;font-size:10.5px;
     font-family:var(--body);font-weight:600;transition:color .15s;}
-  th:hover{color:var(--teal);}
-  td.l,th.l{text-align:left;}
-  tbody tr{transition:background .15s;}
-  tbody tr:hover td{background:var(--panel-2);}
+  table.main th:hover{color:var(--teal);}
+  table.main td.l,table.main th.l{text-align:left;}
+  table.main tbody tr{transition:background .15s;}
+  table.main tbody tr:hover td{background:var(--panel-2);}
   .tblwrap{max-height:540px;overflow:auto;border-radius:14px;border:1px solid var(--line);}
   .tblwrap::-webkit-scrollbar{width:9px;height:9px;}
   .tblwrap::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px;}
@@ -253,6 +282,9 @@ HTML = r"""<!doctype html>
   .empty{color:var(--mut-2);padding:34px;text-align:center;font-style:italic;}
   .foot{margin-top:34px;color:var(--mut-2);font-size:12px;text-align:center;
     font-family:var(--mono);}
+  .sec-title{font-family:var(--display);font-weight:700;font-size:15px;margin:30px 0 14px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--txt);display:flex;align-items:center;gap:10px;}
+  .sec-title::before{content:"";width:4px;height:16px;border-radius:3px;background:var(--teal);}
 </style>
 </head>
 <body>
@@ -264,6 +296,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="live"><span class="dot idle" id="mastDot"></span><span id="liveTxt">—</span></div>
   </div>
+
   <div class="controls">
     <div class="ctl"><label>Класс актива</label>
       <select id="asset">
@@ -279,39 +312,59 @@ HTML = r"""<!doctype html>
         <option value="short">умерли &lt;60м</option>
       </select></div>
   </div>
+
+  <!-- ═══ DAILY STATS ═══ -->
+  <div class="sec-title">Статистика по дням</div>
+  <div class="daygrid" id="dayGrid"></div>
+  <div class="panel reveal" style="margin-bottom:26px">
+    <h3>История по дням (последние 14 дней)</h3>
+    <div style="overflow-x:auto"><table class="dailytbl" id="dailyTbl"></table></div>
+  </div>
+
+  <!-- ═══ LIVE POSITIONS ═══ -->
   <div class="livehead">
     <span class="pdot idle" id="liveDot"></span>
     <h2>Live positions</h2>
     <span class="cnt" id="liveCnt">0</span>
   </div>
   <div class="livegrid" id="liveGrid"></div>
+
+  <!-- ═══ KPI BENTO ═══ -->
   <div class="bento" id="bento"></div>
+
+  <!-- ═══ CHARTS ═══ -->
   <div class="grid2">
     <div class="panel reveal"><h3>Win-rate ≥1% по MOMENTUM входа</h3><canvas id="chMom"></canvas></div>
     <div class="panel reveal"><h3>Win-rate ≥1% по CVD_MOMENTUM входа</h3><canvas id="chCvd"></canvas></div>
     <div class="panel reveal"><h3>CVD_MOMENTUM × return@60m</h3><canvas id="chScatter"></canvas></div>
     <div class="panel reveal"><h3>Накопленный strategy PnL</h3><canvas id="chEquity"></canvas></div>
   </div>
+
   <div class="grid2">
     <div class="panel reveal"><h3>TOP 10 — лучший сигнал (return@60m)</h3><div id="topSig"></div></div>
     <div class="panel reveal"><h3>TOP 10 — лучшая стратегия (PnL)</h3><div id="topStr"></div></div>
   </div>
   <div class="panel reveal" style="margin-bottom:18px">
     <h3>Расхождение: отличный вход, плохой выход</h3><div id="topDiv"></div></div>
+
+  <!-- ═══ TRADE HISTORY TABLE ═══ -->
   <div class="panel reveal">
     <h3>Архив сделок <span style="color:var(--mut-2);font-weight:400;font-size:12px">· клик по заголовку — сортировка</span></h3>
-    <div class="tblwrap"><table id="tbl"></table></div>
+    <div class="tblwrap"><table class="main" id="tbl"></table></div>
   </div>
+
   <div class="foot" id="foot"></div>
 </div>
+
 <script>
 const TRADES = __DATA__;
 const OPEN   = __OPEN__;
 const MOM_B=[3,5,7], CVD_B=[0,3,6,10];
-const LOW=20;                 // эвристика LOW SAMPLE (не правило)
+const LOW=20;
 const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED_TREND:"🟢",
   ACCELERATION:"🚀",EXHAUSTION:"🟠",DISTRIBUTION:"🔴",INVALIDATED:"❌"};
 let charts={};
+
 const fmt=(v,d=1)=> v==null?'—':(+v).toFixed(d);
 const trimZ=s=> s.replace(/\.?0+$/,'');
 const pricef=v=>{
@@ -323,9 +376,6 @@ const pricef=v=>{
 const pctf=v=> v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%';
 const cls=v=> v==null?'':(v>0?'pos2':(v<0?'neg':'neu'));
 const bucket=(v,e)=>{ if(v==null)return 'n/a'; for(const x of e){if(v<x)return '<'+x;} return '>='+e[e.length-1]; };
-/* [FIX R28] Числовая сортировка ключей бакетов — JS-аналог sort_key() из
-   trades_report.py. Object.keys(g).sort() (лексикографический, как раньше)
-   ломал порядок для CVD_BUCKETS=[0,3,6,10]: "<10" вставал перед "<3"/"<6". */
 function bucketSortKey(k){
   if(k==='n/a') return [3,0,k];
   let m=/^<(-?\d+(?:\.\d+)?)$/.exec(k);
@@ -349,11 +399,9 @@ const median=a=>{ if(!a.length)return null; const s=[...a].sort((x,y)=>x-y); con
   const f=Math.floor(m),c=Math.min(f+1,s.length-1); return f===c?s[f]:s[f]+(s[c]-s[f])*(m-f); };
 const mean=a=> a.length? a.reduce((x,y)=>x+y,0)/a.length : null;
 const sum=a=> a.reduce((x,y)=>x+y,0);
-/* [FIX R27] winrate/median возвращают null на пустых данных вместо 0 —
-   "0%" и "нет наблюдений" должны отличаться в UI (тот же принцип, что уже
-   применён к hero-плитке накопленного PnL). */
 const winrate=(a,lvl)=> a.length? a.filter(x=>x>=lvl).length/a.length*100 : null;
 const dstr=ts=> ts? new Date(ts*1000).toISOString().slice(0,16).replace('T',' ') : '—';
+const dayStr=ts=> ts? new Date(ts*1000).toISOString().slice(0,10) : null;
 const acClass=a=> a==='equity'?'eq':a==='commodity'?'co':'';
 function assetOk(a){ const v=document.getElementById('asset').value; return v==='all'||a===v; }
 function filtered(){
@@ -366,7 +414,110 @@ function filtered(){
   });
 }
 function openFiltered(){ return OPEN.filter(o=>assetOk(o.asset_class)); }
-/* ── LIVE POSITIONS ── */
+
+/* ═══════════════════════════════════════════════════════════
+   DAILY STATISTICS
+   ═══════════════════════════════════════════════════════════ */
+function computeDaily(rows){
+  const days={};
+  const now=new Date();
+  const todayStr=now.toISOString().slice(0,10);
+  const yest=new Date(now); yest.setDate(yest.getDate()-1);
+  const yestStr=yest.toISOString().slice(0,10);
+
+  for(const t of rows){
+    const d=dayStr(t.entry_ts);
+    if(!d) continue;
+    if(!days[d]) days[d]={opened:0,closed:0,pos:0,neg:0,zero:0,pnl:0,rets:[]};
+    days[d].opened++;
+    if(t.strategy_pnl_pct!=null){
+      days[d].closed++;
+      days[d].pnl+=t.strategy_pnl_pct;
+      if(t.strategy_pnl_pct>0) days[d].pos++;
+      else if(t.strategy_pnl_pct<0) days[d].neg++;
+      else days[d].zero++;
+    }
+    if(t.return_60m!=null) days[d].rets.push(t.return_60m);
+  }
+
+  // Ensure last 14 days exist
+  for(let i=0;i<14;i++){
+    const dt=new Date(now); dt.setDate(dt.getDate()-i);
+    const k=dt.toISOString().slice(0,10);
+    if(!days[k]) days[k]={opened:0,closed:0,pos:0,neg:0,zero:0,pnl:0,rets:[]};
+  }
+  return {days, todayStr, yestStr};
+}
+
+function renderDaily(rows){
+  const {days, todayStr, yestStr}=computeDaily(rows);
+  const grid=document.getElementById('dayGrid');
+  const tbl=document.getElementById('dailyTbl');
+
+  // Summary cards: Today, Yesterday, 7d, 30d, All
+  const periods=[
+    {label:'Сегодня', filter:d=>d===todayStr},
+    {label:'Вчера', filter:d=>d===yestStr},
+    {label:'7 дней', filter:d=>{const diff=(Date.now()-new Date(d).getTime())/864e5; return diff<7;}},
+    {label:'30 дней', filter:d=>{const diff=(Date.now()-new Date(d).getTime())/864e5; return diff<30;}},
+    {label:'Всё время', filter:()=>true},
+  ];
+
+  let cardsHtml='';
+  periods.forEach((p,i)=>{
+    let opened=0,closed=0,pos=0,neg=0,pnl=0;
+    for(const [d,v] of Object.entries(days)){
+      if(!p.filter(d)) continue;
+      opened+=v.opened; closed+=v.closed; pos+=v.pos; neg+=v.neg; pnl+=v.pnl;
+    }
+    const wr=closed? Math.round(pos/closed*100) : null;
+    const isToday=i===0;
+    cardsHtml+=`<div class="daycard${isToday?' today':''}" style="animation-delay:${i*60}ms">
+      <div class="dlabel">${p.label}</div>
+      <div class="dcount">${opened}</div>
+      <div class="dbreak">
+        <span class="pos">▲${pos}</span>
+        <span class="neg">▼${neg}</span>
+        <span class="neu">закрыто ${closed}</span>
+      </div>
+      <div class="dmeta">
+        ${wr!=null?`win ${wr}% · `:''}PnL <span class="${pnl>=0?'pos2':'neg'}">${pnl>=0?'+':''}${pnl.toFixed(1)}%</span>
+      </div>
+    </div>`;
+  });
+  grid.innerHTML=cardsHtml;
+
+  // Daily table (last 14 days)
+  const sorted=Object.keys(days).sort().reverse().slice(0,14);
+  let thead=`<tr><th class="l">Дата</th><th>Открыто</th><th>Закрыто</th>
+    <th>▲ Плюс</th><th>▼ Минус</th><th>Win%</th><th>PnL</th><th>Медиана r60</th><th>Лучшая</th><th>Худшая</th></tr>`;
+  let tbody='';
+  for(const d of sorted){
+    const v=days[d];
+    if(v.opened===0 && v.closed===0) continue;
+    const wr=v.closed? Math.round(v.pos/v.closed*100)+'%' : '—';
+    const med=v.rets.length? median(v.rets) : null;
+    const best=v.rets.length? Math.max(...v.rets) : null;
+    const worst=v.rets.length? Math.min(...v.rets) : null;
+    const isToday=d===todayStr;
+    const label=isToday? 'Сегодня' : d===yestStr? 'Вчера' : d;
+    tbody+=`<tr${isToday?' style="background:var(--panel-2)"':''}>
+      <td class="l">${label}</td>
+      <td>${v.opened}</td><td>${v.closed}</td>
+      <td class="pos2">${v.pos}</td><td class="neg">${v.neg}</td>
+      <td>${wr}</td>
+      <td class="${v.pnl>=0?'pos2':'neg'}">${v.pnl>=0?'+':''}${v.pnl.toFixed(1)}%</td>
+      <td>${med!=null?pctf(med):'—'}</td>
+      <td class="pos2">${best!=null?pctf(best):'—'}</td>
+      <td class="neg">${worst!=null?pctf(worst):'—'}</td>
+    </tr>`;
+  }
+  tbl.innerHTML=thead+(tbody||'<tr><td class="l empty" colspan="10">Нет данных за последние 14 дней</td></tr>');
+}
+
+/* ═══════════════════════════════════════════════════════════
+   LIVE POSITIONS
+   ═══════════════════════════════════════════════════════════ */
 function renderLive(){
   const ops=openFiltered();
   const grid=document.getElementById('liveGrid');
@@ -382,7 +533,7 @@ function renderLive(){
     const pnl=o.cur_pnl_pct;
     const warn=o.timeout_pct>=80;
     const se=STATE_EMOJI[o.state]||'·';
-    return `<div class="pos ${acClass(o.asset_class)}" style="animation-delay:${i*50}ms">
+    return `<div class="pos-card ${acClass(o.asset_class)}" style="animation-delay:${i*50}ms">
       <div class="row1">
         <div>
           <div class="sym">${o.symbol}</div>
@@ -420,7 +571,10 @@ function renderLive(){
     });
   });
 }
-/* ── KPI BENTO ── */
+
+/* ═══════════════════════════════════════════════════════════
+   KPI BENTO
+   ═══════════════════════════════════════════════════════════ */
 function kpi(label,valHtml,rawNum,opts={}){
   const d=document.createElement('div');
   d.className='kpi'+(opts.big?' big':'');
@@ -442,7 +596,6 @@ function renderBento(rows,openN){
   const ddMed=dd.length?median(dd):null;
   const last=[...rows].sort((a,b)=>(b.entry_ts||0)-(a.entry_ts||0))[0];
   const b=document.getElementById('bento'); b.innerHTML='';
-  /* [FIX R17] hero-плитка: "—" вместо "+0.0%" при отсутствии закрытых сделок. */
   const heroVal = strat.length ? sum(strat) : null;
   const heroTxt = heroVal==null ? '—' : (heroVal>=0?'+':'') + heroVal.toFixed(1) + '%';
   const heroMeta = heroVal==null ? 'нет закрытых сделок'
@@ -450,8 +603,6 @@ function renderBento(rows,openN){
   const hero=kpi('Накопленный strategy PnL', heroTxt, heroVal, {big:true, meta:heroMeta});
   b.appendChild(hero);
   b.appendChild(kpi('Открыто сейчас', openN, openN, {delay:60, meta: openN?'live-позиции':'ждём входа'}));
-  /* [FIX R27] wr1/med могут быть null (нет сделок с return_60m) — "—" вместо
-     вводящего в заблуждение "0%"/"0.0%". */
   const wr1Txt = wr1==null ? '—' : wr1.toFixed(0)+'%';
   b.appendChild(kpi('Win ≥1% @60m', wr1Txt, wr1, {delay:120, meta:`n=${r60.length}`}));
   b.appendChild(kpi('Медиана @60m', pctf(med), med, {delay:180}));
@@ -473,7 +624,10 @@ function renderBento(rows,openN){
     ? `${openN} открыто` + (liveLast ? ` · ${liveLast.symbol} ${pctf(liveLast.cur_pnl_pct)}` : '')
     : (last ? `last ${last.symbol} ${pctf(last.strategy_pnl_pct)} · ${dstr(last.entry_ts)}` : 'нет сделок');
 }
-/* ── CHARTS ── */
+
+/* ═══════════════════════════════════════════════════════════
+   CHARTS
+   ═══════════════════════════════════════════════════════════ */
 function barByBucket(rows,key,edges,canvas){
   const g={};
   for(const r of rows){ const k=bucket(r[key],edges); (g[k]=g[k]||[]).push(r.return_60m); }
@@ -521,7 +675,10 @@ function equity(rows,canvas){
         y:{ticks:{color:'#93a0b8',callback:v=>v+'%'},grid:{color:'#2c3447'}}},
       plugins:{legend:{labels:{color:'#93a0b8'}}}}});
 }
-/* ── TABLE + TOP ── */
+
+/* ═══════════════════════════════════════════════════════════
+   TABLE + TOP
+   ═══════════════════════════════════════════════════════════ */
 const COLS=[
   ['entry_ts','Дата',t=>dstr(t.entry_ts),1],
   ['symbol','Монета',t=>t.symbol,1],
@@ -575,9 +732,14 @@ function topDiv(rows){
     </div>`;
   }).join('') : '<div class="empty">Нет данных</div>';
 }
+
+/* ═══════════════════════════════════════════════════════════
+   RENDER ALL
+   ═══════════════════════════════════════════════════════════ */
 function renderAll(){
   const rows=filtered();
   const ops=openFiltered();
+  renderDaily(rows);
   renderLive();
   renderBento(rows,ops.length);
   barByBucket(rows,'entry_momentum',MOM_B,'chMom');
@@ -591,33 +753,38 @@ function renderAll(){
   document.getElementById('foot').textContent =
     `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE < ${LOW}`;
 }
+
 const io = new IntersectionObserver(entries=>{
   entries.forEach(e=>{ if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);} });
 },{threshold:.12});
 function observeReveals(){ document.querySelectorAll('.reveal:not(.in)').forEach(el=>io.observe(el)); }
-/* [FIX R26] Раньше переключение фильтров #asset/#life не вызывало
-   перерисовку — пользователь видел эффект только случайно, если после
-   этого трогал сортировку таблицы (которая сама дёргает renderTable). */
+
 document.getElementById('asset').addEventListener('change', renderAll);
 document.getElementById('life').addEventListener('change', renderAll);
 renderAll(); observeReveals();
 </script>
 </body>
 </html>"""
+
+
 def main():
-    trades = load_trades()
+    trades, bad_lines = load_trades()
     open_positions = load_open()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     html = (HTML
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
             .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
             .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN)))
+    # [FIX F7] raise вместо assert (не отключается -O)
     for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__"):
-        assert placeholder not in html, (
-            f"make_dashboard.py: плейсхолдер {placeholder} не был подставлен — "
-            f"генерация дашборда остановлена, чтобы не закоммитить битый HTML"
-        )
+        if placeholder in html:
+            raise RuntimeError(
+                f"make_dashboard.py: плейсхолдер {placeholder} не подставлен — "
+                f"генерация остановлена, чтобы не закоммитить битый HTML")
     OUT.write_text(html, encoding="utf-8")
-    print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых)")
+    bad_note = f" · ⚠ {bad_lines} битых строк" if bad_lines else ""
+    print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых{bad_note})")
+
+
 if __name__ == "__main__":
     main()
