@@ -720,12 +720,29 @@ def detect_pattern(r: dict, derived: dict, momentum: int) -> str:
 # ═══════════════════════════════════════════════════════════
 # 8. MARKET PHASE DETECTION
 # ═══════════════════════════════════════════════════════════
-def detect_market_phase(rows: list[dict]) -> dict:
+ def fetch_btc_price_chg():
+    """[FIX R20] BTC из Binance public API, если BTCUSDT не прошёл discovery."""
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
+            timeout=10)
+        if r.status_code == 200:
+            return float(r.json().get("priceChangePercent", 0))
+    except Exception as e:
+        log.warning(f"Binance API недоступен: {e}")
+    return None
+
+
+def detect_market_phase(rows):
+    """[FIX R20] Фаза рынка. BTC из rows, fallback — Binance API."""
     btc = next((r for r in rows if r["symbol"] == "BTCUSDT"), None)
-    if not btc:
-        return {"phase": "unknown", "note": "", "modifier": 0}
-    btc_pc = safe(btc.get("price_chg24"))
-    up = sum(1 for r in rows if safe(r.get("price_chg24")) > 0)
+    if btc:
+        btc_pc = btc.get("price_chg24") or 0
+    else:
+        btc_pc = fetch_btc_price_chg()
+        if btc_pc is None:
+            return {"phase": "unknown", "note": "", "modifier": 0}
+    up = sum(1 for r in rows if (r.get("price_chg24") or 0) > 0)
     ratio = up / max(len(rows), 1)
     if btc_pc > 2 and ratio > 0.6:
         return {"phase": "risk-on", "note": "BTC↑ рынок широкий", "modifier": +1}
@@ -736,6 +753,7 @@ def detect_market_phase(rows: list[dict]) -> dict:
     if btc_pc < -2 and ratio > 0.5:
         return {"phase": "rotation", "note": "BTC↓ альты держатся", "modifier": 0}
     return {"phase": "neutral", "note": "", "modifier": 0}
+  
 # ═══════════════════════════════════════════════════════════
 # 9. LIFECYCLE ENGINE
 #    Возвращает (state, reasons, warnings, entry_path).
