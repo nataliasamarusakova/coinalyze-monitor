@@ -424,6 +424,16 @@ def load_existing_trade_ids() -> set:
 
 
 def load_pending() -> list:
+    # [FIX C3] Миграция с legacy .json на .jsonl
+    if not PENDING_FILE.exists() and PENDING_FILE_LEGACY.exists():
+        try:
+            legacy_data = PENDING_FILE_LEGACY.read_text(encoding="utf-8")
+            PENDING_FILE.write_text(legacy_data, encoding="utf-8")
+            PENDING_FILE_LEGACY.unlink()
+            log.info("pending: мигрировано с legacy .json на .jsonl")
+        except Exception as e:
+            log.error(f"pending: миграция не удалась: {e}")
+
     if not PENDING_FILE.exists():
         return []
     raw = PENDING_FILE.read_text(encoding="utf-8")
@@ -434,7 +444,7 @@ def load_pending() -> list:
             data = json.loads(stripped)
         except json.JSONDecodeError as e:
             backup = _quarantine_corrupt_file(PENDING_FILE)
-            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json (legacy) "
+            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.jsonl (legacy) "
                    f"повреждён: {e}\nBackup: {backup.name if backup else 'не создан'}\n"
                    f"Прогон остановлен.")
             log.error(msg.replace("<b>", "").replace("</b>", ""))
@@ -453,17 +463,17 @@ def load_pending() -> list:
                 bad_lines += 1
         if bad_lines and not data:
             backup = _quarantine_corrupt_file(PENDING_FILE)
-            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json полностью бит "
+            msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.jsonl полностью бит "
                    f"({bad_lines} строк). Backup: {backup.name if backup else 'не создан'}\n"
                    f"Прогон остановлен.")
             log.error(msg.replace("<b>", "").replace("</b>", ""))
             send_tg(msg)
             sys.exit(1)
         if bad_lines:
-            log.warning(f"pending_trades.json: {bad_lines} битых строк пропущено")
+            log.warning(f"pending_trades.jsonl: {bad_lines} битых строк пропущено")
     if not isinstance(data, list):
         backup = _quarantine_corrupt_file(PENDING_FILE)
-        msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.json имеет неожиданный "
+        msg = (f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.jsonl имеет неожиданный "
                f"формат. Backup: {backup.name if backup else 'не создан'}\n"
                f"Прогон остановлен.")
         log.error(msg.replace("<b>", "").replace("</b>", ""))
