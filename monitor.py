@@ -47,8 +47,8 @@ HEARTBEAT_FILE      = BASE / "heartbeat.jsonl"
 WATCHLIST_FILE      = BASE / "watchlist.json"
 CALIBRATION_FILE    = BASE / "calibration.jsonl"
 TRADES_FILE         = BASE / "trades.jsonl"
-PENDING_FILE        = BASE / "pending_trades.json"
-PENDING_FILE_LEGACY = BASE / "pending_trades.json"
+PENDING_FILE        = BASE / "pending_trades.jsonl"     # [FIX C3] было .json
+PENDING_FILE_LEGACY = BASE / "pending_trades.json"      # для миграции
 DEBUG_HTML_FILE     = BASE / "debug_page.html"
 
 # ═══════════════════════════════════════════════════════════
