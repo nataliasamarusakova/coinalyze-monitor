@@ -7,8 +7,8 @@ unentered_tracker.py — детектор упущенных движений.
 форвардному исходу и определяет fail_point.
 
 ВАЖНО: «упущенное движение» (unentered) ≠ «MISSED» (exit_reason в close_trade).
-MISSED — сделка БЫЛА открыта, монета выпала из discovery.
-Unentered — сделка НЕ БЫЛА открыта вообще.
+MISSED — это когда сделка БЫЛА открыта, но монета выпала из discovery.
+Unentered — это когда сделка НЕ БЫЛА открыта вообще. Разные концепции.
 
 Запуск: python unentered_tracker.py  (после monitor.py в том же прогоне)
 """
@@ -25,11 +25,11 @@ from conditions import (
 )
 
 try:
-    from monitor import classify_asset_class, SIGNAL_LOGIC_VERSION
+    from monitor import SIGNAL_LOGIC_VERSION, classify_asset_class
 except Exception:
+    SIGNAL_LOGIC_VERSION = 1
     def classify_asset_class(r):
         return "crypto"
-    SIGNAL_LOGIC_VERSION = 1
 
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY = BASE / "market_history.jsonl"
@@ -40,11 +40,9 @@ ANALYSIS_FILE = BASE / "unentered_analysis.jsonl"
 
 CANDIDATES_TTL_DAYS = 7
 ANALYSIS_TTL_DAYS = 90
-
 MISSED_THRESHOLD_PCT = 5.0
 FINALIZATION_WINDOW_H = 6
 FORWARD_HORIZONS = [60, 120]
-FORWARD_MAX_LAG_MIN = 15
 
 
 def now_ts() -> int:
@@ -71,12 +69,6 @@ def append_jsonl(path: Path, rec: dict):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def save_jsonl(path: Path, recs: list[dict]):
-    with open(path, "w", encoding="utf-8") as f:
-        for r in recs:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
 def cleanup_jsonl(path: Path, ttl_days: int, ts_field: str = "detect_ts"):
     if not path.exists():
         return
@@ -85,7 +77,9 @@ def cleanup_jsonl(path: Path, ttl_days: int, ts_field: str = "detect_ts"):
     fresh = [r for r in recs if r.get(ts_field, 0) > cutoff]
     removed = len(recs) - len(fresh)
     if removed:
-        save_jsonl(path, fresh)
+        with open(path, "w", encoding="utf-8") as f:
+            for r in fresh:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"cleanup {path.name}: -{removed}")
 
 
@@ -122,9 +116,8 @@ def get_active_symbols() -> set:
     return active
 
 
-def compute_forward_returns(snaps: list[dict], detect_ts: int,
-                            entry_price: float) -> dict:
-    """[FIX M1] Ищем ближайший снимок (abs lag), а не только после target_ts."""
+def compute_forward_returns(snaps: list[dict], detect_ts: int, entry_price: float) -> dict:
+    """Форвардные return_60m/120m. Ищем ближайший снимок (abs lag). FIX M1."""
     result = {}
     for h in FORWARD_HORIZONS:
         target_ts = detect_ts + h * 60
@@ -136,7 +129,7 @@ def compute_forward_returns(snaps: list[dict], detect_ts: int,
             if lag < best_lag:
                 best_lag = lag
                 best_price = s.get("price")
-        if best_price is not None and best_lag <= FORWARD_MAX_LAG_MIN * 60 and entry_price:
+        if best_price is not None and best_lag <= 15 * 60 and entry_price:
             result[f"forward_{h}m"] = round((best_price - entry_price) / entry_price * 100, 3)
             result[f"forward_{h}m_available"] = True
         else:
@@ -145,8 +138,8 @@ def compute_forward_returns(snaps: list[dict], detect_ts: int,
     return result
 
 
-def classify_quality(forward_returns: dict, movement_snaps: list[dict],
-                     detect_ts: int) -> dict:
+def classify_quality(forward_returns: dict, movement_snaps: list[dict]) -> dict:
+    """Форвардная классификация: good / noise / late / undetermined."""
     f60 = forward_returns.get("forward_60m")
     f120 = forward_returns.get("forward_120m")
     if f60 is None and f120 is None:
@@ -154,7 +147,6 @@ def classify_quality(forward_returns: dict, movement_snaps: list[dict],
     best_forward = max([v for v in [f60, f120] if v is not None], default=None)
     if best_forward is None:
         return {"label": "undetermined", "reason": "нет форвардных данных"}
-
     if len(movement_snaps) >= 3:
         oi_start = safe(movement_snaps[0].get("oi_chg24_pct"))
         oi_end = safe(movement_snaps[-1].get("oi_chg24_pct"))
@@ -165,7 +157,6 @@ def classify_quality(forward_returns: dict, movement_snaps: list[dict],
     else:
         oi_rising = None
         cvd_rising = None
-
     if best_forward >= 2.0 and oi_rising and cvd_rising:
         return {"label": "good", "reason": "форвардный рост + OI↑ + CVD↑"}
     elif best_forward >= 2.0:
@@ -179,11 +170,9 @@ def classify_quality(forward_returns: dict, movement_snaps: list[dict],
 
 
 def determine_fail_point(sym: str, movement_snaps: list[dict],
-                         lifecycle_state: Optional[str],
-                         cvd_momentum: float) -> dict:
+                         lifecycle_state: Optional[str], cvd_momentum: float) -> dict:
     confidence = "observed" if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE") else "estimated"
     cm = closest_miss_for_confirmed(movement_snaps, cvd_momentum)
-
     if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE"):
         stage = lifecycle_state
         if cm["condition"] is not None:
@@ -193,11 +182,9 @@ def determine_fail_point(sym: str, movement_snaps: list[dict],
         return {"stage": stage, "condition": "conditions_met_but_not_confirmed",
                 "path": None, "deficit": 0, "value": None, "threshold": None,
                 "confidence": confidence}
-
     result_a = check_confirmed_path_a(movement_snaps)
     result_em = check_early_move(movement_snaps)
     result_acc = check_accumulation(movement_snaps)
-
     if result_a.get("passed") or result_a.get("insufficient_data"):
         stage_note = "estimated: условия CONFIRMED выполнены или мало данных"
     elif result_em.get("passed"):
@@ -206,10 +193,9 @@ def determine_fail_point(sym: str, movement_snaps: list[dict],
         stage_note = "estimated: прошла ACCUMULATION, не дошла до EARLY_MOVE"
     else:
         stage_note = "estimated: не прошла даже ACCUMULATION"
-
     return {"stage": stage_note, "condition": cm["condition"], "path": cm["path"],
-            "deficit": cm["deficit"], "value": cm["value"], "threshold": cm["threshold"],
-            "confidence": confidence}
+            "deficit": cm["deficit"], "value": cm["value"],
+            "threshold": cm["threshold"], "confidence": confidence}
 
 
 def compute_cvd_momentum(snaps: list[dict]) -> float:
@@ -229,7 +215,7 @@ def run():
     existing_candidate_syms = {c.get("symbol") for c in existing_candidates
                                if c.get("detect_ts", 0) > now - 24 * 3600}
 
-    # ── Шаг 1: Обнаружение новых кандидатов ──
+    # Шаг 1: Обнаружение новых кандидатов
     new_candidates = 0
     for sym, snaps in market_snaps.items():
         if not snaps or sym in active_symbols or sym in existing_candidate_syms:
@@ -255,12 +241,9 @@ def run():
         append_jsonl(CANDIDATES_FILE, candidate)
         new_candidates += 1
 
-    # ── Шаг 2: Финализация кандидатов ──
+    # Шаг 2: Финализация кандидатов
     finalized = 0
     remaining = []
-    already_finalized = {(r.get("detect_ts"), r.get("symbol"))
-                         for r in load_jsonl(ANALYSIS_FILE)}
-
     for cand in existing_candidates:
         detect_ts = cand.get("detect_ts", 0)
         sym = cand.get("symbol")
@@ -269,20 +252,16 @@ def run():
         if now - detect_ts < FINALIZATION_WINDOW_H * 3600:
             remaining.append(cand)
             continue
-        if (detect_ts, sym) in already_finalized:
-            continue
-
-        # [FIX S4] try/except для устойчивости
         try:
             snaps = market_snaps.get(sym, [])
             entry_price = cand.get("price_at_detect")
             forward_returns = compute_forward_returns(snaps, detect_ts, entry_price)
             movement_snaps = [s for s in snaps if s.get("ts", 0) >= detect_ts - 4 * 3600]
-            quality = classify_quality(forward_returns, movement_snaps, detect_ts)
+            quality = classify_quality(forward_returns, movement_snaps)
             cvd_mom = cand.get("cvd_momentum_at_detect", 0)
             lifecycle_state = cand.get("lifecycle_state_at_detect")
             fail_point = determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_mom)
-
+            asset_class = classify_asset_class({"symbol": sym, "name": cand.get("name", "")})
             analysis_rec = {
                 "detect_ts": detect_ts,
                 "finalize_ts": now,
@@ -293,8 +272,8 @@ def run():
                 "lifecycle_state_at_detect": lifecycle_state,
                 "cvd_momentum_at_detect": cvd_mom,
                 "signal_logic_version": cand.get("signal_logic_version", SIGNAL_LOGIC_VERSION),
-                "asset_class": classify_asset_class({"symbol": sym, "name": cand.get("name", "")}),
                 "movement_snaps_count": len(movement_snaps),
+                "asset_class": asset_class,
                 **forward_returns,
                 "quality": quality,
                 "fail_point": fail_point,
@@ -305,14 +284,17 @@ def run():
             print(f"ERROR: финализация {sym} упала: {e}")
             remaining.append(cand)
 
-    # [FIX C1] Перезаписываем candidates без финализированных
-    save_jsonl(CANDIDATES_FILE, remaining)
+    # FIX C1: Перезаписываем CANDIDATES_FILE без финализированных
+    with open(CANDIDATES_FILE, "w", encoding="utf-8") as f:
+        for cand in remaining:
+            f.write(json.dumps(cand, ensure_ascii=False) + "\n")
 
-    # ── Шаг 3: Cleanup ──
+    # Шаг 3: Cleanup
     cleanup_jsonl(CANDIDATES_FILE, CANDIDATES_TTL_DAYS, "detect_ts")
     cleanup_jsonl(ANALYSIS_FILE, ANALYSIS_TTL_DAYS, "detect_ts")
 
-    pending_count = len(load_jsonl(CANDIDATES_FILE))
+    pending_count = len([c for c in load_jsonl(CANDIDATES_FILE)
+                         if c.get("status") != "finalized"])
     print(f"  новых кандидатов: {new_candidates}")
     print(f"  финализировано: {finalized}")
     print(f"  ожидают классификации: {pending_count}")
