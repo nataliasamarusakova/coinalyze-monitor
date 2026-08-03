@@ -215,23 +215,24 @@ def top_divergence(rows):
 
 
 def analyze_unentered(unentered, trades, cutoff_h=24):
-    """Анализ упущенных хороших лонгов."""
     now = time.time()
     cutoff = now - cutoff_h * 3600
 
-    # Хорошие лонги, которые поймали
+    # [FIX M4] Фильтр по asset_class == "crypto" для trades
     caught_good = []
     for t in trades:
         if t.get("entry_ts") and t["entry_ts"] >= cutoff:
+            if t.get("asset_class", "crypto") != "crypto":
+                continue
             r60 = t.get("return_60m")
             strat = t.get("strategy_pnl_pct")
             if (r60 is not None and r60 >= 1.0) or (strat is not None and strat > 0):
                 caught_good.append(t)
 
-    # Хорошие лонги, которые упустили
     missed_good = [u for u in unentered
                    if u.get("detect_ts", 0) >= cutoff
-                   and u.get("quality", {}).get("label") == "good"]
+                   and u.get("quality", {}).get("label") == "good"
+                   and u.get("asset_class", "crypto") == "crypto"]
 
     total_good = len(caught_good) + len(missed_good)
     capture_rate = len(caught_good) / total_good * 100 if total_good > 0 else 0
@@ -246,7 +247,6 @@ def analyze_unentered(unentered, trades, cutoff_h=24):
         print(f"  ⚠ low sample (<{LOW_SAMPLE_WARNING}) — выводов пока не делать")
         return
 
-    # Агрегация по fail_point
     by_condition = defaultdict(lambda: {"count": 0, "deficits": []})
     by_stage = defaultdict(int)
     for u in missed_good:
@@ -254,14 +254,12 @@ def analyze_unentered(unentered, trades, cutoff_h=24):
         stage = fp.get("stage", "unknown")
         condition = fp.get("condition", "unknown")
         deficit = fp.get("deficit")
-
         key = f"{stage}:{condition}"
         by_condition[key]["count"] += 1
         by_condition[key]["stage"] = stage
         by_condition[key]["condition"] = condition
         if deficit is not None and deficit != float("inf"):
             by_condition[key]["deficits"].append(deficit)
-
         by_stage[stage] += 1
 
     print(f"\n  False negative rate по условию (топ-10):")
@@ -281,7 +279,6 @@ def analyze_unentered(unentered, trades, cutoff_h=24):
     for stage, count in sorted(by_stage.items(), key=lambda x: x[1], reverse=True):
         print(f"    {stage:30} {count:>6}")
 
-    # Near-miss распределение
     near_miss = [u for u in missed_good
                  if u.get("fail_point", {}).get("deficit") is not None
                  and u.get("fail_point", {}).get("deficit") != float("inf")]
