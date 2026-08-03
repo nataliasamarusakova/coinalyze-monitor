@@ -1,21 +1,30 @@
 """make_dashboard.py — генерирует docs/index.html (дашборд сделок) из trades.jsonl
-+ живые открытые позиции из watchlist.json.
++ живые открытые позиции из watchlist.json + упущенные движения из market_history.jsonl.
+
 Данные инлайнятся → самодостаточный HTML (GitHub Pages + локально без сервера).
-Закрытые сделки = trades.jsonl (история исходов). Открытые = watchlist.json
-(блок LIVE с текущим PnL). Запуск:  python make_dashboard.py
+Закрытые сделки = trades.jsonl. Открытые = watchlist.json (блок LIVE).
+Упущенные = market_history.jsonl (монеты с ростом > порога без нашей сделки).
 
 ФИКСЫ:
   - F6: load_trades() считает и печатает битые строки.
   - F7: assert заменён на raise RuntimeError (не отключается -O).
-  - НОВОЕ: подробная статистика по дням (открыто/закрыто/плюс/минус/win%/PnL).
+  - Статистика по дням (открыто/закрыто/плюс/минус/win%/PnL).
+  - Упущенные движения за 24ч.
+  - Порядок: Статистика по дням поставлена перед Win-rate графиками.
+
+Запуск:  python make_dashboard.py
 """
 import json
+import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 TRADES = BASE / "trades.jsonl"
 WATCHLIST = BASE / "watchlist.json"
+MARKET_HISTORY = BASE / "market_history.jsonl"
 OUT = BASE / "docs" / "index.html"
+
+MISSED_THRESHOLD = 5.0   # порог "значимого роста" (% за 24ч) для упущенных
 
 try:
     from monitor import TRADE_TIMEOUT_MIN
@@ -101,6 +110,54 @@ def load_open():
     out.sort(key=lambda x: (x["cur_pnl_pct"] if x["cur_pnl_pct"] is not None else -999),
              reverse=True)
     return out
+
+
+def load_market_history():
+    """Последний снимок каждой монеты из market_history.jsonl (глубина ~24ч)."""
+    if not MARKET_HISTORY.exists():
+        return []
+    latest = {}
+    for ln in MARKET_HISTORY.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        sym = r.get("symbol")
+        ts = r.get("ts", 0)
+        if not sym:
+            continue
+        if sym not in latest or ts > latest[sym]["ts"]:
+            latest[sym] = {
+                "symbol": sym,
+                "name": r.get("name", sym),
+                "price": r.get("price"),
+                "price_chg24": r.get("price_chg24"),
+                "ts": ts,
+            }
+    return list(latest.values())
+
+
+def compute_missed(market_data, trades, open_positions, threshold_pct=MISSED_THRESHOLD):
+    """Упущенные: монеты с ростом > порога, по которым нет сделки (открытой или закрытой за 24ч)."""
+    now = time.time()
+    cutoff_24h = now - 24 * 3600
+    active_symbols = set()
+    for op in open_positions:
+        active_symbols.add(op["symbol"])
+    for t in trades:
+        if t.get("entry_ts") and t["entry_ts"] >= cutoff_24h:
+            active_symbols.add(t["symbol"])
+
+    missed = []
+    for m in market_data:
+        chg = m.get("price_chg24")
+        if chg is not None and chg > threshold_pct and m["symbol"] not in active_symbols:
+            missed.append(m)
+    missed.sort(key=lambda x: x.get("price_chg24") or 0, reverse=True)
+    return missed
 
 
 HTML = r"""<!doctype html>
@@ -313,14 +370,6 @@ HTML = r"""<!doctype html>
       </select></div>
   </div>
 
-  <!-- ═══ DAILY STATS ═══ -->
-  <div class="sec-title">Статистика по дням</div>
-  <div class="daygrid" id="dayGrid"></div>
-  <div class="panel reveal" style="margin-bottom:26px">
-    <h3>История по дням (последние 14 дней)</h3>
-    <div style="overflow-x:auto"><table class="dailytbl" id="dailyTbl"></table></div>
-  </div>
-
   <!-- ═══ LIVE POSITIONS ═══ -->
   <div class="livehead">
     <span class="pdot idle" id="liveDot"></span>
@@ -332,7 +381,22 @@ HTML = r"""<!doctype html>
   <!-- ═══ KPI BENTO ═══ -->
   <div class="bento" id="bento"></div>
 
-  <!-- ═══ CHARTS ═══ -->
+  <!-- ═══ DAILY STATS (перед Win-rate) ═══ -->
+  <div class="sec-title">Статистика по дням</div>
+  <div class="daygrid" id="dayGrid"></div>
+  <div class="panel reveal" style="margin-bottom:26px">
+    <h3>История по дням (последние 14 дней)</h3>
+    <div style="overflow-x:auto"><table class="dailytbl" id="dailyTbl"></table></div>
+  </div>
+
+  <!-- ═══ MISSED OPPORTUNITIES (перед Win-rate) ═══ -->
+  <div class="sec-title">Упущенные движения · 24ч</div>
+  <div class="panel reveal" style="margin-bottom:26px">
+    <h3>Рост > __MISSED_THRESHOLD__% без нашей сделки</h3>
+    <div style="overflow-x:auto"><table class="dailytbl" id="missedTbl"></table></div>
+  </div>
+
+  <!-- ═══ WIN-RATE CHARTS ═══ -->
   <div class="grid2">
     <div class="panel reveal"><h3>Win-rate ≥1% по MOMENTUM входа</h3><canvas id="chMom"></canvas></div>
     <div class="panel reveal"><h3>Win-rate ≥1% по CVD_MOMENTUM входа</h3><canvas id="chCvd"></canvas></div>
@@ -340,6 +404,7 @@ HTML = r"""<!doctype html>
     <div class="panel reveal"><h3>Накопленный strategy PnL</h3><canvas id="chEquity"></canvas></div>
   </div>
 
+  <!-- ═══ TOP 10 ═══ -->
   <div class="grid2">
     <div class="panel reveal"><h3>TOP 10 — лучший сигнал (return@60m)</h3><div id="topSig"></div></div>
     <div class="panel reveal"><h3>TOP 10 — лучшая стратегия (PnL)</h3><div id="topStr"></div></div>
@@ -359,6 +424,7 @@ HTML = r"""<!doctype html>
 <script>
 const TRADES = __DATA__;
 const OPEN   = __OPEN__;
+const MISSED = __MISSED__;
 const MOM_B=[3,5,7], CVD_B=[0,3,6,10];
 const LOW=20;
 const STATE_EMOJI={NEUTRAL:"⚪",ACCUMULATION:"🔍",EARLY_MOVE:"🌱",CONFIRMED_TREND:"🟢",
@@ -439,8 +505,6 @@ function computeDaily(rows){
     }
     if(t.return_60m!=null) days[d].rets.push(t.return_60m);
   }
-
-  // Ensure last 14 days exist
   for(let i=0;i<14;i++){
     const dt=new Date(now); dt.setDate(dt.getDate()-i);
     const k=dt.toISOString().slice(0,10);
@@ -454,7 +518,6 @@ function renderDaily(rows){
   const grid=document.getElementById('dayGrid');
   const tbl=document.getElementById('dailyTbl');
 
-  // Summary cards: Today, Yesterday, 7d, 30d, All
   const periods=[
     {label:'Сегодня', filter:d=>d===todayStr},
     {label:'Вчера', filter:d=>d===yestStr},
@@ -487,7 +550,6 @@ function renderDaily(rows){
   });
   grid.innerHTML=cardsHtml;
 
-  // Daily table (last 14 days)
   const sorted=Object.keys(days).sort().reverse().slice(0,14);
   let thead=`<tr><th class="l">Дата</th><th>Открыто</th><th>Закрыто</th>
     <th>▲ Плюс</th><th>▼ Минус</th><th>Win%</th><th>PnL</th><th>Медиана r60</th><th>Лучшая</th><th>Худшая</th></tr>`;
@@ -513,6 +575,28 @@ function renderDaily(rows){
     </tr>`;
   }
   tbl.innerHTML=thead+(tbody||'<tr><td class="l empty" colspan="10">Нет данных за последние 14 дней</td></tr>');
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MISSED OPPORTUNITIES
+   ═══════════════════════════════════════════════════════════ */
+function renderMissed(){
+  const tbl=document.getElementById('missedTbl');
+  if(!MISSED.length){
+    tbl.innerHTML='<tr><td class="l empty">Нет упущенных движений за последние 24ч</td></tr>';
+    return;
+  }
+  let head=`<tr><th class="l">Монета</th><th>Рост 24ч</th><th>Цена</th><th>Последний снимок</th></tr>`;
+  let body='';
+  for(const m of MISSED){
+    body+=`<tr>
+      <td class="l">${m.name||m.symbol} (${m.symbol})</td>
+      <td class="pos2">${pctf(m.price_chg24)}</td>
+      <td>${pricef(m.price)}</td>
+      <td>${dstr(m.ts)}</td>
+    </tr>`;
+  }
+  tbl.innerHTML=head+body;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -739,9 +823,10 @@ function topDiv(rows){
 function renderAll(){
   const rows=filtered();
   const ops=openFiltered();
-  renderDaily(rows);
   renderLive();
   renderBento(rows,ops.length);
+  renderDaily(rows);
+  renderMissed();
   barByBucket(rows,'entry_momentum',MOM_B,'chMom');
   barByBucket(rows,'entry_cvd_momentum',CVD_B,'chCvd');
   scatter(rows,'chScatter');
@@ -751,7 +836,7 @@ function renderAll(){
   topDiv(rows);
   renderTable(rows);
   document.getElementById('foot').textContent =
-    `live: ${ops.length} · архив: ${rows.length} · signal outcome = return@60m · strategy outcome = PnL после fee · LOW SAMPLE < ${LOW}`;
+    `live: ${ops.length} · архив: ${rows.length} · упущено 24ч: ${MISSED.length} · LOW SAMPLE < ${LOW}`;
 }
 
 const io = new IntersectionObserver(entries=>{
@@ -770,20 +855,27 @@ renderAll(); observeReveals();
 def main():
     trades, bad_lines = load_trades()
     open_positions = load_open()
+    market_data = load_market_history()
+    missed = compute_missed(market_data, trades, open_positions)
+
     OUT.parent.mkdir(parents=True, exist_ok=True)
     html = (HTML
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
             .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
-            .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN)))
+            .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN))
+            .replace("__MISSED__", json.dumps(missed, ensure_ascii=False))
+            .replace("__MISSED_THRESHOLD__", str(MISSED_THRESHOLD)))
     # [FIX F7] raise вместо assert (не отключается -O)
-    for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__"):
+    for placeholder in ("__DATA__", "__OPEN__", "__TIMEOUT_MIN__",
+                        "__MISSED__", "__MISSED_THRESHOLD__"):
         if placeholder in html:
             raise RuntimeError(
                 f"make_dashboard.py: плейсхолдер {placeholder} не подставлен — "
                 f"генерация остановлена, чтобы не закоммитить битый HTML")
     OUT.write_text(html, encoding="utf-8")
     bad_note = f" · ⚠ {bad_lines} битых строк" if bad_lines else ""
-    print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых{bad_note})")
+    print(f"Dashboard: {OUT}  ({len(trades)} закрытых · {len(open_positions)} открытых"
+          f" · {len(missed)} упущенных{bad_note})")
 
 
 if __name__ == "__main__":
