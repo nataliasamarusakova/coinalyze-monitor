@@ -1,143 +1,376 @@
-"""conditions.py — проверочные функции условий lifecycle.
-Общий модуль для unentered_tracker.py (и в будущем для monitor.py).
-
-ВНИМАНИЕ: пороги должны совпадать с monitor.py. При изменении monitor.py
-синхронизируй этот файл. Проверка консистентности — в test_conditions.py.
-
-Эти функции проверяют условия на снимках, но НЕ воспроизводят полную машину
-состояний (prev_state, порядок проверок, гистерезис). Для fail_point в
-суженном scope v1 этого достаточно.
 """
+conditions.py — общие предикаты условий lifecycle.
+
+Используются и в monitor.py (detect_lifecycle), и в unentered_tracker.py
+(fail_point analysis). Это гарантия консистентности порогов между продом
+и аналитикой: обе стороны проверяют ОДИН И ТОТ ЖЕ код.
+
+ВАЖНО: это чистые предикаты на список снимков, БЕЗ трекинга prev_state
+и без порядка вызова. Они отвечают на вопрос «выполнено ли условие X
+на данных снимках», а не «какое состояние должна получить монета».
+Порядок и prev_state обрабатываются вызывающим кодом.
+
+Версия: SIGNAL_LOGIC_VERSION = 1
+При изменении любого порога ниже — инкрементировать SIGNAL_LOGIC_VERSION
+в monitor.py и записать в calibration_changelog.jsonl.
+"""
+
 from typing import Optional
 
-MIN_SNAPS_LIFECYCLE = 5
+
+def safe(val, default=0.0) -> float:
+    return val if val is not None else default
 
 
-def check_confirmed_path_a(recent):
-    """Path A: все снимки OI>5 и CVD>55."""
-    oi_vals = [s.get("oi_chg24_pct") or 0 for s in recent]
-    cvd_vals = [s.get("cvd24") or 0 for s in recent]
-    passed = all(v > 5 for v in oi_vals) and all(v > 55 for v in cvd_vals)
-    return passed, oi_vals, cvd_vals
+# ═══════════════════════════════════════════════════════════
+# CONFIRMED_TREND — path_a
+# ═══════════════════════════════════════════════════════════
+
+CONFIRMED_A_SNAPS = 5          # MIN_SNAPS_LIFECYCLE
+CONFIRMED_A_OI_MIN = 5.0       # oi_chg24_pct > 5 на всех снимках
+CONFIRMED_A_CVD_MIN = 55.0     # cvd24 > 55 на всех снимках
+CONFIRMED_A_OI4H_POS = True    # oi_chg4h_pct > 0 на всех снимках
+CONFIRMED_A_FR_MAX = 0.05      # fr_oiw < 0.05 на всех снимках
+CONFIRMED_A_LLS_MAX = 40.0     # lls24 < 40 на всех снимках
+CONFIRMED_A_PC_TOLERANCE = 0.5 # price_chg24 не падает более чем на 0.5
+CONFIRMED_A_OI_TOLERANCE = 1.0 # oi_chg24_pct не падает более чем на 1
+CONFIRMED_A_CVD_TOLERANCE = 5.0 # cvd24 не падает более чем на 5
 
 
-def check_confirmed_path_b(recent, cvd_momentum):
-    """Path B: все снимки OI>2 и CVD>50, ускорение OI, cvd_momentum>5."""
-    oi_vals = [s.get("oi_chg24_pct") or 0 for s in recent]
-    cvd_vals = [s.get("cvd24") or 0 for s in recent]
-    base = all(v > 2 for v in oi_vals) and all(v > 50 for v in cvd_vals)
+def check_confirmed_path_a(snaps: list[dict]) -> dict:
+    """Проверяет path_a CONFIRMED_TREND на последних снимках.
+    Возвращает {passed, conditions: {name: {met, value, threshold, deficit}}}."""
+    if len(snaps) < CONFIRMED_A_SNAPS:
+        return {"passed": False, "insufficient_data": True,
+                "snaps_have": len(snaps), "snaps_need": CONFIRMED_A_SNAPS,
+                "conditions": {}}
+    recent = snaps[-CONFIRMED_A_SNAPS:]
+    conds = {}
+
+    # OI > 5 на всех
+    vals_oi = [safe(s.get("oi_chg24_pct")) for s in recent]
+    met_oi = all(v > CONFIRMED_A_OI_MIN for v in vals_oi)
+    worst_oi = min(vals_oi)
+    conds["oi_chg24_gt5"] = {
+        "met": met_oi,
+        "value": round(worst_oi, 2),
+        "threshold": CONFIRMED_A_OI_MIN,
+        "deficit": round(CONFIRMED_A_OI_MIN - worst_oi, 2) if not met_oi else 0,
+        "met_count": sum(1 for v in vals_oi if v > CONFIRMED_A_OI_MIN),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # CVD > 55 на всех
+    vals_cvd = [safe(s.get("cvd24")) for s in recent]
+    met_cvd = all(v > CONFIRMED_A_CVD_MIN for v in vals_cvd)
+    worst_cvd = min(vals_cvd)
+    conds["cvd_gt55"] = {
+        "met": met_cvd,
+        "value": round(worst_cvd, 2),
+        "threshold": CONFIRMED_A_CVD_MIN,
+        "deficit": round(CONFIRMED_A_CVD_MIN - worst_cvd, 2) if not met_cvd else 0,
+        "met_count": sum(1 for v in vals_cvd if v > CONFIRMED_A_CVD_MIN),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # OI4h > 0 на всех
+    vals_oi4 = [safe(s.get("oi_chg4h_pct")) for s in recent]
+    met_oi4 = all(v > 0 for v in vals_oi4)
+    conds["oi4h_positive"] = {
+        "met": met_oi4,
+        "value": round(min(vals_oi4), 3),
+        "threshold": 0,
+        "deficit": round(0 - min(vals_oi4), 3) if not met_oi4 else 0,
+        "met_count": sum(1 for v in vals_oi4 if v > 0),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # FR < 0.05 на всех
+    vals_fr = [s.get("fr_oiw") for s in recent]
+    met_fr = all(v is not None and v < CONFIRMED_A_FR_MAX for v in vals_fr)
+    worst_fr = max([v for v in vals_fr if v is not None], default=None)
+    conds["fr_lt005"] = {
+        "met": met_fr,
+        "value": round(worst_fr, 5) if worst_fr is not None else None,
+        "threshold": CONFIRMED_A_FR_MAX,
+        "deficit": round(worst_fr - CONFIRMED_A_FR_MAX, 5) if (worst_fr is not None and not met_fr) else 0,
+        "met_count": sum(1 for v in vals_fr if v is not None and v < CONFIRMED_A_FR_MAX),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # LLS < 40 на всех
+    vals_lls = [s.get("lls24") for s in recent]
+    met_lls = all(v is not None and v < CONFIRMED_A_LLS_MAX for v in vals_lls)
+    worst_lls = max([v for v in vals_lls if v is not None], default=None)
+    conds["lls_lt40"] = {
+        "met": met_lls,
+        "value": round(worst_lls, 2) if worst_lls is not None else None,
+        "threshold": CONFIRMED_A_LLS_MAX,
+        "deficit": round(worst_lls - CONFIRMED_A_LLS_MAX, 2) if (worst_lls is not None and not met_lls) else 0,
+        "met_count": sum(1 for v in vals_lls if v is not None and v < CONFIRMED_A_LLS_MAX),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # Price не падает (шагово, с допуском 0.5)
+    met_pc = all(
+        safe(recent[i].get("price_chg24")) >= safe(recent[i-1].get("price_chg24")) - CONFIRMED_A_PC_TOLERANCE
+        for i in range(1, len(recent)))
+    pc_net_up = safe(recent[-1].get("price_chg24")) >= safe(recent[0].get("price_chg24")) - CONFIRMED_A_PC_TOLERANCE
+    conds["price_not_falling"] = {
+        "met": met_pc and pc_net_up,
+        "value": None,
+        "threshold": None,
+        "deficit": 0,
+        "met_count": None,
+        "total": None,
+    }
+
+    # OI не падает (шагово, с допуском 1)
+    met_oi_step = all(
+        safe(recent[i].get("oi_chg24_pct")) >= safe(recent[i-1].get("oi_chg24_pct")) - CONFIRMED_A_OI_TOLERANCE
+        for i in range(1, len(recent)))
+    conds["oi_not_falling"] = {
+        "met": met_oi_step,
+        "value": None,
+        "threshold": None,
+        "deficit": 0,
+        "met_count": None,
+        "total": None,
+    }
+
+    # CVD не падает (шагово, с допуском 5)
+    met_cvd_step = all(
+        safe(recent[i].get("cvd24")) >= safe(recent[i-1].get("cvd24")) - CONFIRMED_A_CVD_TOLERANCE
+        for i in range(1, len(recent)))
+    conds["cvd_not_falling"] = {
+        "met": met_cvd_step,
+        "value": None,
+        "threshold": None,
+        "deficit": 0,
+        "met_count": None,
+        "total": None,
+    }
+
+    passed = all(c["met"] for c in conds.values())
+    return {"passed": passed, "insufficient_data": False, "conditions": conds}
+
+
+# ═══════════════════════════════════════════════════════════
+# CONFIRMED_TREND — path_b (раннее подтверждение)
+# ═══════════════════════════════════════════════════════════
+
+CONFIRMED_B_OI_MIN = 2.0       # oi_chg24_pct > 2 на всех снимках
+CONFIRMED_B_CVD_MIN = 50.0     # cvd24 > 50 на всех снимках
+CONFIRMED_B_CVD_MOM_MIN = 5.0  # cvd_momentum > 5
+
+
+def check_confirmed_path_b(snaps: list[dict], cvd_momentum: float) -> dict:
+    """Проверяет path_b CONFIRMED_TREND. Требует cvd_momentum из derived."""
+    if len(snaps) < CONFIRMED_A_SNAPS:
+        return {"passed": False, "insufficient_data": True,
+                "snaps_have": len(snaps), "snaps_need": CONFIRMED_A_SNAPS,
+                "conditions": {}}
+    recent = snaps[-CONFIRMED_A_SNAPS:]
+    conds = {}
+
+    vals_oi = [safe(s.get("oi_chg24_pct")) for s in recent]
+    met_oi = all(v > CONFIRMED_B_OI_MIN for v in vals_oi)
+    worst_oi = min(vals_oi)
+    conds["oi_chg24_gt2"] = {
+        "met": met_oi,
+        "value": round(worst_oi, 2),
+        "threshold": CONFIRMED_B_OI_MIN,
+        "deficit": round(CONFIRMED_B_OI_MIN - worst_oi, 2) if not met_oi else 0,
+        "met_count": sum(1 for v in vals_oi if v > CONFIRMED_B_OI_MIN),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    vals_cvd = [safe(s.get("cvd24")) for s in recent]
+    met_cvd = all(v > CONFIRMED_B_CVD_MIN for v in vals_cvd)
+    worst_cvd = min(vals_cvd)
+    conds["cvd_gt50"] = {
+        "met": met_cvd,
+        "value": round(worst_cvd, 2),
+        "threshold": CONFIRMED_B_CVD_MIN,
+        "deficit": round(CONFIRMED_B_CVD_MIN - worst_cvd, 2) if not met_cvd else 0,
+        "met_count": sum(1 for v in vals_cvd if v > CONFIRMED_B_CVD_MIN),
+        "total": CONFIRMED_A_SNAPS,
+    }
+
+    # OI растёт быстрее (oi_growing_faster)
     oi_growing_faster = False
-    if len(oi_vals) >= 3:
-        ov = oi_vals[-3:]
-        d1 = ov[1] - ov[0]
-        d2 = ov[2] - ov[1]
+    if len(recent) >= 3:
+        ov = [safe(s.get("oi_chg24_pct")) for s in recent[-3:]]
+        d1, d2 = ov[1] - ov[0], ov[2] - ov[1]
         oi_growing_faster = d2 > d1 and d1 > 0
-    passed = base and oi_growing_faster and cvd_momentum > 5
-    return passed, oi_vals, cvd_vals
+    conds["oi_growing_faster"] = {
+        "met": oi_growing_faster,
+        "value": None,
+        "threshold": None,
+        "deficit": 0,
+        "met_count": None,
+        "total": None,
+    }
+
+    met_mom = cvd_momentum > CONFIRMED_B_CVD_MOM_MIN
+    conds["cvd_momentum_gt5"] = {
+        "met": met_mom,
+        "value": round(cvd_momentum, 2),
+        "threshold": CONFIRMED_B_CVD_MOM_MIN,
+        "deficit": round(CONFIRMED_B_CVD_MOM_MIN - cvd_momentum, 2) if not met_mom else 0,
+        "met_count": None,
+        "total": None,
+    }
+
+    passed = all(c["met"] for c in conds.values())
+    return {"passed": passed, "insufficient_data": False, "conditions": conds}
 
 
-def check_confirmed_common(recent):
-    """Общие условия CONFIRMED: OI4h>0, FR<0.05, LLS<40 на всех снимках."""
-    reasons = []
-    all_oi4 = all((s.get("oi_chg4h_pct") or 0) > 0 for s in recent)
-    all_fr = all(s.get("fr_oiw") is not None and s["fr_oiw"] < 0.05 for s in recent)
-    all_lls = all(s.get("lls24") is not None and s["lls24"] < 40 for s in recent)
-    if not all_oi4: reasons.append("OI4h ≤0")
-    if not all_fr: reasons.append("FR ≥0.05")
-    if not all_lls: reasons.append("LLS ≥40")
-    return all_oi4 and all_fr and all_lls, reasons
+# ═══════════════════════════════════════════════════════════
+# EARLY_MOVE
+# ═══════════════════════════════════════════════════════════
+
+EARLY_MOVE_SNAPS = 3
+EARLY_MOVE_CVD_TOLERANCE = 3.0
+EARLY_MOVE_VOL_FACTOR = 0.95
 
 
-def check_confirmed_price(recent):
-    """Price не падает (all_pc + pc_net_up)."""
-    all_pc = all(
-        (recent[i].get("price_chg24") or 0) >= (recent[i-1].get("price_chg24") or 0) - 0.5
-        for i in range(1, len(recent))
-    )
-    pc_net_up = (recent[-1].get("price_chg24") or 0) >= (recent[0].get("price_chg24") or 0) - 0.5
-    passed = all_pc and pc_net_up
-    return passed, (None if passed else "Price падает")
+def check_early_move(snaps: list[dict]) -> dict:
+    """Проверяет условия EARLY_MOVE на последних 3 снимках."""
+    if len(snaps) < EARLY_MOVE_SNAPS:
+        return {"passed": False, "insufficient_data": True,
+                "snaps_have": len(snaps), "snaps_need": EARLY_MOVE_SNAPS,
+                "conditions": {}}
+    last3 = snaps[-EARLY_MOVE_SNAPS:]
+    conds = {}
+
+    price_up = all(
+        safe(last3[i].get("price_chg24")) > safe(last3[i-1].get("price_chg24"))
+        for i in range(1, EARLY_MOVE_SNAPS))
+    conds["price_up"] = {"met": price_up, "value": None, "threshold": None,
+                         "deficit": 0, "met_count": None, "total": None}
+
+    oi_up = all(
+        safe(last3[i].get("oi_chg24_pct")) > safe(last3[i-1].get("oi_chg24_pct"))
+        for i in range(1, EARLY_MOVE_SNAPS))
+    conds["oi_up"] = {"met": oi_up, "value": None, "threshold": None,
+                      "deficit": 0, "met_count": None, "total": None}
+
+    cvd_up = all(
+        safe(last3[i].get("cvd24")) > safe(last3[i-1].get("cvd24")) - EARLY_MOVE_CVD_TOLERANCE
+        for i in range(1, EARLY_MOVE_SNAPS))
+    conds["cvd_up"] = {"met": cvd_up, "value": None, "threshold": None,
+                       "deficit": 0, "met_count": None, "total": None}
+
+    vol_up = all(
+        safe(last3[i].get("volume24")) > safe(last3[i-1].get("volume24")) * EARLY_MOVE_VOL_FACTOR
+        for i in range(1, EARLY_MOVE_SNAPS))
+    conds["vol_up"] = {"met": vol_up, "value": None, "threshold": None,
+                       "deficit": 0, "met_count": None, "total": None}
+
+    passed = all(c["met"] for c in conds.values())
+    return {"passed": passed, "insufficient_data": False, "conditions": conds}
 
 
-def check_confirmed_not_falling(recent):
-    """OI и CVD не снижаются пошагово."""
-    oi_nf = all(
-        (recent[i].get("oi_chg24_pct") or 0) >= (recent[i-1].get("oi_chg24_pct") or 0) - 1
-        for i in range(1, len(recent))
-    )
-    cvd_nf = all(
-        (recent[i].get("cvd24") or 0) >= (recent[i-1].get("cvd24") or 0) - 5
-        for i in range(1, len(recent))
-    )
-    return oi_nf, cvd_nf
+# ═══════════════════════════════════════════════════════════
+# ACCUMULATION
+# ═══════════════════════════════════════════════════════════
+
+ACCUMULATION_SNAPS = 3
+ACCUMULATION_CVD_AVG_MIN = 50.0
+ACCUMULATION_PC_MAX = 5.0
+ACCUMULATION_FR_MAX = 0.03
 
 
-def check_confirmed(recent, derived):
-    """Полная проверка CONFIRMED на снимках.
-    Возвращает (passed, path, failing_conditions, closest_miss).
-    path: 'a'/'b'/None. closest_miss: близость к path_a и path_b отдельно."""
-    if len(recent) < MIN_SNAPS_LIFECYCLE:
-        return False, None, [f"мало снимков ({len(recent)}/{MIN_SNAPS_LIFECYCLE})"], None
+def check_accumulation(snaps: list[dict]) -> dict:
+    """Проверяет условия ACCUMULATION на последних 3 снимках."""
+    if len(snaps) < ACCUMULATION_SNAPS:
+        return {"passed": False, "insufficient_data": True,
+                "snaps_have": len(snaps), "snaps_need": ACCUMULATION_SNAPS,
+                "conditions": {}}
+    last3 = snaps[-ACCUMULATION_SNAPS:]
+    conds = {}
 
-    cvd_momentum = derived.get("cvd_momentum", 0)
-    pa, oi_a, cvd_a = check_confirmed_path_a(recent)
-    pb, oi_b, cvd_b = check_confirmed_path_b(recent, cvd_momentum)
-    common_ok, common_reasons = check_confirmed_common(recent)
-    price_ok, price_reason = check_confirmed_price(recent)
-    oi_nf, cvd_nf = check_confirmed_not_falling(recent)
-    trends_ok = derived.get("cvd_trend") != "down" and derived.get("oi_trend") != "down"
+    oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
+    conds["oi4h_positive"] = {"met": oi4_pos, "value": None, "threshold": None,
+                              "deficit": 0, "met_count": None, "total": None}
 
-    failing = list(common_reasons)
-    if price_reason: failing.append(price_reason)
-    if not oi_nf: failing.append("OI снижается")
-    if not cvd_nf: failing.append("CVD снижается")
-    if not trends_ok: failing.append("тренд OI/CVD вниз")
-    if not (pa or pb): failing.append("OI/CVD пороги (path_a/path_b)")
+    cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / ACCUMULATION_SNAPS
+    met_cvd = cvd_avg > ACCUMULATION_CVD_AVG_MIN
+    conds["cvd_avg_gt50"] = {
+        "met": met_cvd,
+        "value": round(cvd_avg, 2),
+        "threshold": ACCUMULATION_CVD_AVG_MIN,
+        "deficit": round(ACCUMULATION_CVD_AVG_MIN - cvd_avg, 2) if not met_cvd else 0,
+        "met_count": None, "total": None,
+    }
 
-    passed = (pa or pb) and common_ok and price_ok and oi_nf and cvd_nf and trends_ok
-    path = 'a' if pa else ('b' if pb else None)
+    pc = safe(last3[-1].get("price_chg24"))
+    met_pc = pc < ACCUMULATION_PC_MAX
+    conds["price_chg_lt5"] = {
+        "met": met_pc,
+        "value": round(pc, 2),
+        "threshold": ACCUMULATION_PC_MAX,
+        "deficit": round(pc - ACCUMULATION_PC_MAX, 2) if not met_pc else 0,
+        "met_count": None, "total": None,
+    }
 
-    closest_miss = {}
-    if not pa:
-        closest_miss['path_a'] = {
-            'oi_miss': round(max(0, 5 - min(oi_a)), 2) if oi_a else None,
-            'cvd_miss': round(max(0, 55 - min(cvd_a)), 2) if cvd_a else None,
-        }
-    if not pb:
-        closest_miss['path_b'] = {
-            'oi_miss': round(max(0, 2 - min(oi_b)), 2) if oi_b else None,
-            'cvd_miss': round(max(0, 50 - min(cvd_b)), 2) if cvd_b else None,
-        }
-    return passed, path, failing, closest_miss
+    fr_ok = all(s.get("fr_oiw") is not None and s.get("fr_oiw") < ACCUMULATION_FR_MAX
+                for s in last3)
+    conds["fr_lt003"] = {"met": fr_ok, "value": None, "threshold": None,
+                         "deficit": 0, "met_count": None, "total": None}
 
-
-def check_early_move(last3):
-    """EARLY_MOVE: 3 снимка Price↑ OI↑ CVD↑ Vol↑."""
-    if len(last3) < 3:
-        return False, ["мало снимков"]
-    reasons = []
-    price_up = all((last3[i].get("price_chg24") or 0) > (last3[i-1].get("price_chg24") or 0) for i in range(1, 3))
-    oi_up = all((last3[i].get("oi_chg24_pct") or 0) > (last3[i-1].get("oi_chg24_pct") or 0) for i in range(1, 3))
-    cvd_up = all((last3[i].get("cvd24") or 0) > (last3[i-1].get("cvd24") or 0) - 3 for i in range(1, 3))
-    vol_up = all((last3[i].get("volume24") or 0) > (last3[i-1].get("volume24") or 0) * 0.95 for i in range(1, 3))
-    if not price_up: reasons.append("Price не растёт")
-    if not oi_up: reasons.append("OI не растёт")
-    if not cvd_up: reasons.append("CVD не растёт")
-    if not vol_up: reasons.append("Volume не растёт")
-    return price_up and oi_up and cvd_up and vol_up, reasons
+    passed = all(c["met"] for c in conds.values())
+    return {"passed": passed, "insufficient_data": False, "conditions": conds}
 
 
-def check_accumulation(last3):
-    """ACCUMULATION: OI4h>0, CVD avg>50, Price<5, FR<0.03."""
-    if len(last3) < 3:
-        return False, ["мало снимков"]
-    reasons = []
-    oi4_pos = all((s.get("oi_chg4h_pct") or 0) > 0 for s in last3)
-    cvd_avg = sum(s.get("cvd24") or 0 for s in last3) / 3
-    pc = last3[-1].get("price_chg24") or 0
-    fr_ok = all(s.get("fr_oiw") is not None and s["fr_oiw"] < 0.03 for s in last3)
-    if not oi4_pos: reasons.append("OI4h ≤0")
-    if cvd_avg <= 50: reasons.append(f"CVD avg {cvd_avg:.0f} ≤50")
-    if pc >= 5: reasons.append(f"Price {pc:.1f}% ≥5")
-    if not fr_ok: reasons.append("FR ≥0.03")
-    return oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok, reasons
+# ═══════════════════════════════════════════════════════════
+# УТИЛИТЫ ДЛЯ FAIL_POINT
+# ═══════════════════════════════════════════════════════════
+
+def closest_miss_for_confirmed(snaps: list[dict], cvd_momentum: float) -> dict:
+    """Определяет ближайший промах для CONFIRMED (path_a и path_b).
+    Возвращает {path, condition, deficit} для наиболее близкого непрохождения."""
+    result_a = check_confirmed_path_a(snaps)
+    result_b = check_confirmed_path_b(snaps, cvd_momentum)
+
+    best_a = _closest_fail(result_a)
+    best_b = _closest_fail(result_b)
+
+    if best_a is None and best_b is None:
+        return {"path": None, "condition": None, "deficit": 0, "note": "оба пути пройдены"}
+    if best_a is None:
+        return {"path": "b", **best_b}
+    if best_b is None:
+        return {"path": "a", **best_a}
+
+    # Берём более близкий (меньший deficit)
+    if best_a["deficit"] <= best_b["deficit"]:
+        return {"path": "a", **best_a}
+    return {"path": "b", **best_b}
+
+
+def _closest_fail(result: dict) -> Optional[dict]:
+    """Из результата check_* находит условие с наименьшим deficit (ближайший промах)."""
+    if result.get("passed"):
+        return None
+    if result.get("insufficient_data"):
+        return {"condition": "insufficient_data", "deficit": float("inf"),
+                "value": None, "threshold": None}
+    fails = [(name, c) for name, c in result["conditions"].items() if not c["met"]]
+    if not fails:
+        return None
+    # Сортируем по deficit (числовые), нечисловые — в конец
+    numeric_fails = [(n, c) for n, c in fails
+                     if c["deficit"] is not None and c["deficit"] != float("inf")]
+    other_fails = [(n, c) for n, c in fails if n not in dict(numeric_fails)]
+    if numeric_fails:
+        numeric_fails.sort(key=lambda x: x[1]["deficit"])
+        name, c = numeric_fails[0]
+        return {"condition": name, "deficit": c["deficit"],
+                "value": c["value"], "threshold": c["threshold"]}
+    if other_fails:
+        name, c = other_fails[0]
+        return {"condition": name, "deficit": None,
+                "value": c["value"], "threshold": c["threshold"]}
+    return None
