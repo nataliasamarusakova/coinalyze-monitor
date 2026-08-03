@@ -143,59 +143,54 @@ def load_pending_unentered():
 
 
 def compute_capture_rate(trades, unentered, cutoff_h=24):
-    """Коэффициент захвата: поймали vs упустили хороших лонгов за cutoff_h часов."""
     now = time.time()
     cutoff = now - cutoff_h * 3600
 
-    # Хорошие лонги, которые поймали (return_60m >= 1% или strategy_pnl > 0)
+    # [FIX M3] Фильтр по asset_class == "crypto"
     caught_good = []
     for t in trades:
         if t.get("entry_ts") and t["entry_ts"] >= cutoff:
+            if t.get("asset_class", "crypto") != "crypto":
+                continue
             r60 = t.get("return_60m")
             strat = t.get("strategy_pnl_pct")
             if (r60 is not None and r60 >= 1.0) or (strat is not None and strat > 0):
                 caught_good.append(t)
 
-    # Хорошие лонги, которые упустили (quality == good)
     missed_good = [u for u in unentered
                    if u.get("detect_ts", 0) >= cutoff
-                   and u.get("quality", {}).get("label") == "good"]
+                   and u.get("quality", {}).get("label") == "good"
+                   and u.get("asset_class", "crypto") == "crypto"]
 
     total_good = len(caught_good) + len(missed_good)
     capture_rate = len(caught_good) / total_good * 100 if total_good > 0 else 0
-
-    return {
-        "caught": len(caught_good),
-        "missed": len(missed_good),
-        "total": total_good,
-        "capture_rate": round(capture_rate, 1),
-    }
+    return {"caught": len(caught_good), "missed": len(missed_good),
+            "total": total_good, "capture_rate": round(capture_rate, 1)}
 
 
 def aggregate_fail_points(unentered):
-    """Агрегация fail_point по условию/стадии."""
     by_condition = {}
     by_stage = {}
     for u in unentered:
+        # [FIX M3] Фильтр по asset_class == "crypto"
+        if u.get("asset_class", "crypto") != "crypto":
+            continue
         if u.get("quality", {}).get("label") != "good":
             continue
         fp = u.get("fail_point", {})
         stage = fp.get("stage", "unknown")
         condition = fp.get("condition", "unknown")
         deficit = fp.get("deficit")
-
         key_cond = f"{stage}:{condition}"
         if key_cond not in by_condition:
             by_condition[key_cond] = {"count": 0, "deficits": [], "stage": stage, "condition": condition}
         by_condition[key_cond]["count"] += 1
         if deficit is not None and deficit != float("inf"):
             by_condition[key_cond]["deficits"].append(deficit)
-
         if stage not in by_stage:
             by_stage[stage] = 0
         by_stage[stage] += 1
 
-    # Сортируем по count desc
     sorted_cond = sorted(by_condition.values(), key=lambda x: x["count"], reverse=True)
     for item in sorted_cond:
         if item["deficits"]:
@@ -203,7 +198,6 @@ def aggregate_fail_points(unentered):
         else:
             item["avg_deficit"] = None
         del item["deficits"]
-
     return {"by_condition": sorted_cond, "by_stage": by_stage}
 
 
