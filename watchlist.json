@@ -5,23 +5,24 @@
     "action": "WATCH",
     "confidence": 63,
     "score": 3,
-    "momentum": 4,
+    "momentum": 5,
     "pattern": "—",
     "name": "OpenLedger",
     "first_seen": 1785746181,
-    "last_seen": 1785747958,
-    "snapshots": 7,
+    "last_seen": 1785748272,
+    "snapshots": 8,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.16,
+    "entry_earliness": 0.17,
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=92>50, FR<0.03",
-      "Price=3.0%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=95>50, FR<0.03",
+      "Price=3.3%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
-      "CVD mom↓",
+      "OI accel↓",
+      "CVD mom↑",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ]
@@ -32,22 +33,23 @@
     "action": "WATCH",
     "confidence": 67,
     "score": 7,
-    "momentum": 6,
+    "momentum": 2,
     "pattern": "—",
     "name": "Chain",
     "first_seen": 1785746181,
-    "last_seen": 1785747958,
-    "snapshots": 7,
+    "last_seen": 1785748272,
+    "snapshots": 8,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.18,
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=56>50, FR<0.03",
-      "Price=3.9%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=53>50, FR<0.03",
+      "Price=4.2%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
+      "OI accel↓",
+      "CVD mom↓",
       "Price accel↑",
       "Funding stable",
       "No divergence"
@@ -63,9 +65,9 @@
     "pattern": "—",
     "name": "Talus",
     "first_seen": 1785747363,
-    "last_seen": 1785747958,
+    "last_seen": 1785748272,
     "snapshots": 1,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.13,
     "reasons": [
@@ -80,50 +82,78 @@
       "No divergence"
     ]
   },
-  "ME": {
+  "JST": {
     "state": "EARLY_MOVE",
     "previous_state": "ACCUMULATION",
     "action": "WATCH_LONG",
-    "confidence": 77,
-    "score": 2,
-    "momentum": 3,
-    "pattern": "—",
-    "name": "Magic Eden",
+    "confidence": 82,
+    "score": 7,
+    "momentum": 6,
+    "pattern": "Stealth Accumulation",
+    "name": "JUST",
     "first_seen": 1785747718,
-    "last_seen": 1785747958,
-    "snapshots": 2,
+    "last_seen": 1785748272,
+    "snapshots": 3,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.11,
+    "entry_earliness": 0.03,
     "reasons": [
       "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↓",
-      "Price accel↑",
-      "Funding stable",
-      "No divergence"
+      "OI accel↑",
+      "Funding↑",
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
     ]
   },
-  "JST": {
+  "BNB": {
     "state": "ACCUMULATION",
     "previous_state": "ACCUMULATION",
     "action": "WATCH",
-    "confidence": 67,
-    "score": 7,
-    "momentum": 7,
+    "confidence": 53,
+    "score": 5,
+    "momentum": 8,
     "pattern": "—",
-    "name": "JUST",
-    "first_seen": 1785747718,
-    "last_seen": 1785747958,
+    "name": "BNB",
+    "first_seen": 1785747958,
+    "last_seen": 1785748272,
     "snapshots": 2,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.03,
+    "entry_earliness": 0.05,
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=97>50, FR<0.03",
-      "Price=-0.1%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=70>50, FR<0.03",
+      "Price=0.3%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "CVD mom↑",
+      "Funding stable",
+      "No divergence",
+      "OI+CVD sync↑"
+    ]
+  },
+  "TUT": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 83,
+    "score": 8,
+    "momentum": 8,
+    "pattern": "Healthy Trend",
+    "name": "Tutorial",
+    "first_seen": 1785748272,
+    "last_seen": 1785748272,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.46,
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
     ],
     "warnings": [],
     "mom_tags": [
@@ -131,34 +161,37 @@
       "Price accel↑",
       "Funding stable",
       "OI4h↑",
-      "No divergence"
+      "No divergence",
+      "OI+CVD sync↑"
     ]
   },
-  "BNB": {
+  "ALLO": {
     "state": "ACCUMULATION",
     "previous_state": "NEUTRAL",
     "action": "WATCH",
-    "confidence": 50,
-    "score": 4,
-    "momentum": 3,
-    "pattern": "—",
-    "name": "BNB",
-    "first_seen": 1785747958,
-    "last_seen": 1785747958,
+    "confidence": 67,
+    "score": 7,
+    "momentum": 8,
+    "pattern": "Short Squeeze",
+    "name": "Allora",
+    "first_seen": 1785748272,
+    "last_seen": 1785748272,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.04,
+    "entry_earliness": 0.21,
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=62>50, FR<0.03",
-      "Price=0.2%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=80>50, FR<0.03",
+      "Price=4.2%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↓",
+      "OI accel↑",
       "Price accel↑",
       "Funding stable",
-      "No divergence"
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
     ]
   }
 }
