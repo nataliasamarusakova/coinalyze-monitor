@@ -1,45 +1,56 @@
-"""unentered_tracker.py — отслеживание упущенных движений (unentered).
-
-Терминология (не путать с exit_reason="MISSED" в monitor.py!):
-  - exit_reason="MISSED" — сделка БЫЛА открыта, монета выпала из discovery.
-  - unentered — сделка НЕ БЫЛА открыта вообще. Это другой концепт.
-
-Двухфазная схема:
-  1. Детект: монета с price_chg24 > порога, без сделки → unentered_candidates.jsonl.
-  2. Финализация (через FINALIZE_DELAY_H): классификация по форвардному исходу
-     → unentered_analysis.jsonl.
-
-Запускается каждый прогон после monitor.py.
 """
+unentered_tracker.py — детектор упущенных движений.
+
+Обнаруживает монеты, которые прошли discovery-фильтр Coinalyze и показали
+значимый рост, но по которым НЕ была открыта сделка. Записывает кандидата,
+ждёт окно финализации (6 часов), затем классифицирует движение по
+форвардному исходу и определяет fail_point.
+
+ВАЖНО: «упущенное движение» (unentered) ≠ «MISSED» (exit_reason в close_trade).
+MISSED — это когда сделка БЫЛА открыта, но монета выпала из discovery.
+Unentered — это когда сделка НЕ БЫЛА открыта вообще. Разные концепции.
+
+Запуск: python unentered_tracker.py  (после monitor.py в том же прогоне)
+"""
+
 import json
 import time
 from pathlib import Path
-from bisect import bisect_left
+from typing import Optional
 
-from conditions import (check_confirmed, check_early_move, check_accumulation,
-                         MIN_SNAPS_LIFECYCLE)
-
-try:
-    from monitor import SIGNAL_LOGIC_VERSION
-except Exception:
-    SIGNAL_LOGIC_VERSION = 0
+from conditions import (
+    check_confirmed_path_a, check_confirmed_path_b,
+    check_early_move, check_accumulation, closest_miss_for_confirmed,
+    safe
+)
 
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY = BASE / "market_history.jsonl"
-TRADES = BASE / "trades.jsonl"
 WATCHLIST = BASE / "watchlist.json"
+TRADES = BASE / "trades.jsonl"
 CANDIDATES_FILE = BASE / "unentered_candidates.jsonl"
 ANALYSIS_FILE = BASE / "unentered_analysis.jsonl"
+CALIBRATION_CHANGELOG = BASE / "calibration_changelog.jsonl"
 
-MISSED_THRESHOLD = 5.0        # % рост за 24ч для "значимого движения"
-FINALIZE_DELAY_H = 6          # часов ожидания перед финализацией
-FORWARD_HORIZONS = [60, 120]  # минуты для форвардного исхода
 CANDIDATES_TTL_DAYS = 7
 ANALYSIS_TTL_DAYS = 90
-GOOD_RETURN_THRESHOLD = 2.0   # % форвардный рост для "good"
+
+MISSED_THRESHOLD_PCT = 5.0    # рост за 24ч, выше которого считаем «значимым»
+FINALIZATION_WINDOW_H = 6     # часов ожидания перед финализацией
+FORWARD_HORIZONS = [60, 120]  # минуты для форвардного исхода
+
+# Импортируем версию из monitor.py
+try:
+    from monitor import SIGNAL_LOGIC_VERSION
+except Exception:
+    SIGNAL_LOGIC_VERSION = 1
 
 
-def load_jsonl(path):
+def now_ts() -> int:
+    return int(time.time())
+
+
+def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     out = []
@@ -54,283 +65,278 @@ def load_jsonl(path):
     return out
 
 
-def append_jsonl(path, rec):
+def append_jsonl(path: Path, rec: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def rewrite_jsonl(path, recs):
-    with open(path, "w", encoding="utf-8") as f:
-        for r in recs:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def cleanup_jsonl(path, ttl_days):
+def cleanup_jsonl(path: Path, ttl_days: int, ts_field: str = "detect_ts"):
     if not path.exists():
         return
-    cutoff = time.time() - ttl_days * 86400
+    cutoff = now_ts() - ttl_days * 86400
     recs = load_jsonl(path)
-    fresh = [r for r in recs if r.get("ts", r.get("detect_ts", 0)) > cutoff]
-    if len(fresh) != len(recs):
-        rewrite_jsonl(path, fresh)
+    fresh = [r for r in recs if r.get(ts_field, 0) > cutoff]
+    removed = len(recs) - len(fresh)
+    if removed:
+        with open(path, "w", encoding="utf-8") as f:
+            for r in fresh:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"cleanup {path.name}: -{removed}")
 
 
-def load_market_history_grouped():
-    """Все снимки из market_history, сгруппированные по symbol, отсортированные по ts."""
-    all_snaps = {}
-    for r in load_jsonl(MARKET_HISTORY):
+def load_market_history_snaps() -> dict[str, list[dict]]:
+    """Все снимки из market_history, сгруппированные по символу."""
+    recs = load_jsonl(MARKET_HISTORY)
+    grouped = {}
+    for r in recs:
         sym = r.get("symbol")
         if not sym:
             continue
-        all_snaps.setdefault(sym, []).append(r)
-    for sym in all_snaps:
-        all_snaps[sym].sort(key=lambda x: x.get("ts", 0))
-    return all_snaps
+        if sym not in grouped:
+            grouped[sym] = []
+        grouped[sym].append(r)
+    for sym in grouped:
+        grouped[sym].sort(key=lambda x: x.get("ts", 0))
+    return grouped
 
 
-def load_active_symbols():
-    """Символы с открытой сделкой (watchlist) или закрытой за 24ч (trades)."""
+def get_active_symbols() -> set:
+    """Символы, по которым есть открытая или закрытая за 24ч сделка."""
+    now = now_ts()
+    cutoff_24h = now - 24 * 3600
     active = set()
-    if WATCHLIST.exists():
+
+    wl_path = WATCHLIST
+    if wl_path.exists():
         try:
-            wl = json.loads(WATCHLIST.read_text(encoding="utf-8"))
-            active.update(wl.keys())
+            wl = json.loads(wl_path.read_text(encoding="utf-8"))
+            for sym, rec in wl.items():
+                if rec.get("open_trade"):
+                    active.add(sym)
         except json.JSONDecodeError:
             pass
-    cutoff = time.time() - 24 * 3600
+
     for t in load_jsonl(TRADES):
-        if t.get("entry_ts") and t["entry_ts"] >= cutoff:
-            active.add(t["symbol"])
+        if t.get("entry_ts") and t["entry_ts"] >= cutoff_24h:
+            active.add(t.get("symbol"))
+
     return active
 
 
-def get_watchlist_state(sym):
-    """Текущая стадия монеты из watchlist.json (или None)."""
-    if not WATCHLIST.exists():
-        return None
-    try:
-        wl = json.loads(WATCHLIST.read_text(encoding="utf-8"))
-        return wl.get(sym, {}).get("state")
-    except json.JSONDecodeError:
-        return None
+def compute_forward_returns(snaps: list[dict], detect_ts: int,
+                            entry_price: float) -> dict:
+    """Форвардные return_60m/120m от момента детекта (аналог return_*m в trades)."""
+    result = {}
+    for h in FORWARD_HORIZONS:
+        target_ts = detect_ts + h * 60
+        best_price = None
+        best_lag = float("inf")
+        for s in snaps:
+            ts = s.get("ts", 0)
+            if ts >= target_ts:
+                lag = ts - target_ts
+                if lag < best_lag:
+                    best_lag = lag
+                    best_price = s.get("price")
+        if best_price is not None and best_lag <= 15 * 60 and entry_price:
+            result[f"forward_{h}m"] = round((best_price - entry_price) / entry_price * 100, 3)
+            result[f"forward_{h}m_available"] = True
+        else:
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+    return result
 
 
-def compute_cvd_momentum(snaps):
-    if len(snaps) >= 4:
-        return (snaps[-1].get("cvd24") or 0) - (snaps[-4].get("cvd24") or 0)
-    elif len(snaps) >= 2:
-        return (snaps[-1].get("cvd24") or 0) - (snaps[0].get("cvd24") or 0)
-    return 0
+def classify_quality(forward_returns: dict, movement_snaps: list[dict],
+                     detect_ts: int) -> dict:
+    """Форвардная классификация: good / noise / late / undetermined.
+    НЕ копирует условия CONFIRMED — использует форвардный исход."""
+    f60 = forward_returns.get("forward_60m")
+    f120 = forward_returns.get("forward_120m")
+
+    if f60 is None and f120 is None:
+        return {"label": "undetermined", "reason": "нет форвардных данных"}
+
+    best_forward = max([v for v in [f60, f120] if v is not None], default=None)
+    if best_forward is None:
+        return {"label": "undetermined", "reason": "нет форвардных данных"}
+
+    # OI/CVD динамика в окне движения (подтверждающий фактор)
+    if len(movement_snaps) >= 3:
+        oi_start = safe(movement_snaps[0].get("oi_chg24_pct"))
+        oi_end = safe(movement_snaps[-1].get("oi_chg24_pct"))
+        cvd_start = safe(movement_snaps[0].get("cvd24"))
+        cvd_end = safe(movement_snaps[-1].get("cvd24"))
+        oi_rising = oi_end > oi_start
+        cvd_rising = cvd_end > cvd_start
+    else:
+        oi_rising = None
+        cvd_rising = None
+
+    if best_forward >= 2.0 and oi_rising and cvd_rising:
+        return {"label": "good", "reason": "форвардный рост + OI↑ + CVD↑"}
+    elif best_forward >= 2.0:
+        return {"label": "good", "reason": "форвардный рост (OI/CVD не подтверждены)"}
+    elif best_forward < 0:
+        return {"label": "noise", "reason": "форвардный исход отрицательный"}
+    elif f60 is not None and f60 > 0 and f120 is not None and f120 < f60 - 2:
+        return {"label": "late", "reason": "рост затухает (f120 < f60)"}
+    else:
+        return {"label": "undetermined", "reason": "смешанные сигналы"}
 
 
-def compute_trend(vals):
-    clean = [v for v in vals if v is not None]
-    if len(clean) < 2:
-        return "flat"
-    diff = clean[-1] - clean[0]
-    base = abs(clean[0]) if abs(clean[0]) > 1 else 10.0
-    if diff > base * 0.05:
-        return "up"
-    if diff < -base * 0.05:
-        return "down"
-    return "flat"
+def determine_fail_point(sym: str, movement_snaps: list[dict],
+                         lifecycle_state: Optional[str],
+                         cvd_momentum: float) -> dict:
+    """Определяет fail_point: где и на чём монета споткнулась.
+    observed — если монета сейчас в watchlist (ACCUMULATION/EARLY_MOVE).
+    estimated — если не отслеживалась."""
+    confidence = "observed" if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE") else "estimated"
 
+    # Проверяем CONFIRMED (path_a и path_b)
+    cm = closest_miss_for_confirmed(movement_snaps, cvd_momentum)
 
-def compute_derived_lite(snaps):
-    """Упрощённый derived для conditions.check_confirmed."""
+    if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE"):
+        stage = lifecycle_state
+        if cm["condition"] is not None:
+            return {
+                "stage": stage,
+                "condition": cm["condition"],
+                "path": cm["path"],
+                "deficit": cm["deficit"],
+                "value": cm["value"],
+                "threshold": cm["threshold"],
+                "confidence": confidence,
+            }
+        return {
+            "stage": stage,
+            "condition": "conditions_met_but_not_confirmed",
+            "path": None,
+            "deficit": 0,
+            "value": None,
+            "threshold": None,
+            "confidence": confidence,
+        }
+
+    # Не отслеживалась — грубая оценка по снимкам
+    result_a = check_confirmed_path_a(movement_snaps)
+    result_em = check_early_move(movement_snaps)
+    result_acc = check_accumulation(movement_snaps)
+
+    if result_a.get("passed") or result_a.get("insufficient_data"):
+        stage_note = "estimated: условия CONFIRMED выполнены или мало данных"
+    elif result_em.get("passed"):
+        stage_note = "estimated: прошла EARLY_MOVE, не дошла до CONFIRMED"
+    elif result_acc.get("passed"):
+        stage_note = "estimated: прошла ACCUMULATION, не дошла до EARLY_MOVE"
+    else:
+        stage_note = "estimated: не прошла даже ACCUMULATION"
+
     return {
-        "cvd_momentum": compute_cvd_momentum(snaps),
-        "oi_trend": compute_trend([s.get("oi_chg24_pct") for s in snaps]),
-        "cvd_trend": compute_trend([s.get("cvd24") for s in snaps]),
-        "price_trend": compute_trend([s.get("price_chg24") for s in snaps]),
+        "stage": stage_note,
+        "condition": cm["condition"],
+        "path": cm["path"],
+        "deficit": cm["deficit"],
+        "value": cm["value"],
+        "threshold": cm["threshold"],
+        "confidence": confidence,
     }
 
 
-def find_price_at(snaps, target_ts, max_lag_sec=900):
-    """Цена ближайшего снимка на/после target_ts (лаг ≤ max_lag_sec)."""
-    if not snaps:
-        return None
-    ts_list = [s.get("ts", 0) for s in snaps]
-    i = bisect_left(ts_list, target_ts)
-    if i >= len(snaps):
-        return None
-    s = snaps[i]
-    if s.get("ts", 0) - target_ts > max_lag_sec:
-        return None
-    return s.get("price")
-
-
-def detect_fail_point(snaps, watchlist_state):
-    """Определяет fail_point для упущенной монеты.
-    confidence: 'observed' если монета сейчас в watchlist (ACCUMULATION/EARLY_MOVE),
-                'estimated' иначе."""
-    if len(snaps) < MIN_SNAPS_LIFECYCLE:
-        return {
-            "stage": "insufficient_data",
-            "failing_conditions": [f"мало снимков ({len(snaps)})"],
-            "closest_miss": None,
-            "confidence": "estimated",
-        }
-
-    recent = snaps[-MIN_SNAPS_LIFECYCLE:]
-    derived = compute_derived_lite(snaps)
-
-    # Проверяем CONFIRMED
-    passed, path, failing, closest_miss = check_confirmed(recent, derived)
-    if passed:
-        # Условия CONFIRMED выполнены сейчас, но сделки нет — редкий случай
-        return {
-            "stage": "CONFIRMED_conditions_met",
-            "failing_conditions": [],
-            "closest_miss": None,
-            "confidence": "observed" if watchlist_state in ("ACCUMULATION", "EARLY_MOVE") else "estimated",
-        }
-
-    # Определяем, дошла ли монета до EARLY_MOVE / ACCUMULATION
-    last3 = snaps[-3:]
-    em_passed, em_reasons = check_early_move(last3)
-    ac_passed, ac_reasons = check_accumulation(last3)
-
-    if watchlist_state in ("ACCUMULATION", "EARLY_MOVE"):
-        # Монета отслеживается, точный fail_point
-        return {
-            "stage": f"stopped_at_{watchlist_state}",
-            "failing_conditions": failing,
-            "closest_miss": closest_miss,
-            "confidence": "observed",
-        }
-    elif watchlist_state is None:
-        # Не отслеживалась — грубая оценка
-        if not em_passed and not ac_passed:
-            stage = "never_tracked"
-            sub_reasons = em_reasons + ac_reasons
-        else:
-            stage = "estimated_early"
-            sub_reasons = failing
-        return {
-            "stage": stage,
-            "failing_conditions": failing if failing else sub_reasons,
-            "closest_miss": closest_miss,
-            "confidence": "estimated",
-        }
-    else:
-        return {
-            "stage": f"state_{watchlist_state}",
-            "failing_conditions": failing,
-            "closest_miss": closest_miss,
-            "confidence": "estimated",
-        }
-
-
-def classify_quality(snaps, forward_returns, detect_price_chg24):
-    """Классификация качества движения по форвардному исходу (постфактум).
-    label: good / noise / late / undetermined."""
-    r60 = forward_returns.get("return_60m")
-    r120 = forward_returns.get("return_120m")
-    fwd = r120 if r120 is not None else r60
-    if fwd is None:
-        return "undetermined"
-
-    derived = compute_derived_lite(snaps)
-    oi_up = derived["oi_trend"] == "up"
-    cvd_up = derived["cvd_trend"] == "up"
-
-    # Хороший лонг: форвардный рост + поддержка OI/CVD
-    if fwd >= GOOD_RETURN_THRESHOLD and oi_up and cvd_up:
-        return "good"
-    # Поздний: был рост на детекте, но форвардный исход слабый/отрицательный
-    if detect_price_chg24 and detect_price_chg24 > MISSED_THRESHOLD and fwd < 0:
-        return "late"
-    # Шум: рост без поддержки OI, или форвардный исход отрицательный
-    if fwd < 0 or not oi_up:
-        return "noise"
-    return "undetermined"
+def compute_cvd_momentum(snaps: list[dict]) -> float:
+    if len(snaps) >= 4:
+        return safe(snaps[-1].get("cvd24")) - safe(snaps[-4].get("cvd24"))
+    elif len(snaps) >= 2:
+        return safe(snaps[-1].get("cvd24")) - safe(snaps[0].get("cvd24"))
+    return 0.0
 
 
 def run():
-    now = time.time()
-    market_data = load_market_history_grouped()
-    active_symbols = load_active_symbols()
+    print("═══ unentered_tracker ═══")
+    now = now_ts()
+    market_snaps = load_market_history_snaps()
+    active_symbols = get_active_symbols()
+    existing_candidates = load_jsonl(CANDIDATES_FILE)
+    existing_candidate_syms = {c.get("symbol") for c in existing_candidates
+                               if c.get("detect_ts", 0) > now - 24 * 3600}
 
-    # Загрузка существующих кандидатов
-    candidates = load_jsonl(CANDIDATES_FILE)
-    candidates_by_sym = {c["symbol"]: c for c in candidates}
-
-    # ── Обнаружение новых кандидатов ──
-    new_count = 0
-    for sym, snaps in market_data.items():
-        if not snaps:
+    # ── Шаг 1: Обнаружение новых кандидатов ──
+    new_candidates = 0
+    for sym, snaps in market_snaps.items():
+        if not snaps or sym in active_symbols or sym in existing_candidate_syms:
             continue
         last = snaps[-1]
         chg = last.get("price_chg24")
-        if chg is None or chg <= MISSED_THRESHOLD:
+        if chg is None or chg <= MISSED_THRESHOLD_PCT:
             continue
-        if sym in active_symbols:
-            continue
-        if sym in candidates_by_sym:
-            continue
-        cand = {
-            "detect_ts": int(now),
+        lifecycle_state = last.get("lifecycle_state")
+        entry_price = last.get("price")
+        cvd_mom = compute_cvd_momentum(snaps)
+
+        candidate = {
+            "detect_ts": now,
             "symbol": sym,
             "name": last.get("name", sym),
-            "detect_price_chg24": chg,
-            "detect_price": last.get("price"),
+            "price_chg24_at_detect": chg,
+            "price_at_detect": entry_price,
+            "lifecycle_state_at_detect": lifecycle_state,
+            "cvd_momentum_at_detect": round(cvd_mom, 2),
             "signal_logic_version": SIGNAL_LOGIC_VERSION,
+            "status": "pending_finalization",
         }
-        append_jsonl(CANDIDATES_FILE, cand)
-        candidates_by_sym[sym] = cand
-        new_count += 1
+        append_jsonl(CANDIDATES_FILE, candidate)
+        new_candidates += 1
 
-    # ── Финализация кандидатов (прошло >= FINALIZE_DELAY_H) ──
-    finalized_syms = set()
-    for sym, cand in candidates_by_sym.items():
-        age_h = (now - cand["detect_ts"]) / 3600
-        if age_h < FINALIZE_DELAY_H:
+    # ── Шаг 2: Финализация кандидатов, у которых прошло окно ──
+    finalized = 0
+    remaining = []
+    for cand in existing_candidates:
+        detect_ts = cand.get("detect_ts", 0)
+        sym = cand.get("symbol")
+        if cand.get("status") == "finalized":
             continue
-        snaps = market_data.get(sym, [])
-        # Форвардные исходы от detect_ts
-        forward_returns = {}
-        for h in FORWARD_HORIZONS:
-            target_ts = cand["detect_ts"] + h * 60
-            fwd_price = find_price_at(snaps, target_ts)
-            if fwd_price is not None and cand.get("detect_price"):
-                forward_returns[f"return_{h}m"] = round(
-                    (fwd_price - cand["detect_price"]) / cand["detect_price"] * 100, 2)
-            else:
-                forward_returns[f"return_{h}m"] = None
+        if now - detect_ts < FINALIZATION_WINDOW_H * 3600:
+            remaining.append(cand)
+            continue
 
-        watchlist_state = get_watchlist_state(sym)
-        fail_point = detect_fail_point(snaps, watchlist_state)
-        label = classify_quality(snaps, forward_returns, cand.get("detect_price_chg24"))
+        # Финализация
+        snaps = market_snaps.get(sym, [])
+        entry_price = cand.get("price_at_detect")
+        forward_returns = compute_forward_returns(snaps, detect_ts, entry_price)
+        movement_snaps = [s for s in snaps if s.get("ts", 0) >= detect_ts - 4 * 3600]
+        quality = classify_quality(forward_returns, movement_snaps, detect_ts)
+        cvd_mom = cand.get("cvd_momentum_at_detect", 0)
+        lifecycle_state = cand.get("lifecycle_state_at_detect")
+        fail_point = determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_mom)
 
-        rec = {
-            "ts": int(now),
-            "detect_ts": cand["detect_ts"],
-            "finalize_ts": int(now),
+        analysis_rec = {
+            "detect_ts": detect_ts,
+            "finalize_ts": now,
             "symbol": sym,
             "name": cand.get("name", sym),
-            "detect_price_chg24": cand.get("detect_price_chg24"),
-            "peak_price_chg24": max((s.get("price_chg24") or 0) for s in snaps) if snaps else None,
+            "price_chg24_at_detect": cand.get("price_chg24_at_detect"),
+            "price_at_detect": entry_price,
+            "lifecycle_state_at_detect": lifecycle_state,
+            "cvd_momentum_at_detect": cvd_mom,
+            "signal_logic_version": cand.get("signal_logic_version", SIGNAL_LOGIC_VERSION),
+            "movement_snaps_count": len(movement_snaps),
+            **forward_returns,
+            "quality": quality,
             "fail_point": fail_point,
-            "quality_label": label,
-            "forward_returns": forward_returns,
-            "signal_logic_version": cand.get("signal_logic_version"),
         }
-        append_jsonl(ANALYSIS_FILE, rec)
-        finalized_syms.add(sym)
+        append_jsonl(ANALYSIS_FILE, analysis_rec)
+        finalized += 1
 
-    # Удалить финализированных из candidates
-    if finalized_syms:
-        remaining = [c for c in candidates if c["symbol"] not in finalized_syms]
-        rewrite_jsonl(CANDIDATES_FILE, remaining)
+    # ── Шаг 3: Cleanup ──
+    cleanup_jsonl(CANDIDATES_FILE, CANDIDATES_TTL_DAYS, "detect_ts")
+    cleanup_jsonl(ANALYSIS_FILE, ANALYSIS_TTL_DAYS, "detect_ts")
 
-    # Cleanup
-    cleanup_jsonl(CANDIDATES_FILE, CANDIDATES_TTL_DAYS)
-    cleanup_jsonl(ANALYSIS_FILE, ANALYSIS_TTL_DAYS)
-
-    print(f"Unentered tracker: {new_count} новых кандидатов, "
-          f"{len(finalized_syms)} финализировано, "
-          f"{len(candidates_by_sym) - len(finalized_syms)} ожидают")
+    pending_count = len([c for c in load_jsonl(CANDIDATES_FILE)
+                         if c.get("status") != "finalized"])
+    print(f"  новых кандидатов: {new_candidates}")
+    print(f"  финализировано: {finalized}")
+    print(f"  ожидают классификации: {pending_count}")
+    print("═══ done ═══")
 
 
 if __name__ == "__main__":
