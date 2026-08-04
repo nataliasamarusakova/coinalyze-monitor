@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Адаптирован под динамическое количество колонок в таблице Coinalyze.
+Поддерживает универсальное извлечение символа монеты и динамических колонок.
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ log = logging.getLogger("coinalyze_loader")
 
 BASE = Path(__file__).resolve().parent
 DEBUG_HTML_FILE = BASE / "debug_page.html"
-DEBUG_FIRST_ROW_FILE = BASE / "debug_first_row.html"
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
@@ -39,7 +38,7 @@ DEBUG = os.environ.get("DEBUG", "true").lower() == "true"
 
 COINALYZE_URL = (
     "https://coinalyze.net/"
-    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
+    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY4"
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
@@ -62,6 +61,45 @@ def parse_number(text: str) -> Optional[float]:
         return None
 
 
+def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
+    """Надежное извлечение символа и названия монеты с запасными вариантами."""
+    # 1. Пробуем атрибуты <tr>
+    symbol = tr.get("data-coin") or tr.get("data-symbol") or tr.get("data-id")
+
+    # 2. Пробуем ссылки внутри <tr>
+    if not symbol:
+        a_tag = tr.find("a", href=True)
+        if a_tag:
+            href = a_tag["href"].strip("/")
+            parts = href.split("/")
+            if parts:
+                symbol = parts[-1].upper()
+
+    # 3. Пробуем текст из колонок (обычно td[1] или td[0])
+    name = "?"
+    if len(tds) > 1:
+        text_cell = tds[1].get_text(strip=True)
+        spans = tds[1].find_all("span")
+        if spans:
+            name = spans[0].get_text(strip=True)
+        elif text_cell:
+            name = text_cell.split()[0]
+
+        if not symbol and text_cell:
+            symbol = text_cell.replace("\n", " ").split()[0].upper()
+
+    elif len(tds) > 0 and not symbol:
+        symbol = tds[0].get_text(strip=True).upper()
+
+    # 4. Запасной вариант, если ничего не нашлось
+    if not symbol or symbol in ("-", "N/A", "?"):
+        symbol = f"COIN_{row_idx}"
+    if not name or name == "?":
+        name = symbol
+
+    return symbol, name
+
+
 def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     ts = ts or time.time()
     soup = BeautifulSoup(html_text, "lxml")
@@ -69,24 +107,18 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     out = []
 
     def get_td(tds: list, idx: int) -> Optional[float]:
-        """Безопасное получение числа из колонки idx."""
         if idx < len(tds):
             return parse_number(tds[idx].get_text(strip=True))
         return None
 
-    for tr in rows:
-        symbol = tr.get("data-coin")
-        tds = tr.find_all("td")
+    for idx, tr in enumerate(rows, start=1):
+        tds = tr.find_all(["td", "th"])
 
-        # ═══════════════════════════════════════════════════════════
-        # ИСПРАВЛЕНИЕ: ПРОВЕРЯЕМ ТОЛЬКО БАЗОВЫЕ 5 КОЛОНОК
-        # Если колонок меньше 5, это скорее всего не строка с монетой
-        # ═══════════════════════════════════════════════════════════
-        if len(tds) < 5:
+        # Игнорируем строки-заголовки и пустые строки (меньше 3 колонок)
+        if len(tds) < 3:
             continue
 
-        spans = tds[1].find_all("span") if len(tds) > 1 else []
-        name = spans[0].get_text(strip=True) if spans else (symbol or "?")
+        symbol, name = extract_symbol_and_name(tr, tds, idx)
 
         rec = {
             "ts": ts,
@@ -152,10 +184,8 @@ class CoinalyzeScraper:
 
     @staticmethod
     def _add_cookies(ctx):
-        log.info(f"🔑 COINALYZE_P_SID: {'SET (' + str(len(COINALYZE_P_SID)) + ' chars)' if COINALYZE_P_SID else 'EMPTY'}")
-        log.info(f"🔑 COINALYZE_CHAT_SID: {'SET (' + str(len(COINALYZE_CHAT_SID)) + ' chars)' if COINALYZE_CHAT_SID else 'EMPTY'}")
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
-            log.warning("⚠️ Куки НЕ установлены — сайт может отдать дефолтную таблицу")
+            log.warning("⚠️ Куки НЕ установлены — сайт отдаст дефолтную таблицу")
             return
         cookies = []
         if COINALYZE_P_SID:
@@ -175,21 +205,20 @@ class CoinalyzeScraper:
         page.wait_for_timeout(4000)
 
         if "Attention Required" in page.content():
-            log.warning("Cloudflare, waiting 10s...")
+            log.warning("Cloudflare protection triggered, waiting 10s...")
             page.wait_for_timeout(10_000)
 
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # Пагинация
+        # Проверка пагинации
         pagination_found = False
         try:
-            page.wait_for_selector(".pagination", timeout=10_000)
+            page.wait_for_selector(".pagination", timeout=5_000)
             pagination_found = True
-            log.info("✅ .pagination найден")
         except Exception:
-            log.info("ℹ️ .pagination НЕ найден (все монеты на одной странице)")
+            pass
 
-        # Скроллим страницу для прогрузки ленивых элементов
+        # Прокрутка для полной загрузки ячеек
         prev_count = 0
         for _ in range(5):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -201,29 +230,12 @@ class CoinalyzeScraper:
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(500)
 
-        rows = page.query_selector_all("tbody tr[data-coin]") or page.query_selector_all("tbody tr")
+        rows = page.query_selector_all("tbody tr")
         row_count = len(rows)
 
-        log.info(f"🔗 Полный URL: {url}")
-        log.info(f"📊 Строк в таблице: {row_count}")
+        log.info(f"🔗 URL: {url}")
+        log.info(f"📊 Найдено строк в DOM: {row_count}")
         log.info(f"📊 Пагинация: {'ЕСТЬ' if pagination_found else 'НЕТ'}")
-
-        if row_count > 0:
-            first_row = rows[0]
-            tds = first_row.query_selector_all("td")
-            log.info(f"🔍 В первой строке КОЛОНОК: {len(tds)}")
-
-            # Выводим первые 5 колонок первой строки в лог
-            for i, td in enumerate(tds[:5]):
-                text = (td.inner_text() or "").strip()[:60]
-                log.info(f"   td[{i}] = {text!r}")
-
-            if self.debug:
-                row_html = first_row.inner_html()
-                DEBUG_FIRST_ROW_FILE.write_text(row_html, encoding="utf-8")
-                log.info(f"💾 HTML первой строки сохранён в {DEBUG_FIRST_ROW_FILE.name}")
-        else:
-            log.warning("❌ В таблице нет строк!")
 
         return page.inner_html("body")
 
@@ -260,12 +272,10 @@ class CoinalyzeScraper:
         html_text = self._load(COINALYZE_URL)
         if self.debug:
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-            log.info(f"💾 Полный HTML страницы сохранен в {DEBUG_HTML_FILE.name}")
 
         parsed = parse_table(html_text)
-        add_rows(parsed)
-        total_tr_in_dom = len(BeautifulSoup(html_text, 'lxml').select('tbody tr'))
-        log.info(f"Страница 1: {len(all_rows)} монет (распарсено {len(parsed)} из {total_tr_in_dom} строк)")
+        new_added = add_rows(parsed)
+        log.info(f"Страница 1: распарсено {len(parsed)} строк, добавлено {new_added} монет")
 
         urls = self._get_page_urls(html_text)
         if len(urls) > 1:
@@ -275,14 +285,14 @@ class CoinalyzeScraper:
                     new_count = add_rows(parse_table(html_text))
                     log.info(f"Страница {i}: +{new_count} новых монет")
                 except Exception as e:
-                    log.error(f"Ошибка страницы {i}: {e}")
+                    log.error(f"Ошибка на странице {i}: {e}")
 
         log.info(f"ИТОГО уникальных монет: {len(all_rows)}")
         if all_rows:
             sample = all_rows[0]
             log.info(
-                f"📋 Пример первой монеты: symbol={sample.get('symbol')} name={sample.get('name')} "
-                f"price={sample.get('price')} volume24={sample.get('volume24')} oi={sample.get('oi')}"
+                f"📋 Первая монета: symbol={sample.get('symbol')}, name={sample.get('name')}, "
+                f"price={sample.get('price')}, volume24={sample.get('volume24')}"
             )
         return all_rows
 
