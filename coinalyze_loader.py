@@ -1,11 +1,12 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Адаптирован под таблицу из 21 колонки (без CVD и LLS).
+Адаптирован под динамическое количество колонок в таблице Coinalyze.
 """
 from __future__ import annotations
 
 import os
 import json
+import time
 import logging
 from pathlib import Path
 from typing import Optional
@@ -28,13 +29,13 @@ log = logging.getLogger("coinalyze_loader")
 
 BASE = Path(__file__).resolve().parent
 DEBUG_HTML_FILE = BASE / "debug_page.html"
-DEBUG_PAGINATION_FILE = BASE / "debug_pagination.html"
+DEBUG_FIRST_ROW_FILE = BASE / "debug_first_row.html"
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
-DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+DEBUG = os.environ.get("DEBUG", "true").lower() == "true"
 
 COINALYZE_URL = (
     "https://coinalyze.net/"
@@ -62,50 +63,57 @@ def parse_number(text: str) -> Optional[float]:
 
 
 def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
-    import time
     ts = ts or time.time()
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
     out = []
+
+    def get_td(tds: list, idx: int) -> Optional[float]:
+        """Безопасное получение числа из колонки idx."""
+        if idx < len(tds):
+            return parse_number(tds[idx].get_text(strip=True))
+        return None
+
     for tr in rows:
         symbol = tr.get("data-coin")
         tds = tr.find_all("td")
 
         # ═══════════════════════════════════════════════════════════
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: снижаем порог с 23 до 21
-        # Таблица Coinalyze в этом URL имеет только 21 колонку
-        # (CVD и LLS отсутствуют в сохранённом представлении)
+        # ИСПРАВЛЕНИЕ: ПРОВЕРЯЕМ ТОЛЬКО БАЗОВЫЕ 5 КОЛОНОК
+        # Если колонок меньше 5, это скорее всего не строка с монетой
         # ═══════════════════════════════════════════════════════════
-        if len(tds) < 21:
+        if len(tds) < 5:
             continue
 
-        spans = tds[1].find_all("span")
+        spans = tds[1].find_all("span") if len(tds) > 1 else []
         name = spans[0].get_text(strip=True) if spans else (symbol or "?")
 
         rec = {
-            "ts": ts, "symbol": symbol, "name": name,
-            "price": parse_number(tds[2].get_text(strip=True)),
-            "price_chg24": parse_number(tds[3].get_text(strip=True)),
-            "mktcap": parse_number(tds[4].get_text(strip=True)),
-            "volume24": parse_number(tds[5].get_text(strip=True)),
-            "oi": parse_number(tds[6].get_text(strip=True)),
-            "oi_chg24_pct": parse_number(tds[7].get_text(strip=True)),
-            "oi_chg4h_pct": parse_number(tds[9].get_text(strip=True)),
-            "oi_vol_ratio": parse_number(tds[11].get_text(strip=True)),
-            "oi_mktcap_ratio": parse_number(tds[12].get_text(strip=True)),
-            "fr_avg": parse_number(tds[13].get_text(strip=True)),
-            "pfr_avg": parse_number(tds[14].get_text(strip=True)),
-            "fr_oiw": parse_number(tds[15].get_text(strip=True)),
-            "pfr_oiw": parse_number(tds[16].get_text(strip=True)),
-            "liq_short24": parse_number(tds[17].get_text(strip=True)),
-            "liq_long24": parse_number(tds[18].get_text(strip=True)),
-            "ls_accounts": parse_number(tds[19].get_text(strip=True)),
-            "btc_corr7d": parse_number(tds[20].get_text(strip=True)),
-            # ═══ CVD и LLS отсутствуют в этой таблице ═══
-            "cvd24": parse_number(tds[21].get_text(strip=True)) if len(tds) > 21 else None,
-            "lls24": parse_number(tds[22].get_text(strip=True)) if len(tds) > 22 else None,
+            "ts": ts,
+            "symbol": symbol,
+            "name": name,
+            "price": get_td(tds, 2),
+            "price_chg24": get_td(tds, 3),
+            "mktcap": get_td(tds, 4),
+            "volume24": get_td(tds, 5),
+            "oi": get_td(tds, 6),
+            "oi_chg24_pct": get_td(tds, 7),
+            "oi_chg4h_pct": get_td(tds, 9),
+            "oi_vol_ratio": get_td(tds, 11),
+            "oi_mktcap_ratio": get_td(tds, 12),
+            "fr_avg": get_td(tds, 13),
+            "pfr_avg": get_td(tds, 14),
+            "fr_oiw": get_td(tds, 15),
+            "pfr_oiw": get_td(tds, 16),
+            "liq_short24": get_td(tds, 17),
+            "liq_long24": get_td(tds, 18),
+            "ls_accounts": get_td(tds, 19),
+            "btc_corr7d": get_td(tds, 20),
+            "cvd24": get_td(tds, 21),
+            "lls24": get_td(tds, 22),
         }
         out.append(rec)
+
     return out
 
 
@@ -181,7 +189,7 @@ class CoinalyzeScraper:
         except Exception:
             log.info("ℹ️ .pagination НЕ найден (все монеты на одной странице)")
 
-        # Скроллим
+        # Скроллим страницу для прогрузки ленивых элементов
         prev_count = 0
         for _ in range(5):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -196,9 +204,6 @@ class CoinalyzeScraper:
         rows = page.query_selector_all("tbody tr[data-coin]") or page.query_selector_all("tbody tr")
         row_count = len(rows)
 
-        # ═══════════════════════════════════════════════════════════
-        # ДИАГНОСТИКА — всегда выводится в лог
-        # ═══════════════════════════════════════════════════════════
         log.info(f"🔗 Полный URL: {url}")
         log.info(f"📊 Строк в таблице: {row_count}")
         log.info(f"📊 Пагинация: {'ЕСТЬ' if pagination_found else 'НЕТ'}")
@@ -208,18 +213,17 @@ class CoinalyzeScraper:
             tds = first_row.query_selector_all("td")
             log.info(f"🔍 В первой строке КОЛОНОК: {len(tds)}")
 
-            # Выводим ВСЕ тексты колонок первой строки
-            for i, td in enumerate(tds):
+            # Выводим первые 5 колонок первой строки в лог
+            for i, td in enumerate(tds[:5]):
                 text = (td.inner_text() or "").strip()[:60]
                 log.info(f"   td[{i}] = {text!r}")
 
-            # Сохраняем HTML первой строки
-            row_html = first_row.inner_html()
-            Path(BASE / "debug_first_row.html").write_text(row_html, encoding="utf-8")
-            log.info(f"💾 HTML первой строки сохранён в debug_first_row.html")
+            if self.debug:
+                row_html = first_row.inner_html()
+                DEBUG_FIRST_ROW_FILE.write_text(row_html, encoding="utf-8")
+                log.info(f"💾 HTML первой строки сохранён в {DEBUG_FIRST_ROW_FILE.name}")
         else:
             log.warning("❌ В таблице нет строк!")
-        # ═══════════════════════════════════════════════════════════
 
         return page.inner_html("body")
 
@@ -256,10 +260,12 @@ class CoinalyzeScraper:
         html_text = self._load(COINALYZE_URL)
         if self.debug:
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+            log.info(f"💾 Полный HTML страницы сохранен в {DEBUG_HTML_FILE.name}")
 
         parsed = parse_table(html_text)
         add_rows(parsed)
-        log.info(f"Страница 1: {len(all_rows)} монет (распарсено {len(parsed)} из {len(BeautifulSoup(html_text, 'lxml').select('tbody tr'))} строк)")
+        total_tr_in_dom = len(BeautifulSoup(html_text, 'lxml').select('tbody tr'))
+        log.info(f"Страница 1: {len(all_rows)} монет (распарсено {len(parsed)} из {total_tr_in_dom} строк)")
 
         urls = self._get_page_urls(html_text)
         if len(urls) > 1:
@@ -274,8 +280,10 @@ class CoinalyzeScraper:
         log.info(f"ИТОГО уникальных монет: {len(all_rows)}")
         if all_rows:
             sample = all_rows[0]
-            log.info(f"📋 Пример записи: symbol={sample.get('symbol')} name={sample.get('name')} "
-                     f"price={sample.get('price')} cvd24={sample.get('cvd24')} lls24={sample.get('lls24')}")
+            log.info(
+                f"📋 Пример первой монеты: symbol={sample.get('symbol')} name={sample.get('name')} "
+                f"price={sample.get('price')} volume24={sample.get('volume24')} oi={sample.get('oi')}"
+            )
         return all_rows
 
 
