@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает глубокий скроллинг всех монет первой страницы и умную пагинацию.
+Включает глубокую маскировку под реальный браузер и выбор 100+ строк в таблице.
 """
 from __future__ import annotations
 
@@ -161,7 +161,21 @@ class CoinalyzeScraper:
 
     def __enter__(self) -> "CoinalyzeScraper":
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=self.headless)
+
+        # ═══════════════════════════════════════════════════════════
+        # МАСКИРОВКА ПОД РЕАЛЬНЫЙ БРАУЗЕР (ОБХОД ДЕТЕКТА ХЕДЛЕССА)
+        # ═══════════════════════════════════════════════════════════
+        self._browser = self._pw.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+            ],
+        )
+
         ctx = self._browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -169,7 +183,23 @@ class CoinalyzeScraper:
             ),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+
+        # Скрываем атрибут navigator.webdriver
+        ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
         self._add_cookies(ctx)
         self._page = ctx.new_page()
         stealth_sync(self._page)
@@ -209,21 +239,39 @@ class CoinalyzeScraper:
         page.wait_for_selector("tbody tr", timeout=25_000)
 
         # ═══════════════════════════════════════════════════════════
-        # ГЛУБОКИЙ СКТРОЛЛИНГ С НАЖАТИЕМ КЛАВИШ (ДО 30 ШАГОВ)
+        # ПРИНУДИТЕЛЬНО ПЕРЕКЛЮЧАЕМ ВЫПАДАЮЩИЙ СПИСОК СТРОК НА 100/ALL
+        # ═══════════════════════════════════════════════════════════
+        try:
+            page.evaluate("""() => {
+                const selects = document.querySelectorAll('select');
+                selects.forEach(s => {
+                    for (let opt of s.options) {
+                        if (opt.value === '100' || opt.text.includes('100') || opt.value === '-1') {
+                            s.value = opt.value;
+                            s.dispatchEvent(new Event('change', { bubbles: true }));
+                            break;
+                        }
+                    }
+                });
+            }""")
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            log.info(f"ℹ️ Выбор количества строк через select: {e}")
+
+        # ═══════════════════════════════════════════════════════════
+        # ГЛУБОКИЙ СКРОЛЛИНГ С НАЖАТИЕМ КЛАВИШ
         # ═══════════════════════════════════════════════════════════
         log.info("📜 Начинаем глубокий скроллинг страницы...")
         prev_count = 0
         no_change = 0
 
         for step in range(1, 30):
-            # Прокрутка через JS, колесо мыши и клавиши
             page.mouse.wheel(0, 3000)
             page.keyboard.press("PageDown")
             page.keyboard.press("End")
             page.evaluate("window.scrollBy(0, 2500)")
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
-            # Даем 2.0 секунды на AJAX подгрузку строк
             page.wait_for_timeout(2000)
 
             cur_count = len(page.query_selector_all("tbody tr"))
@@ -243,7 +291,6 @@ class CoinalyzeScraper:
 
         full_html = page.content()
 
-        # Проверяем, есть ли на странице пагинация
         soup = BeautifulSoup(full_html, "html.parser")
         has_pagination = bool(
             soup.select_one(".pagination") 
@@ -286,7 +333,6 @@ class CoinalyzeScraper:
                 new_added = add_rows(parsed_page)
                 log.info(f"🏁 Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}")
 
-                # Если пагинация отсутствует на сайте или монеты перестали добавляться — завершаем
                 if not has_pagination:
                     log.info("ℹ️ Пагинация на странице отсутствует (все монеты находятся на одной странице). Сбор завершен.")
                     break
