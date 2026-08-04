@@ -39,10 +39,7 @@ HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "true").lower() == "true"
 
 COINALYZE_URL = (
-    "https://coinalyze.net/"
-    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY4"
-    "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
-    "&order_by=volume_24hour&order_dir=desc"
+    "https://coinalyze.net/" 
 )
 
 # ─────────────────────────── парсеры ───────────────────────────
