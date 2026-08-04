@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Диагностика: полный HTML пагинации, колонки, сырой HTML строк.
+Адаптирован под таблицу из 21 колонки (без CVD и LLS).
 """
 from __future__ import annotations
 
@@ -19,16 +19,12 @@ except ImportError:
     def stealth_sync(page):
         pass
 
-# ─────────────────────────── логирование ───────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("coinalyze_loader")
-
-# ─────────────────────────── конфигурация ───────────────────────────
 
 BASE = Path(__file__).resolve().parent
 DEBUG_HTML_FILE = BASE / "debug_page.html"
@@ -46,7 +42,6 @@ COINALYZE_URL = (
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
-
 
 # ─────────────────────────── парсеры ───────────────────────────
 
@@ -75,10 +70,18 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     for tr in rows:
         symbol = tr.get("data-coin")
         tds = tr.find_all("td")
-        if len(tds) < 23:
+
+        # ═══════════════════════════════════════════════════════════
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: снижаем порог с 23 до 21
+        # Таблица Coinalyze в этом URL имеет только 21 колонку
+        # (CVD и LLS отсутствуют в сохранённом представлении)
+        # ═══════════════════════════════════════════════════════════
+        if len(tds) < 21:
             continue
+
         spans = tds[1].find_all("span")
         name = spans[0].get_text(strip=True) if spans else (symbol or "?")
+
         rec = {
             "ts": ts, "symbol": symbol, "name": name,
             "price": parse_number(tds[2].get_text(strip=True)),
@@ -98,8 +101,9 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
             "liq_long24": parse_number(tds[18].get_text(strip=True)),
             "ls_accounts": parse_number(tds[19].get_text(strip=True)),
             "btc_corr7d": parse_number(tds[20].get_text(strip=True)),
-            "cvd24": parse_number(tds[21].get_text(strip=True)),
-            "lls24": parse_number(tds[22].get_text(strip=True)),
+            # ═══ CVD и LLS отсутствуют в этой таблице ═══
+            "cvd24": parse_number(tds[21].get_text(strip=True)) if len(tds) > 21 else None,
+            "lls24": parse_number(tds[22].get_text(strip=True)) if len(tds) > 22 else None,
         }
         out.append(rec)
     return out
@@ -140,10 +144,10 @@ class CoinalyzeScraper:
 
     @staticmethod
     def _add_cookies(ctx):
-        log.info(f"🔑 Env check: COINALYZE_P_SID={'SET (' + str(len(COINALYZE_P_SID)) + ' chars)' if COINALYZE_P_SID else 'EMPTY'}")
-        log.info(f"🔑 Env check: COINALYZE_CHAT_SID={'SET (' + str(len(COINALYZE_CHAT_SID)) + ' chars)' if COINALYZE_CHAT_SID else 'EMPTY'}")
+        log.info(f"🔑 COINALYZE_P_SID: {'SET (' + str(len(COINALYZE_P_SID)) + ' chars)' if COINALYZE_P_SID else 'EMPTY'}")
+        log.info(f"🔑 COINALYZE_CHAT_SID: {'SET (' + str(len(COINALYZE_CHAT_SID)) + ' chars)' if COINALYZE_CHAT_SID else 'EMPTY'}")
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
-            log.warning("⚠️ Куки НЕ установлены — сайт отдаст дефолтную таблицу")
+            log.warning("⚠️ Куки НЕ установлены — сайт может отдать дефолтную таблицу")
             return
         cookies = []
         if COINALYZE_P_SID:
@@ -157,72 +161,27 @@ class CoinalyzeScraper:
         ctx.add_cookies(cookies)
         log.info(f"✅ Куки установлены: {len(cookies)} шт.")
 
-    # ───────── загрузка страницы ─────────
-
     def _load(self, url: str) -> str:
         page = self._page
         page.goto(url, wait_until="domcontentloaded", timeout=50_000)
         page.wait_for_timeout(4000)
 
         if "Attention Required" in page.content():
-            log.warning("Cloudflare detected, waiting 10s...")
+            log.warning("Cloudflare, waiting 10s...")
             page.wait_for_timeout(10_000)
 
-        # Ждём таблицу
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # ═══════════════════════════════════════════════════════════
-        # ДИАГНОСТИКА СЕЛЕКТОРА .pagination — ПОЛНЫЙ ВЫВОД В ЛОГ
-        # ═══════════════════════════════════════════════════════════
-        log.info("🔍 Пытаемся найти селектор: .pagination")
+        # Пагинация
+        pagination_found = False
         try:
             page.wait_for_selector(".pagination", timeout=10_000)
-            log.info("✅ СЕЛЕКТОР .pagination НАЙДЕН в DOM")
-            
-            pag_el = page.query_selector(".pagination")
-            if pag_el:
-                # ПОЛНЫЙ HTML блока пагинации
-                pag_html = pag_el.evaluate("el => el.outerHTML")
-                log.info("=" * 80)
-                log.info("📄 ПОЛНЫЙ HTML БЛОКА .pagination (outerHTML):")
-                log.info("=" * 80)
-                # Разбиваем на строки для читаемости в логе GitHub Actions
-                for line in pag_html.split("\n"):
-                    if line.strip():
-                        log.info(f"   {line.strip()}")
-                log.info("=" * 80)
-                
-                # Сохраняем в файл
-                DEBUG_PAGINATION_FILE.write_text(pag_html, encoding="utf-8")
-                log.info(f"💾 Сохранено в {DEBUG_PAGINATION_FILE.name} ({len(pag_html)} симв.)")
-                
-                # Детальный разбор всех элементов внутри
-                links = pag_el.query_selector_all("a")
-                log.info(f"🔗 Элементов <a> внутри .pagination: {len(links)}")
-                for i, a in enumerate(links):
-                    href = a.get_attribute("href") or "(no href)"
-                    text = (a.inner_text() or "").strip()
-                    log.info(f"   a[{i}]: text='{text}' href='{href}'")
-                    
-                buttons = pag_el.query_selector_all("button")
-                log.info(f"🔘 Элементов <button> внутри .pagination: {len(buttons)}")
-                for i, b in enumerate(buttons):
-                    text = (b.inner_text() or "").strip()
-                    log.info(f"   button[{i}]: text='{text}'")
-                    
-                spans = pag_el.query_selector_all("span")
-                log.info(f"📍 Элементов <span> внутри .pagination: {len(spans)}")
-                for i, s in enumerate(spans):
-                    text = (s.inner_text() or "").strip()
-                    cls = s.get_attribute("class") or ""
-                    log.info(f"   span[{i}]: text='{text}' class='{cls}'")
-            else:
-                log.warning("⚠️ query_selector('.pagination') вернул None, хотя wait_for_selector сработал!")
-        except Exception as e:
-            log.warning(f"❌ СЕЛЕКТОР .pagination НЕ НАЙДЕН за 10с: {e}")
-        # ═══════════════════════════════════════════════════════════
+            pagination_found = True
+            log.info("✅ .pagination найден")
+        except Exception:
+            log.info("ℹ️ .pagination НЕ найден (все монеты на одной странице)")
 
-        # Скроллим для подгрузки
+        # Скроллим
         prev_count = 0
         for _ in range(5):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -237,31 +196,32 @@ class CoinalyzeScraper:
         rows = page.query_selector_all("tbody tr[data-coin]") or page.query_selector_all("tbody tr")
         row_count = len(rows)
 
-        # Диагностика колонок
-        log.info(f"🔗 URL: {url}")
+        # ═══════════════════════════════════════════════════════════
+        # ДИАГНОСТИКА — всегда выводится в лог
+        # ═══════════════════════════════════════════════════════════
+        log.info(f"🔗 Полный URL: {url}")
+        log.info(f"📊 Строк в таблице: {row_count}")
+        log.info(f"📊 Пагинация: {'ЕСТЬ' if pagination_found else 'НЕТ'}")
+
         if row_count > 0:
             first_row = rows[0]
             tds = first_row.query_selector_all("td")
-            log.info(f"🔍 Первая строка: КОЛОНОК = {len(tds)} (требуется >= 23)")
-            
-            if len(tds) < 23:
-                log.warning(f"⚠️ ТАБЛИЦА ИМЕЕТ ТОЛЬКО {len(tds)} КОЛОНОК — парсер отбросит все {row_count} строк!")
-                row_html = first_row.evaluate("el => el.outerHTML")
-                log.info("📄 HTML первой строки таблицы:")
-                for line in row_html.split("\n")[:20]:
-                    if line.strip():
-                        log.info(f"   {line.strip()}")
-                Path(BASE / "debug_first_row.html").write_text(row_html, encoding="utf-8")
-                log.info(f"💾 Первая строка сохранена в debug_first_row.html")
-        else:
-            log.warning("❌ В таблице вообще нет строк")
+            log.info(f"🔍 В первой строке КОЛОНОК: {len(tds)}")
 
-        has_pagination = page.query_selector(".pagination") is not None
-        log.info(f"📊 Итог: строк={row_count}, пагинация={'ЕСТЬ' if has_pagination else 'НЕТ'}")
+            # Выводим ВСЕ тексты колонок первой строки
+            for i, td in enumerate(tds):
+                text = (td.inner_text() or "").strip()[:60]
+                log.info(f"   td[{i}] = {text!r}")
+
+            # Сохраняем HTML первой строки
+            row_html = first_row.inner_html()
+            Path(BASE / "debug_first_row.html").write_text(row_html, encoding="utf-8")
+            log.info(f"💾 HTML первой строки сохранён в debug_first_row.html")
+        else:
+            log.warning("❌ В таблице нет строк!")
+        # ═══════════════════════════════════════════════════════════
 
         return page.inner_html("body")
-
-    # ───────── пагинация ─────────
 
     @staticmethod
     def _get_page_urls(html_text: str) -> list[str]:
@@ -279,40 +239,6 @@ class CoinalyzeScraper:
                 urls.append(full_url)
         return urls[:MAX_PAGES]
 
-    def _click_next_page(self, current_page_num: int) -> bool:
-        page = self._page
-        pag = page.query_selector(".pagination")
-        if not pag:
-            return False
-        first_row = page.query_selector("tbody tr")
-        before = first_row.get_attribute("data-coin") if first_row else None
-        target = None
-        for el in pag.query_selector_all("a, button, li"):
-            if (el.inner_text() or "").strip() == str(current_page_num + 1):
-                target = el
-                break
-        if target is None:
-            target = pag.query_selector("[aria-label='Next'], .next, a[rel='next']")
-        if target is None:
-            return False
-        target.click()
-        page.wait_for_timeout(1500)
-        for _ in range(10):
-            first_row = page.query_selector("tbody tr")
-            after = first_row.get_attribute("data-coin") if first_row else None
-            if after and after != before:
-                return True
-            page.wait_for_timeout(500)
-        return False
-
-    def _dump_debug(self, html_text: str):
-        if not self.debug:
-            return
-        DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-        log.info(f"💾 Полный HTML страницы сохранён в {DEBUG_HTML_FILE.name}")
-
-    # ───────── публичный метод ─────────
-
     def fetch_all(self) -> list[dict]:
         all_rows: list[dict] = []
         seen: set[str] = set()
@@ -328,38 +254,28 @@ class CoinalyzeScraper:
             return new
 
         html_text = self._load(COINALYZE_URL)
-        self._dump_debug(html_text)
-        add_rows(parse_table(html_text))
-        log.info(f"Страница 1: {len(all_rows)} монет (из {len(seen)} уникальных)")
+        if self.debug:
+            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+
+        parsed = parse_table(html_text)
+        add_rows(parsed)
+        log.info(f"Страница 1: {len(all_rows)} монет (распарсено {len(parsed)} из {len(BeautifulSoup(html_text, 'lxml').select('tbody tr'))} строк)")
 
         urls = self._get_page_urls(html_text)
-        log.info(f"📑 URL-ов для загрузки: {len(urls)}")
-
         if len(urls) > 1:
             for i, url in enumerate(urls[1:], start=2):
                 try:
-                    log.info(f"➡️ Загружаю страницу {i}: {url[:120]}...")
                     html_text = self._load(url)
                     new_count = add_rows(parse_table(html_text))
                     log.info(f"Страница {i}: +{new_count} новых монет")
                 except Exception as e:
                     log.error(f"Ошибка страницы {i}: {e}")
-        else:
-            soup = BeautifulSoup(html_text, "lxml")
-            if soup.select_one(".pagination"):
-                log.info("href не найдены, пробуем клики по .pagination")
-                page_num = 1
-                while page_num < self.max_pages:
-                    if not self._click_next_page(page_num):
-                        break
-                    self._page.wait_for_selector("tbody tr", timeout=15_000)
-                    self._page.wait_for_timeout(500)
-                    html_text = self._page.content()
-                    new_count = add_rows(parse_table(html_text))
-                    page_num += 1
-                    log.info(f"Страница {page_num}: +{new_count} новых монет (клик)")
 
         log.info(f"ИТОГО уникальных монет: {len(all_rows)}")
+        if all_rows:
+            sample = all_rows[0]
+            log.info(f"📋 Пример записи: symbol={sample.get('symbol')} name={sample.get('name')} "
+                     f"price={sample.get('price')} cvd24={sample.get('cvd24')} lls24={sample.get('lls24')}")
         return all_rows
 
 
