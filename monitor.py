@@ -142,13 +142,42 @@ def _setup_browser_context(p):
 
 
 def _load_page(page, url):
-    """Загружает одну страницу и возвращает HTML."""
+    """Загружает одну страницу и возвращает полный HTML.
+    Ждёт таблицу, пагинацию, скроллит для подгрузки всех строк."""
     page.goto(url, wait_until="domcontentloaded", timeout=50_000)
     page.wait_for_timeout(4000)
+
     if "Attention Required" in page.content():
         log.warning("Cloudflare, waiting...")
         page.wait_for_timeout(10_000)
+
+    # Ждём таблицу
     page.wait_for_selector("tbody tr", timeout=25_000)
+
+    # Ждём блок пагинации (рендерится позже таблицы)
+    try:
+        page.wait_for_selector(".pagination", timeout=10_000)
+    except Exception:
+        log.warning("Блок .pagination не найден за 10с — работаем с одной страницей")
+
+    # Скроллим вниз до конца, чтобы триггернуть подгрузку всех строк таблицы
+    prev_count = 0
+    for _ in range(5):  # максимум 5 итераций скролла
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(800)
+        cur_count = len(page.select("tbody tr"))
+        if cur_count == prev_count:
+            break  # больше строк не появляется
+        prev_count = cur_count
+
+    # Скроллим обратно наверх (на всякий случай, для корректного рендера)
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+
+    row_count = len(page.select("tbody tr"))
+    has_pagination = page.select_one(".pagination") is not None
+    log.info(f"Строк в таблице: {row_count} · пагинация: {'есть' if has_pagination else 'нет'}")
+
     return page.content()
 
 
