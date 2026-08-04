@@ -1,3 +1,7 @@
+"""
+coinalyze_loader.py — загрузчик данных с Coinalyze.
+Включает диагностику количества колонок для отладки JS-рендеринга.
+"""
 from __future__ import annotations
 
 import os
@@ -8,7 +12,6 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, Page
- 
 
 try:
     from playwright_stealth import stealth_sync
@@ -23,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("browser")
+log = logging.getLogger("coinalyze_loader")
 
 # ─────────────────────────── конфигурация ───────────────────────────
 
@@ -37,13 +40,13 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
+# ВАЖНО: URL склеен плотно, без пробелов, чтобы сервер применил фильтры
 COINALYZE_URL = (
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
-
 
 # ─────────────────────────── парсинг чисел / таблицы ───────────────────────────
 
@@ -107,12 +110,7 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
 # ─────────────────────────── скрапер ───────────────────────────
 
 class CoinalyzeScraper:
-    """Инкапсулирует жизненный цикл Playwright-браузера и логику загрузки страниц.
-
-    Использование:
-        with CoinalyzeScraper() as scraper:
-            coins = scraper.fetch_all()
-    """
+    """Инкапсулирует жизненный цикл Playwright-браузера и логику загрузки страниц."""
 
     def __init__(self, headless: bool = HEADLESS, max_pages: int = MAX_PAGES, debug: bool = DEBUG):
         self.headless = headless
@@ -163,67 +161,67 @@ class CoinalyzeScraper:
 
     def _load(self, url: str) -> str:
         page = self._page
-
-        # Ждем завершения всех сетевых запросов после перехода
-        try:
-            with page.expect_event("networkidle", timeout=30_000):
-                page.goto(url, wait_until="domcontentloaded", timeout=50_000)
-        except Exception:
-            page.goto(url, wait_until="domcontentloaded", timeout=50_000)
-
-        # Дополнительная пауза для исполнения JS
-        page.wait_for_timeout(3000)
+        page.goto(url, wait_until="domcontentloaded", timeout=50_000)
+        page.wait_for_timeout(4000)
 
         if "Attention Required" in page.content():
             log.warning("Cloudflare, waiting...")
-            page.wait_for_timeout(15_000)
-            try:
-                with page.expect_event("networkidle", timeout=30_000):
-                    pass
-            except Exception:
-                pass
+            page.wait_for_timeout(10_000)
 
-        # Ждем не просто строки, а строки с атрибутом data-coin (гарантия загрузки данных)
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Ждем именно 23-ю колонку, а не просто tr.
+        # Это заставляет Playwright ждать, пока JS Coinalyze не перестроит таблицу
+        # и не применит фильтры из URL.
         try:
-            page.wait_for_selector("tbody tr[data-coin]", timeout=25_000)
+            page.wait_for_selector("tbody tr td:nth-child(23)", timeout=15_000)
+            log.info("✅ Найдена 23-я колонка (таблица успешно перестроена JS)")
         except Exception:
-            log.warning("Строки с data-coin не найдены, пробуем обычные tr")
+            log.warning("⚠️ 23-я колонка не найдена за 15с. JS не успел или фильтры не применились.")
+            # Фолбэк: ждем хотя бы обычные строки
             page.wait_for_selector("tbody tr", timeout=10_000)
 
         try:
-            page.wait_for_selector(".pagination", timeout=5_000)
+            page.wait_for_selector(".pagination", timeout=10_000)
         except Exception:
-            pass  # Пагинации может не быть
+            log.info("Блок .pagination не найден (все монеты на одной странице)")
 
         # Скроллим для подгрузки всех строк (ленивая отрисовка)
         prev_count = 0
-        for _ in range(7):  # Увеличили попытки скролла
+        for _ in range(5):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(600)
-            # Считаем только строки с данными
-            cur_count = len(page.query_selector_all("tbody tr[data-coin]"))
-            if cur_count == 0:
-                cur_count = len(page.query_selector_all("tbody tr"))
-
-            if cur_count == prev_count and cur_count > 0:
+            page.wait_for_timeout(800)
+            cur_count = len(page.query_selector_all("tbody tr"))
+            if cur_count == prev_count:
                 break
             prev_count = cur_count
-
         page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(1000)  # Пауза перед снятием слепка
+        page.wait_for_timeout(500)
 
-        # Считаем итоговое количество
-        row_count = len(page.query_selector_all("tbody tr[data-coin]"))
-        if row_count == 0:
-            row_count = len(page.query_selector_all("tbody tr"))
+        rows = page.query_selector_all("tbody tr[data-coin]") or page.query_selector_all("tbody tr")
+        row_count = len(rows)
+        
+        # === ДИАГНОСТИКА ===
+        log.info(f"🔗 Полный URL: {url}")
+        
+        if row_count > 0:
+            first_row = rows[0]
+            tds = first_row.query_selector_all("td")
+            log.info(f"🔍 В первой строке таблицы найдено КОЛОНОК (td): {len(tds)}")
+            
+            if len(tds) < 23:
+                log.warning(f"⚠️ ВНИМАНИЕ: Таблица имеет {len(tds)} колонок, а парсер требует >= 23.")
+                log.warning(f"⚠️ Все {row_count} строк будут отброшены функцией parse_table!")
+                # Сохраняем HTML для ручного анализа
+                Path(BASE / "debug_first_row.html").write_text(first_row.inner_html(), encoding="utf-8")
+                log.info(f"💾 HTML первой строки сохранен в {BASE / 'debug_first_row.html'}")
+        else:
+            log.warning("❌ В таблице вообще нет строк! Возможно, Cloudflare.")
+        # ===================
 
         has_pagination = page.query_selector(".pagination") is not None
-        log.info(f"{url.split('?')[0]}: строк={row_count}, пагинация={'есть' if has_pagination else 'нет'}")
+        log.info(f"Итог: строк={row_count}, пагинация={'есть' if has_pagination else 'нет'}")
 
-        # ВАЖНО: Берем innerHTML body, а не полный content страницы
-        # Это решает проблему с динамически подгружаемым контентом
-        html_text = page.inner_html("body")
-        return html_text
+        # Берем innerHTML body, чтобы захватить динамически подгруженный контент
+        return page.inner_html("body")
 
     # ───────── пагинация: href (быстрый путь) ─────────
 
@@ -289,7 +287,7 @@ class CoinalyzeScraper:
     # ───────── публичный метод ─────────
 
     def fetch_all(self) -> list[dict]:
-        """Загружает все страницы пагинации и возвращает список монет (дедупликация по symbol)."""
+        """Загружает все страницы пагинации и возвращает список монет."""
         all_rows: list[dict] = []
         seen: set[str] = set()
 
@@ -311,7 +309,6 @@ class CoinalyzeScraper:
         urls = self._get_page_urls(html_text)
 
         if len(urls) > 1:
-            # Быстрый путь: реальные href-ссылки на страницы
             for i, url in enumerate(urls[1:], start=2):
                 try:
                     html_text = self._load(url)
@@ -320,7 +317,6 @@ class CoinalyzeScraper:
                 except Exception as e:
                     log.error(f"Ошибка страницы {i} ({url}): {e}")
         else:
-            # Фолбэк: пагинация есть, но href не нашли — кликаем
             soup = BeautifulSoup(html_text, "lxml")
             if soup.select_one(".pagination"):
                 log.info("href не найдены, пробуем клики по .pagination")
