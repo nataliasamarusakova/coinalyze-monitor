@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Содержит полный дамп содержимого <tbody> в логи для детального аудита каждого TR.
+Использует огромный виртуальный экран (5000px) для моментального получения всех 90+ монет.
 """
 from __future__ import annotations
 
@@ -107,25 +107,12 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     ts = ts or time.time()
     soup = BeautifulSoup(html_text, "html.parser")
     tbody = soup.select_one("tbody")
-    
-    # ═══════════════════════════════════════════════════════════
-    # ДАМП ВСЕГО TBODY В ЛОГИ ДЛЯ ПРОВЕРКИ СТРОК
-    # ═══════════════════════════════════════════════════════════
+
     if tbody:
         tbody_html = str(tbody)
         DEBUG_TBODY_FILE.write_text(tbody_html, encoding="utf-8")
-        log.info(f"💾 [DEBUG] Фрагмент <tbody> сохранен в {DEBUG_TBODY_FILE.name} ({len(tbody_html)} байт)")
-
         tr_elements = tbody.find_all("tr")
-        log.info("=" * 70)
-        log.info(f"🔥 [TBODY DUMP] Найдено {len(tr_elements)} строк <tr> внутри <tbody>:")
-        log.info("=" * 70)
-        for idx, tr in enumerate(tr_elements, start=1):
-            coin_attr = tr.get("data-coin", "NO_DATA_COIN")
-            tds_in_tr = tr.find_all(["td", "th"])
-            cell_preview = [td.get_text(strip=True)[:18] for td in tds_in_tr[:4]]
-            log.info(f"  TR #{idx:03d} | data-coin={coin_attr:<10} | td_count={len(tds_in_tr):<2} | cells={cell_preview}")
-        log.info("=" * 70)
+        log.info(f"🔥 [TBODY DUMP] Всего строк <tr> внутри <tbody>: {len(tr_elements)}")
 
     rows = soup.select("tbody tr") if tbody else soup.select("tr")
 
@@ -164,7 +151,7 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
         }
         out.append(rec)
 
-    log.info(f"✅ [PARSER] Успешно распарсено записей: {len(out)}/{len(rows)}")
+    log.info(f"✅ [PARSER] Успешно распарсено монет: {len(out)}/{len(rows)}")
     return out
 
 
@@ -217,20 +204,31 @@ class CoinalyzeScraper:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--window-size=1920,1080",
+                "--window-size=1920,5000",
             ],
         )
 
+        # ═══════════════════════════════════════════════════════════
+        # ВЫСОТА ЭКРАНА 5000px ДЛЯ МНОГОКРАТНОЙ ВМЕСТИМОСТИ МОНЕТ
+        # ═══════════════════════════════════════════════════════════
         ctx = self._browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1920, "height": 1080},
+            viewport={"width": 1920, "height": 5000},
             locale="en-US",
         )
 
-        ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Вшиваем настройки таблицы (100 монет на страницу)
+        ctx.add_init_script("""() => {
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            try {
+                localStorage.setItem('table_length', '100');
+                localStorage.setItem('rows_per_page', '100');
+            } catch(e){}
+        }""")
+
         self._add_cookies(ctx)
         self._page = ctx.new_page()
         stealth_sync(self._page)
@@ -263,7 +261,9 @@ class CoinalyzeScraper:
         log.info(f"🌐 [PLAYWRIGHT] Загружаем URL: {url}")
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=40_000)
-            page.wait_for_timeout(3000)
+            
+            # Ждем 6 секунд прогрузки таблицы
+            page.wait_for_timeout(6000)
 
             if "Attention Required" in page.content():
                 log.warning("⚠️ Обнаружен Cloudflare, ждем 10 сек...")
@@ -274,32 +274,30 @@ class CoinalyzeScraper:
             log.warning(f"⚠️ Таблица `tbody tr` не загружена ({e})")
             return None
 
-        # Плавный скроллинг
-        log.info("📜 [SCROLL] Начинаем плавный скроллинг таблицы...")
+        # Прокрутка вниз по огромному экрану
+        log.info("📜 [SCROLL] Прокрутка огромного экрана (5000px)...")
         prev_count = 0
         no_change = 0
 
-        for step in range(1, 35):
+        for step in range(1, 20):
             page.keyboard.press("PageDown")
-            page.mouse.wheel(0, 1500)
+            page.mouse.wheel(0, 3000)
 
             page.evaluate("""() => {
                 const wrapper = document.querySelector('.table-wrapper') || document.querySelector('div[class*="wrapper"]');
-                if (wrapper) {
-                    wrapper.scrollBy(0, 1200);
-                }
-                window.scrollBy(0, 1200);
+                if (wrapper) wrapper.scrollTop += 3000;
+                window.scrollBy(0, 3000);
             }""")
 
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1200)
 
             cur_count = len(page.query_selector_all("tbody tr"))
             log.info(f"   [Скролл #{step:02d}] Строк в DOM: {cur_count}")
 
             if cur_count == prev_count:
                 no_change += 1
-                if no_change >= 4:
-                    log.info(f"✅ [SCROLL] Достигнут конец таблицы. Итого строк в DOM: {cur_count}")
+                if no_change >= 3:
+                    log.info(f"✅ [SCROLL] Итого строк в DOM: {cur_count}")
                     break
             else:
                 no_change = 0
