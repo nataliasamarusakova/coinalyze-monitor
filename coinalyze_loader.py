@@ -1,8 +1,8 @@
 """
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
-Вынесен из monitor.py для отдельного тестирования.
-Запуск: python browser.py
-Запуск с видимым окном локально: HEADLESS=false python browser.py
+Отдельный файл для тестирования браузерной части без остального пайплайна.
+Запуск на CI / без дисплея:        python browser.py
+Запуск локально с видимым окном:   HEADLESS=false python browser.py
 """
 import os
 import logging
@@ -83,8 +83,10 @@ def load_page(page, url):
         log.warning("Cloudflare, waiting...")
         page.wait_for_timeout(10_000)
 
+    # Ждём таблицу
     page.wait_for_selector("tbody tr", timeout=25_000)
 
+    # Ждём блок пагинации (рендерится позже таблицы)
     try:
         page.wait_for_selector(".pagination", timeout=10_000)
     except Exception:
@@ -149,7 +151,7 @@ def get_page_urls(html_text):
 
 def click_next_page(page, current_page_num):
     """
-    Фолбэк на случай, если пагинация — JS-виджет без прямых ссылок:
+    Пагинация на сайте — JS-виджет без прямых ссылок:
     кликаем по нужному номеру / кнопке 'Next' внутри .pagination
     и ждём, пока изменится первая строка таблицы (data-coin).
     """
