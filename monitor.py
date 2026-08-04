@@ -15,6 +15,7 @@ try:
     from playwright_stealth import stealth_sync
 except ImportError:
     def stealth_sync(page): pass
+
 from conditions import check_confirmed_path_a, check_confirmed_path_b
 
 BASE = Path(__file__).resolve().parent
@@ -898,10 +899,11 @@ def run():
                     new_tid=f"{sym}_{ts}"
                     new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,existing.get("snapshots",0)+1,cur_price)
                     log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
+        # [FIX] setdefault не перезаписывает cooldown_until
         idea_first_seen=lifecycle_state.get(sym,{}).get("idea_first_seen_ts")
         if idea_first_seen is None and state in("ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION"):
             idea_first_seen=ts
-            lifecycle_state[sym]={"idea_first_seen_ts":idea_first_seen}
+            lifecycle_state.setdefault(sym,{})["idea_first_seen_ts"]=idea_first_seen
         entry={
             "state":state,"previous_state":prev_state,
             "action":ACTIONS.get(state,""),
