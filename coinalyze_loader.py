@@ -1,5 +1,5 @@
  
-from __future__ import annotations
+ 
 """
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
 Отдаёт готовый список монет (list[dict]), пригодный для использования в monitor.py.
@@ -18,6 +18,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, Page
+from __future__ import annotations
 
 try:
     from playwright_stealth import stealth_sync
