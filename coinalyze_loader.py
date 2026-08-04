@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает пошаговую прокрутку и гарантию обхода всех страниц пагинации (&page=N).
+Поддерживает верный параметр пагинации (&p=N).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ DEBUG_HTML_FILE = BASE / "debug_page.html"
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "10"))  # Проверяем до 10 страниц
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "10"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "true").lower() == "true"
 
@@ -208,7 +208,7 @@ class CoinalyzeScraper:
 
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # Прокрутка текущей страницы для подгрузки ячеек
+        # Прокрутка текущей страницы
         prev_count = 0
         no_change = 0
 
@@ -249,14 +249,16 @@ class CoinalyzeScraper:
         base_url = COINALYZE_URL
 
         for page_num in range(1, self.max_pages + 1):
-            # Формируем URL для следующей страницы
-            sep = "&" if "?" in base_url else "?"
+            # ═══════════════════════════════════════════════════════════
+            # ИСПОЛЬЗУЕМ ВЕРНЫЙ ПАРАМЕТР ПАГИНАЦИИ &p=N (ВМЕСТО &page=N)
+            # ═══════════════════════════════════════════════════════════
             if page_num == 1:
                 url = base_url
             else:
-                url = f"{base_url}{sep}page={page_num}"
+                sep = "&" if "?" in base_url else "?"
+                url = f"{base_url}{sep}p={page_num}"
 
-            log.info(f"\n📑 === ЗАГРУЗКА СТРАНИЦЫ #{page_num} ===")
+            log.info(f"\n📑 === ЗАГРУЗКА СТРАНИЦЫ #{page_num} ({url}) ===")
             try:
                 html_text = self._load(url)
                 if self.debug and page_num == 1:
@@ -266,9 +268,9 @@ class CoinalyzeScraper:
                 new_added = add_rows(parsed_page)
                 log.info(f"🏁 Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}")
 
-                # Если на новой странице нет НИ ОДНОЙ новой монеты — мы дошли до конца
+                # Если на новой странице 0 новых монет — все монеты собраны
                 if new_added == 0:
-                    log.info(f"✅ Достигнут конец данных (на странице #{page_num} нет новых монет). Завершаем сбор.")
+                    log.info(f"✅ Все данные собраны (на странице #{page_num} нет новых монет). Завершаем сбор.")
                     break
 
             except Exception as e:
