@@ -1,6 +1,5 @@
 """
-coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает универсальное извлечение символа монеты и динамических колонок.
+coinalyze_loader.py — загрузчик с Coinalyze с расширенной диагностикой.
 """
 from __future__ import annotations
 
@@ -62,11 +61,9 @@ def parse_number(text: str) -> Optional[float]:
 
 
 def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
-    """Надежное извлечение символа и названия монеты с запасными вариантами."""
-    # 1. Пробуем атрибуты <tr>
+    """Надежное извлечение символа и названия монеты."""
     symbol = tr.get("data-coin") or tr.get("data-symbol") or tr.get("data-id")
 
-    # 2. Пробуем ссылки внутри <tr>
     if not symbol:
         a_tag = tr.find("a", href=True)
         if a_tag:
@@ -75,7 +72,6 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
             if parts:
                 symbol = parts[-1].upper()
 
-    # 3. Пробуем текст из колонок (обычно td[1] или td[0])
     name = "?"
     if len(tds) > 1:
         text_cell = tds[1].get_text(strip=True)
@@ -91,7 +87,6 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
     elif len(tds) > 0 and not symbol:
         symbol = tds[0].get_text(strip=True).upper()
 
-    # 4. Запасной вариант, если ничего не нашлось
     if not symbol or symbol in ("-", "N/A", "?"):
         symbol = f"COIN_{row_idx}"
     if not name or name == "?":
@@ -102,23 +97,33 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
 
 def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     ts = ts or time.time()
-    soup = BeautifulSoup(html_text, "lxml")
+    soup = BeautifulSoup(html_text, "html.parser")
     rows = soup.select("tbody tr")
+    
+    log.info(f"🔍 [BeautifulSoup] Найдено `tbody tr`: {len(rows)} шт.")
+    
+    if not rows:
+        rows = soup.select("tr")
+        log.info(f"⚠️ [BeautifulSoup] Резервный селектор `tr`: {len(rows)} шт.")
+
     out = []
-
-    def get_td(tds: list, idx: int) -> Optional[float]:
-        if idx < len(tds):
-            return parse_number(tds[idx].get_text(strip=True))
-        return None
-
     for idx, tr in enumerate(rows, start=1):
         tds = tr.find_all(["td", "th"])
+        
+        # Логируем первые 3 строки для отладки структуры HTML
+        if idx <= 3:
+            cell_texts = [td.get_text(strip=True)[:25] for td in tds]
+            log.info(f"   👉 Строка #{idx}: колонок={len(tds)}, tr.attrs={tr.attrs}")
+            log.info(f"      Тексты колонок (первые 5): {cell_texts[:5]}")
 
-        # Игнорируем строки-заголовки и пустые строки (меньше 3 колонок)
-        if len(tds) < 3:
+        if len(tds) < 2:
+            if idx <= 3:
+                log.info(f"   ⚠️ Строка #{idx} пропущена (меньше 2 колонок)")
             continue
 
         symbol, name = extract_symbol_and_name(tr, tds, idx)
+        if idx <= 3:
+            log.info(f"      Результат extract: symbol={symbol!r}, name={name!r}")
 
         rec = {
             "ts": ts,
@@ -146,7 +151,14 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
         }
         out.append(rec)
 
+    log.info(f"✅ [parse_table] Успешно сформировано словарей: {len(out)}")
     return out
+
+
+def get_td(tds: list, idx: int) -> Optional[float]:
+    if idx < len(tds):
+        return parse_number(tds[idx].get_text(strip=True))
+    return None
 
 
 # ─────────────────────────── скрапер ───────────────────────────
@@ -184,41 +196,32 @@ class CoinalyzeScraper:
 
     @staticmethod
     def _add_cookies(ctx):
+        log.info(f"🔑 P_SID: {'SET' if COINALYZE_P_SID else 'EMPTY'}, CHAT_SID: {'SET' if COINALYZE_CHAT_SID else 'EMPTY'}")
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
-            log.warning("⚠️ Куки НЕ установлены — сайт отдаст дефолтную таблицу")
+            log.warning("⚠️ Куки не установлены!")
             return
-        cookies = []
+        cookies = [
+            {"name": "cookies_accepted", "value": "1", "domain": "coinalyze.net", "path": "/", "secure": True}
+        ]
         if COINALYZE_P_SID:
-            cookies.append({"name": "p_sid", "value": COINALYZE_P_SID,
-                             "domain": "coinalyze.net", "path": "/", "secure": True})
+            cookies.append({"name": "p_sid", "value": COINALYZE_P_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
         if COINALYZE_CHAT_SID:
-            cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID,
-                             "domain": "coinalyze.net", "path": "/", "secure": True})
-        cookies.append({"name": "cookies_accepted", "value": "1",
-                         "domain": "coinalyze.net", "path": "/", "secure": True})
+            cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
         ctx.add_cookies(cookies)
-        log.info(f"✅ Куки установлены: {len(cookies)} шт.")
 
     def _load(self, url: str) -> str:
         page = self._page
+        log.info(f"🌐 Загружаем URL: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=50_000)
         page.wait_for_timeout(4000)
 
         if "Attention Required" in page.content():
-            log.warning("Cloudflare protection triggered, waiting 10s...")
+            log.warning("⚠️ Обнаружен Cloudflare, ждем 10 сек...")
             page.wait_for_timeout(10_000)
 
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # Проверка пагинации
-        pagination_found = False
-        try:
-            page.wait_for_selector(".pagination", timeout=5_000)
-            pagination_found = True
-        except Exception:
-            pass
-
-        # Прокрутка для полной загрузки ячеек
+        # Прокрутка
         prev_count = 0
         for _ in range(5):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -231,29 +234,12 @@ class CoinalyzeScraper:
         page.wait_for_timeout(500)
 
         rows = page.query_selector_all("tbody tr")
-        row_count = len(rows)
+        log.info(f"📊 [Playwright] Найдено `tbody tr` элементов: {len(rows)}")
 
-        log.info(f"🔗 URL: {url}")
-        log.info(f"📊 Найдено строк в DOM: {row_count}")
-        log.info(f"📊 Пагинация: {'ЕСТЬ' if pagination_found else 'НЕТ'}")
-
-        return page.inner_html("body")
-
-    @staticmethod
-    def _get_page_urls(html_text: str) -> list[str]:
-        soup = BeautifulSoup(html_text, "lxml")
-        pagination = soup.select_one(".pagination")
-        if not pagination:
-            return [COINALYZE_URL]
-        urls = [COINALYZE_URL]
-        for a in pagination.select("a[href]"):
-            href = a.get("href", "")
-            if not href:
-                continue
-            full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
-            if full_url not in urls:
-                urls.append(full_url)
-        return urls[:MAX_PAGES]
+        # Используем page.content() вместо inner_html("body") для получения полного HTML документа
+        full_html = page.content()
+        log.info(f"📄 Размер полученного HTML: {len(full_html)} байт")
+        return full_html
 
     def fetch_all(self) -> list[dict]:
         all_rows: list[dict] = []
@@ -272,39 +258,27 @@ class CoinalyzeScraper:
         html_text = self._load(COINALYZE_URL)
         if self.debug:
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+            log.info(f"💾 Файл {DEBUG_HTML_FILE.name} сохранен ({len(html_text)} байт)")
 
         parsed = parse_table(html_text)
         new_added = add_rows(parsed)
-        log.info(f"Страница 1: распарсено {len(parsed)} строк, добавлено {new_added} монет")
-
-        urls = self._get_page_urls(html_text)
-        if len(urls) > 1:
-            for i, url in enumerate(urls[1:], start=2):
-                try:
-                    html_text = self._load(url)
-                    new_count = add_rows(parse_table(html_text))
-                    log.info(f"Страница {i}: +{new_count} новых монет")
-                except Exception as e:
-                    log.error(f"Ошибка на странице {i}: {e}")
+        log.info(f"🏁 Страница 1: распарсено={len(parsed)}, добавлено_новых={new_added}")
 
         log.info(f"ИТОГО уникальных монет: {len(all_rows)}")
         if all_rows:
             sample = all_rows[0]
-            log.info(
-                f"📋 Первая монета: symbol={sample.get('symbol')}, name={sample.get('name')}, "
-                f"price={sample.get('price')}, volume24={sample.get('volume24')}"
-            )
+            log.info(f"📋 Пример: symbol={sample.get('symbol')}, name={sample.get('name')}, price={sample.get('price')}")
         return all_rows
 
 
 def main():
-    log.info(f"🚀 Запуск в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
+    log.info(f"🚀 Запуск скрипта в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
         coins = scraper.fetch_all()
 
     out_file = BASE / "coins_debug.json"
     out_file.write_text(json.dumps(coins, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info(f"Сохранено {len(coins)} монет в {out_file.name}")
+    log.info(f"💾 Сохранено {len(coins)} монет в {out_file.name}")
 
 
 if __name__ == "__main__":
