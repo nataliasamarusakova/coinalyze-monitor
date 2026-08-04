@@ -142,10 +142,9 @@ def _setup_browser_context(p):
 
 
 def _load_page(page, url):
-    """Загружает одну страницу и возвращает полный HTML.
-    Ждёт таблицу, пагинацию, скроллит для подгрузки всех строк."""
+    """Загружает одну страницу. Скроллит для подгрузки всех строк и пагинации."""
     page.goto(url, wait_until="domcontentloaded", timeout=50_000)
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(3000)
 
     if "Attention Required" in page.content():
         log.warning("Cloudflare, waiting...")
@@ -154,25 +153,28 @@ def _load_page(page, url):
     # Ждём таблицу
     page.wait_for_selector("tbody tr", timeout=25_000)
 
-    # Ждём блок пагинации (рендерится позже таблицы)
-    try:
-        page.wait_for_selector(".pagination", timeout=10_000)
-    except Exception:
-        log.warning("Блок .pagination не найден за 10с — работаем с одной страницей")
-
-    # Скроллим вниз до конца, чтобы триггернуть подгрузку всех строк
-    prev_count = 0
-    for _ in range(5):
+    # Скроллим вниз, чтобы триггернуть подгрузку строк и появление пагинации
+    prev_row_count = 0
+    for scroll_attempt in range(10):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(800)
-        cur_count = len(page.query_selector_all("tbody tr"))
-        if cur_count == prev_count:
-            break
-        prev_count = cur_count
+        page.wait_for_timeout(500)
 
-    # Скроллим обратно наверх
+        cur_row_count = len(page.query_selector_all("tbody tr"))
+
+        # Пагинация появилась — выходим из цикла скролла
+        if page.query_selector(".pagination"):
+            log.info(f"Пагинация найдена после скролла {scroll_attempt + 1}")
+            break
+
+        # Строки перестали появляться и пагинации нет — прекращаем скроллить
+        if cur_row_count == prev_row_count and scroll_attempt >= 2:
+            break
+
+        prev_row_count = cur_row_count
+
+    # Скроллим обратно наверх (для корректного рендера и скриншота)
     page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(300)
 
     row_count = len(page.query_selector_all("tbody tr"))
     has_pagination = page.query_selector(".pagination") is not None
