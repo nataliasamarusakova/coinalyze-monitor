@@ -142,45 +142,63 @@ def _setup_browser_context(p):
 
 
 def _load_page(page, url):
-    """Загружает одну страницу. Скроллит для подгрузки всех строк и пагинации."""
-    page.goto(url, wait_until="domcontentloaded", timeout=50_000)
+    """Загружает одну страницу с полной подгрузкой динамического контента."""
+    # Ждём networkidle — все AJAX-запросы завершены
+    page.goto(url, wait_until="networkidle", timeout=60_000)
     page.wait_for_timeout(3000)
 
     if "Attention Required" in page.content():
         log.warning("Cloudflare, waiting...")
         page.wait_for_timeout(10_000)
+        page.wait_for_load_state("networkidle", timeout=30_000)
 
     # Ждём таблицу
     page.wait_for_selector("tbody tr", timeout=25_000)
+    initial_count = len(page.query_selector_all("tbody tr"))
+    log.info(f"Строк после загрузки: {initial_count}")
 
-    # Скроллим вниз, чтобы триггернуть подгрузку строк и появление пагинации
-    prev_row_count = 0
-    for scroll_attempt in range(10):
+    # Скроллим вниз и ждём стабилизации количества строк
+    prev_count = initial_count
+    for scroll_attempt in range(15):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(700)
 
-        cur_row_count = len(page.query_selector_all("tbody tr"))
+        cur_count = len(page.query_selector_all("tbody tr"))
+        has_pagination = page.query_selector(".pagination") is not None
 
-        # Пагинация появилась — выходим из цикла скролла
-        if page.query_selector(".pagination"):
-            log.info(f"Пагинация найдена после скролла {scroll_attempt + 1}")
+        if has_pagination:
+            log.info(f"Пагинация найдена после скролла {scroll_attempt + 1}, строк: {cur_count}")
             break
 
-        # Строки перестали появляться и пагинации нет — прекращаем скроллить
-        if cur_row_count == prev_row_count and scroll_attempt >= 2:
+        if cur_count != prev_count:
+            log.info(f"Скролл {scroll_attempt + 1}: строк {prev_count} → {cur_count}")
+
+        if cur_count == prev_count and scroll_attempt >= 3:
             break
 
-        prev_row_count = cur_row_count
+        prev_count = cur_count
 
-    # Скроллим обратно наверх (для корректного рендера и скриншота)
+    # После скролла — ждём networkidle (подгрузка могла триггернуть запросы)
+    try:
+        page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        pass
+
+    # Скроллим обратно наверх
     page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(500)
 
-    row_count = len(page.query_selector_all("tbody tr"))
+    final_count = len(page.query_selector_all("tbody tr"))
     has_pagination = page.query_selector(".pagination") is not None
-    log.info(f"Строк в таблице: {row_count} · пагинация: {'есть' if has_pagination else 'нет'}")
+    log.info(f"Итого: строк={final_count}, пагинация={'есть' if has_pagination else 'нет'}")
 
-    return page.content()
+    html_text = page.content()
+
+    # Сохраняем HTML для отладки
+    DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+    log.info(f"HTML сохранён в {DEBUG_HTML_FILE.name} ({len(html_text)} символов)")
+
+    return html_text
 
 
 def get_page_urls(html_text):
