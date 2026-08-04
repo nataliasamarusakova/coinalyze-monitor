@@ -262,7 +262,7 @@ class CoinalyzeScraper:
 
         parsed = parse_table(html_text)
         new_added = add_rows(parsed)
-        log.info(f"🏁 Страница 1: распарсено={len(parsed)}, добавлено_новых={new_added}")
+        log.info(f"🏁 Страница ЧЧЧЧЧЧ Ч Ч Ч1: распарсено={len(parsed)}, добавлено_новых={new_added}")
 
         log.info(f"ИТОГО уникальных монет: {len(all_rows)}")
         if all_rows:
