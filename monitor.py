@@ -116,31 +116,60 @@ def compute_snapshot_hash(snapshot):
     snapshot_json=json.dumps(snapshot,sort_keys=True,ensure_ascii=False)
     return {"algorithm":"sha256","version":"v1","value":hashlib.sha256(snapshot_json.encode()).hexdigest()}
 
-def fetch_html():
-    with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True)
-        ctx=browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",viewport={"width":1920,"height":1080},locale="en-US")
-        if COINALYZE_P_SID or COINALYZE_CHAT_SID:
-            cookies=[]
-            if COINALYZE_P_SID: cookies.append({"name":"p_sid","value":COINALYZE_P_SID,"domain":"coinalyze.net","path":"/","secure":True})
-            if COINALYZE_CHAT_SID: cookies.append({"name":"chat_sid","value":COINALYZE_CHAT_SID,"domain":"coinalyze.net","path":"/","secure":True})
-            cookies.append({"name":"cookies_accepted","value":"1","domain":"coinalyze.net","path":"/","secure":True})
-            ctx.add_cookies(cookies)
-        page=ctx.new_page(); stealth_sync(page)
-        try:
-            page.goto(COINALYZE_URL,wait_until="domcontentloaded",timeout=50000)
-            page.wait_for_timeout(4000)
-            if "Attention Required" in page.content(): log.warning("Cloudflare..."); page.wait_for_timeout(10000)
-            page.wait_for_selector("tbody tr",timeout=25000)
-            html_text=page.content()
-        except Exception as e:
-            log.error(f"Загрузка: {e}")
-            try: html_text=page.content()
-            except: html_text=""
-            try: page.screenshot(path=str(BASE/"debug_screenshot.png"),full_page=True)
-            except: pass
-        finally: browser.close()
-    return html_text
+def _setup_browser_context(p):
+    """Создаёт browser context с cookies. Возвращает (browser, page)."""
+    browser = p.chromium.launch(headless=True)
+    ctx = browser.new_context(
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+    )
+    if COINALYZE_P_SID or COINALYZE_CHAT_SID:
+        cookies = []
+        if COINALYZE_P_SID:
+            cookies.append({"name": "p_sid", "value": COINALYZE_P_SID,
+                            "domain": "coinalyze.net", "path": "/", "secure": True})
+        if COINALYZE_CHAT_SID:
+            cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID,
+                            "domain": "coinalyze.net", "path": "/", "secure": True})
+        cookies.append({"name": "cookies_accepted", "value": "1",
+                        "domain": "coinalyze.net", "path": "/", "secure": True})
+        ctx.add_cookies(cookies)
+    page = ctx.new_page()
+    stealth_sync(page)
+    return browser, page
+
+
+def _load_page(page, url):
+    """Загружает одну страницу и возвращает HTML."""
+    page.goto(url, wait_until="domcontentloaded", timeout=50_000)
+    page.wait_for_timeout(4000)
+    if "Attention Required" in page.content():
+        log.warning("Cloudflare, waiting...")
+        page.wait_for_timeout(10_000)
+    page.wait_for_selector("tbody tr", timeout=25_000)
+    return page.content()
+
+
+def get_page_urls(html_text):
+    """Парсит блок .pagination и возвращает список URL всех страниц.
+    Если пагинации нет — возвращает только базовый URL."""
+    soup = BeautifulSoup(html_text, "lxml")
+    pagination = soup.select_one(".pagination")
+    if not pagination:
+        return [COINALYZE_URL]
+
+    urls = [COINALYZE_URL]
+    for a in pagination.select("a[href]"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
+        if full_url not in urls:
+            urls.append(full_url)
+
+    return urls[:MAX_PAGES]
 
 def parse_table(html_text):
     soup=BeautifulSoup(html_text,"lxml"); rows=soup.select("tbody tr")
