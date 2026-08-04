@@ -1,15 +1,16 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Использует точечный скроллинг последней строки таблицы (.table-wrapper) для выгрузки ВСЕХ монет.
+Включает глубокое диагностическое логирование всех источников HTML, onclick и результатов парсинга.
 """
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, Page
@@ -62,8 +63,10 @@ def parse_number(text: str) -> Optional[float]:
 
 
 def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
-    """Извлечение символа и названия монеты."""
+    """Извлечение символа и названия монеты с диагностикой источников."""
     symbol = tr.get("data-coin") or tr.get("data-symbol") or tr.get("data-id")
+
+    source = "tr.data-coin" if symbol else None
 
     if not symbol:
         a_tag = tr.find("a", href=True)
@@ -72,6 +75,7 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
             parts = href.split("/")
             if parts:
                 symbol = parts[-1].upper()
+                source = f"a[href='{href}']"
 
     name = "?"
     if len(tds) > 1:
@@ -84,12 +88,16 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
 
         if not symbol and text_cell:
             symbol = text_cell.replace("\n", " ").split()[0].upper()
+            source = "td[1].text"
 
     elif len(tds) > 0 and not symbol:
         symbol = tds[0].get_text(strip=True).upper()
+        source = "td[0].text"
 
     if not symbol or symbol in ("-", "N/A", "?"):
         symbol = f"COIN_{row_idx}"
+        source = "fallback_index"
+
     if not name or name == "?":
         name = symbol
 
@@ -101,8 +109,10 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     rows = soup.select("tbody tr")
     
+    log.info(f"📊 [PARSER] Найдено тегов `tbody tr`: {len(rows)} шт.")
     if not rows:
         rows = soup.select("tr")
+        log.info(f"⚠️ [PARSER] Резервный селектор `tr`: {len(rows)} шт.")
 
     out = []
     for idx, tr in enumerate(rows, start=1):
@@ -139,6 +149,15 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
         }
         out.append(rec)
 
+        # Выводим первые 2 и последнюю монету для контроля корректности данных
+        if idx in (1, 2, len(rows)):
+            log.info(
+                f"   [Строка #{idx:02d}] symbol={symbol:<8} name={name:<15} "
+                f"price={str(rec['price']):<10} volume24={str(rec['volume24']):<12} "
+                f"oi={str(rec['oi']):<12} (колонок td={len(tds)})"
+            )
+
+    log.info(f"✅ [PARSER] Успешно распарсено записей: {len(out)}/{len(rows)}")
     return out
 
 
@@ -146,6 +165,41 @@ def get_td(tds: list, idx: int) -> Optional[float]:
     if idx < len(tds):
         return parse_number(tds[idx].get_text(strip=True))
     return None
+
+
+def extract_pagination_urls(html_text: str) -> list[str]:
+    """Извлекает и подробно логирует все найденные ссылки пагинации."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    candidates = []
+
+    # 1. Поиск по ссылкам <a href="...">
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if "p=" in href or "page=" in href:
+            full = f"https://coinalyze.net{href}" if href.startswith("/") else href
+            tag_desc = f"<a href='{href}'> text='{a.get_text(strip=True)[:25]}'"
+            if (full, tag_desc) not in candidates:
+                candidates.append((full, tag_desc))
+
+    # 2. Поиск по JS-атрибутам onclick="document.location='...'"
+    for el in soup.find_all(attrs={"onclick": True}):
+        onclick_str = el["onclick"]
+        matches = re.findall(r"['\"](/?[^'\"]*p=\d+[^'\"]*)['\"]", onclick_str)
+        for m in matches:
+            full = f"https://coinalyze.net{m}" if m.startswith("/") else m
+            tag_desc = f"<{el.name} onclick='{onclick_str[:60]}...'> text='{el.get_text(strip=True)[:20]}'"
+            if (full, tag_desc) not in candidates:
+                candidates.append((full, tag_desc))
+
+    log.info(f"🔎 [DIAGNOSTIC] Извлечение элементов пагинации: найдено кандидатов = {len(candidates)} шт.")
+    unique_urls = []
+    for url, desc in candidates:
+        log.info(f"   ├─ Источник тега: {desc}")
+        log.info(f"   └─ Вытащенный URL: {url}")
+        if url not in unique_urls:
+            unique_urls.append(url)
+
+    return unique_urls
 
 
 # ─────────────────────────── скрапер ───────────────────────────
@@ -195,9 +249,10 @@ class CoinalyzeScraper:
 
     @staticmethod
     def _add_cookies(ctx):
-        log.info(f"🔑 P_SID: {'SET' if COINALYZE_P_SID else 'EMPTY'}, CHAT_SID: {'SET' if COINALYZE_CHAT_SID else 'EMPTY'}")
+        log.info(f"🔑 [COOKIES] COINALYZE_P_SID: {'УСТАНОВЛЕН ✅' if COINALYZE_P_SID else 'ПУСТО ⚠️'}")
+        log.info(f"🔑 [COOKIES] COINALYZE_CHAT_SID: {'УСТАНОВЛЕН ✅' if COINALYZE_CHAT_SID else 'ПУСТО ⚠️'}")
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
-            log.warning("⚠️ Куки не установлены!")
+            log.warning("⚠️ Куки не заданы — сайт может применить лимиты гостей!")
             return
         cookies = [
             {"name": "cookies_accepted", "value": "1", "domain": "coinalyze.net", "path": "/", "secure": True}
@@ -208,58 +263,58 @@ class CoinalyzeScraper:
             cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
         ctx.add_cookies(cookies)
 
-    def _load(self, url: str) -> str:
+    def _load(self, url: str) -> Optional[str]:
         page = self._page
-        log.info(f"🌐 Загружаем URL: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=50_000)
-        page.wait_for_timeout(4000)
+        log.info(f"🌐 [PLAYWRIGHT] Загружаем URL: {url}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=40_000)
+            page.wait_for_timeout(3000)
 
-        if "Attention Required" in page.content():
-            log.warning("⚠️ Обнаружен Cloudflare, ждем 10 сек...")
-            page.wait_for_timeout(10_000)
+            content_now = page.content()
+            if "Attention Required" in content_now or "Just a moment..." in content_now:
+                log.warning("⚠️ [CLOUDFLARE] Обнаружена защита Cloudflare, ожидания спада (10с)...")
+                page.wait_for_timeout(10_000)
 
-        page.wait_for_selector("tbody tr", timeout=25_000)
+            page.wait_for_selector("tbody tr", timeout=8_000)
+        except Exception as e:
+            log.warning(f"⚠️ [PLAYWRIGHT] Элементы `tbody tr` не загружены на странице ({e})")
+            return None
 
-        # ═══════════════════════════════════════════════════════════
-        # ТОЧЕЧНЫЙ СКРОЛЛИНГ ПОСЛЕДНЕЙ СТРОКИ С ДВОЙНОЙ ПРОКРУТКОЙ
-        # ═══════════════════════════════════════════════════════════
-        log.info("📜 Начинаем точечный скроллинг таблицы (.table-wrapper)...")
+        # Проверяем наличие ключевых контейнеров в DOM
+        has_wrapper = bool(page.query_selector(".table-wrapper"))
+        has_pagination_container = bool(page.query_selector(".pagination, ul.pagination, div.paging"))
+        log.info(f"📊 [DIAGNOSTIC] Контейнеры DOM: .table-wrapper = {'ЕСТЬ ✅' if has_wrapper else 'НЕТ ❌'}, .pagination = {'ЕСТЬ ✅' if has_pagination_container else 'НЕТ ❌'}")
+
+        # Пошаговый скроллинг
+        log.info("📜 [SCROLL] Начинаем пошаговую прокрутку последней строки таблицы...")
         prev_count = 0
         no_change = 0
 
-        for step in range(1, 35):
-            # 1. Находим последнюю строку и принудительно прокручиваем её в зону видимости
+        for step in range(1, 20):
             try:
-                page.locator("tbody tr").last.scroll_into_view_if_needed(timeout=3000)
+                page.locator("tbody tr").last.scroll_into_view_if_needed(timeout=2000)
             except Exception:
                 pass
 
-            # 2. Также прокручиваем сам контейнер .table-wrapper и window
             page.evaluate("""() => {
                 const wrapper = document.querySelector('.table-wrapper') || document.querySelector('div[class*="wrapper"]');
-                if (wrapper) {
-                    wrapper.scrollTop = wrapper.scrollHeight;
-                }
+                if (wrapper) wrapper.scrollTop = wrapper.scrollHeight;
                 window.scrollTo(0, document.body.scrollHeight);
             }""")
 
-            # 3. Небольшая пауза для подгрузки новых строк
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
 
             cur_count = len(page.query_selector_all("tbody tr"))
-            log.info(f"   [Скролл #{step}] Загружено строк в DOM: {cur_count}")
+            log.info(f"   [Скролл #{step:02d}] Строк в DOM: {cur_count}")
 
             if cur_count == prev_count:
                 no_change += 1
-                if no_change >= 3:  # 3 шага без изменений = дошли до конца
-                    log.info(f"✅ Достигнут конец таблицы на шаге {step}. Итого строк: {cur_count}")
+                if no_change >= 3:
+                    log.info(f"✅ [SCROLL] Скроллинг завершен (строки перестали добавляться). Итого строк: {cur_count}")
                     break
             else:
                 no_change = 0
                 prev_count = cur_count
-
-        rows = page.query_selector_all("tbody tr")
-        log.info(f"📊 [Playwright] Всего найдено `tbody tr` элементов: {len(rows)}")
 
         return page.content()
 
@@ -277,15 +332,54 @@ class CoinalyzeScraper:
                     new += 1
             return new
 
-        html_text = self._load(COINALYZE_URL)
-        if self.debug:
-            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+        queue_urls = [COINALYZE_URL]
+        processed_urls = set()
 
-        parsed = parse_table(html_text)
-        new_added = add_rows(parsed)
-        log.info(f"🏁 Распарсено={len(parsed)}, добавлено_уникальных={new_added}")
+        page_num = 1
+        while queue_urls and page_num <= self.max_pages:
+            current_url = queue_urls.pop(0)
+            if current_url in processed_urls:
+                log.info(f"⏩ [QUEUE] URL уже был обработан ранее, пропускаем: {current_url}")
+                continue
 
-        log.info(f"\n🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО: {len(all_rows)}")
+            processed_urls.add(current_url)
+            log.info(f"\n==================================================")
+            log.info(f"📑 === ЗАГРУЗКА И ОБРАБОТКА СТРАНИЦЫ #{page_num} ===")
+            log.info(f"🔗 Текущий URL: {current_url}")
+            log.info(f"==================================================")
+
+            html_text = self._load(current_url)
+            if not html_text:
+                log.info(f"🛑 [FETCH] Страница #{page_num} не содержит таблицы. Завершаем обоход очереди.")
+                break
+
+            if self.debug and page_num == 1:
+                DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+                log.info(f"💾 [DEBUG] Файл HTML страницы 1 сохранен в: {DEBUG_HTML_FILE.name}")
+
+            parsed_page = parse_table(html_text)
+            new_added = add_rows(parsed_page)
+            log.info(f"🏁 [SUMMARY] Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}, всего_уникальных={len(all_rows)}")
+
+            # Анализ пагинации на странице
+            found_urls = extract_pagination_urls(html_text)
+            new_urls_count = 0
+            for page_url in found_urls:
+                if page_url not in processed_urls and page_url not in queue_urls:
+                    queue_urls.append(page_url)
+                    new_urls_count += 1
+
+            log.info(f"📌 [QUEUE] Новых ссылок добавлено в очередь: {new_urls_count}. Всего ссылок в очереди: {len(queue_urls)}")
+
+            if new_added == 0 and page_num > 1:
+                log.info("ℹ️ [FETCH] На текущей странице нет новых уникальных монет. Завершаем обоход.")
+                break
+
+            page_num += 1
+
+        log.info(f"\n==================================================")
+        log.info(f"🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО СО ВСЕХ СТРАНИЦ: {len(all_rows)}")
+        log.info(f"==================================================")
         if all_rows:
             sample = all_rows[0]
             log.info(f"📋 Пример первой монеты: symbol={sample.get('symbol')}, name={sample.get('name')}, price={sample.get('price')}")
@@ -299,7 +393,7 @@ def main():
 
     out_file = BASE / "coins_debug.json"
     out_file.write_text(json.dumps(coins, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info(f"💾 Сохранено {len(coins)} монет в {out_file.name}")
+    log.info(f"💾 Успешно сохранено {len(coins)} монет в файл {out_file.name}")
 
 
 if __name__ == "__main__":
