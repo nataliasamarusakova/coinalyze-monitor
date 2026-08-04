@@ -160,22 +160,22 @@ def _load_page(page, url):
     except Exception:
         log.warning("Блок .pagination не найден за 10с — работаем с одной страницей")
 
-    # Скроллим вниз до конца, чтобы триггернуть подгрузку всех строк таблицы
+    # Скроллим вниз до конца, чтобы триггернуть подгрузку всех строк
     prev_count = 0
-    for _ in range(5):  # максимум 5 итераций скролла
+    for _ in range(5):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(800)
-        cur_count = len(page.select("tbody tr"))
+        cur_count = len(page.query_selector_all("tbody tr"))
         if cur_count == prev_count:
-            break  # больше строк не появляется
+            break
         prev_count = cur_count
 
-    # Скроллим обратно наверх (на всякий случай, для корректного рендера)
+    # Скроллим обратно наверх
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
 
-    row_count = len(page.select("tbody tr"))
-    has_pagination = page.select_one(".pagination") is not None
+    row_count = len(page.query_selector_all("tbody tr"))
+    has_pagination = page.query_selector(".pagination") is not None
     log.info(f"Строк в таблице: {row_count} · пагинация: {'есть' if has_pagination else 'нет'}")
 
     return page.content()
