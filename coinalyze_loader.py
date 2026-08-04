@@ -551,4 +551,112 @@ def _goto_next_page(page) -> bool:
 def fetch_data() -> list[dict]:
     """
     Главная функция для monitor.py.
-    Возвращает список всех монет
+    Возвращает список всех монет со страниц пагинации.
+    """
+    all_rows = []
+    seen_symbols = set()
+
+    with sync_playwright() as p:
+        browser, page = _setup_browser_context(p)
+
+        try:
+            html_text = _load_first_page(page)
+            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+
+            rows = parse_table(html_text)
+            all_rows.extend(rows)
+
+            for r in rows:
+                sym = r.get("symbol")
+                if sym:
+                    seen_symbols.add(sym)
+
+            log.info(f"Страница 1: {len(rows)} монет")
+
+            for page_no in range(2, MAX_PAGES + 1):
+                if not _goto_next_page(page):
+                    pag_sel = _find_visible(page, PAGINATION_SELECTORS)
+
+                    if pag_sel:
+                        outer = page.evaluate(
+                            "(sel) => document.querySelector(sel)?.outerHTML || ''",
+                            pag_sel,
+                        )
+                        log.warning(
+                            f"Пагинация найдена ({pag_sel}), но Next не найден/не активен. "
+                            f"HTML: {outer[:1000]}"
+                        )
+                    else:
+                        log.info("Next не найден — пагинация закончилась")
+
+                    break
+
+                html_text = page.content()
+                rows = parse_table(html_text)
+
+                new_count = 0
+
+                for r in rows:
+                    sym = r.get("symbol")
+                    if sym and sym not in seen_symbols:
+                        all_rows.append(r)
+                        seen_symbols.add(sym)
+                        new_count += 1
+
+                log.info(f"Страница {page_no}: +{new_count} новых монет")
+
+                if new_count == 0:
+                    log.warning("Страница загружена, но новых монет нет — останавливаемся")
+                    break
+
+        except Exception as e:
+            log.error(f"Загрузка: {e}")
+
+            try:
+                page.screenshot(path=str(BASE / "debug_screenshot.png"), full_page=True)
+            except Exception:
+                pass
+
+        finally:
+            browser.close()
+
+    if not all_rows:
+        send_tg("⚠️ Monitor: данные не получены. Проверь debug_page.html")
+        sys.exit(1)
+
+    log.info(f"Всего монет после пагинации: {len(all_rows)}")
+    return all_rows
+
+
+def make_storage_state():
+    """
+    Однократная утилита для создания storage_state.json.
+
+    Запуск:
+        python -c "from coinalyze_loader import make_storage_state; make_storage_state()"
+
+    Откроется браузер. Нужно залогиниться на coinalyze.net,
+    дождаться таблицу с пагинацией, затем нажать Enter в терминале.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+
+        ctx = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+        )
+
+        page = ctx.new_page()
+        page.goto("https://coinalyze.net/")
+
+        input("Залогинься, дождись таблицу с пагинацией, затем нажми Enter здесь...")
+
+        ctx.storage_state(path=str(STORAGE_STATE_FILE))
+        browser.close()
+
+        log.info(f"storage_state сохранён в {STORAGE_STATE_FILE}")
+
+
+if __name__ == "__main__":
+    rows = fetch_data()
+    print(f"Loaded rows: {len(rows)}")
