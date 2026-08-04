@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Включает глубокую маскировку под реальный браузер и выбор 100+ строк в таблице.
+Использует точечный скроллинг последней строки таблицы (.table-wrapper) для выгрузки ВСЕХ монет.
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, Page
@@ -162,16 +162,12 @@ class CoinalyzeScraper:
     def __enter__(self) -> "CoinalyzeScraper":
         self._pw = sync_playwright().start()
 
-        # ═══════════════════════════════════════════════════════════
-        # МАСКИРОВКА ПОД РЕАЛЬНЫЙ БРАУЗЕР (ОБХОД ДЕТЕКТА ХЕДЛЕССА)
-        # ═══════════════════════════════════════════════════════════
         self._browser = self._pw.chromium.launch(
             headless=self.headless,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-infobars",
                 "--window-size=1920,1080",
             ],
         )
@@ -183,23 +179,9 @@ class CoinalyzeScraper:
             ),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Upgrade-Insecure-Requests": "1",
-            },
         )
 
-        # Скрываем атрибут navigator.webdriver
         ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
         self._add_cookies(ctx)
         self._page = ctx.new_page()
         stealth_sync(self._page)
@@ -226,7 +208,7 @@ class CoinalyzeScraper:
             cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
         ctx.add_cookies(cookies)
 
-    def _load(self, url: str) -> Tuple[str, bool]:
+    def _load(self, url: str) -> str:
         page = self._page
         log.info(f"🌐 Загружаем URL: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=50_000)
@@ -239,66 +221,47 @@ class CoinalyzeScraper:
         page.wait_for_selector("tbody tr", timeout=25_000)
 
         # ═══════════════════════════════════════════════════════════
-        # ПРИНУДИТЕЛЬНО ПЕРЕКЛЮЧАЕМ ВЫПАДАЮЩИЙ СПИСОК СТРОК НА 100/ALL
+        # ТОЧЕЧНЫЙ СКРОЛЛИНГ ПОСЛЕДНЕЙ СТРОКИ С ДВОЙНОЙ ПРОКРУТКОЙ
         # ═══════════════════════════════════════════════════════════
-        try:
-            page.evaluate("""() => {
-                const selects = document.querySelectorAll('select');
-                selects.forEach(s => {
-                    for (let opt of s.options) {
-                        if (opt.value === '100' || opt.text.includes('100') || opt.value === '-1') {
-                            s.value = opt.value;
-                            s.dispatchEvent(new Event('change', { bubbles: true }));
-                            break;
-                        }
-                    }
-                });
-            }""")
-            page.wait_for_timeout(1500)
-        except Exception as e:
-            log.info(f"ℹ️ Выбор количества строк через select: {e}")
-
-        # ═══════════════════════════════════════════════════════════
-        # ГЛУБОКИЙ СКРОЛЛИНГ С НАЖАТИЕМ КЛАВИШ
-        # ═══════════════════════════════════════════════════════════
-        log.info("📜 Начинаем глубокий скроллинг страницы...")
+        log.info("📜 Начинаем точечный скроллинг таблицы (.table-wrapper)...")
         prev_count = 0
         no_change = 0
 
-        for step in range(1, 30):
-            page.mouse.wheel(0, 3000)
-            page.keyboard.press("PageDown")
-            page.keyboard.press("End")
-            page.evaluate("window.scrollBy(0, 2500)")
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        for step in range(1, 35):
+            # 1. Находим последнюю строку и принудительно прокручиваем её в зону видимости
+            try:
+                page.locator("tbody tr").last.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
 
-            page.wait_for_timeout(2000)
+            # 2. Также прокручиваем сам контейнер .table-wrapper и window
+            page.evaluate("""() => {
+                const wrapper = document.querySelector('.table-wrapper') || document.querySelector('div[class*="wrapper"]');
+                if (wrapper) {
+                    wrapper.scrollTop = wrapper.scrollHeight;
+                }
+                window.scrollTo(0, document.body.scrollHeight);
+            }""")
+
+            # 3. Небольшая пауза для подгрузки новых строк
+            page.wait_for_timeout(1500)
 
             cur_count = len(page.query_selector_all("tbody tr"))
             log.info(f"   [Скролл #{step}] Загружено строк в DOM: {cur_count}")
 
             if cur_count == prev_count:
                 no_change += 1
-                if no_change >= 5:  # Ждем 5 шагов (10 секунд без изменений)
-                    log.info(f"✅ Скроллинг завершен на шаге {step}. Всего строк: {cur_count}")
+                if no_change >= 3:  # 3 шага без изменений = дошли до конца
+                    log.info(f"✅ Достигнут конец таблицы на шаге {step}. Итого строк: {cur_count}")
                     break
             else:
                 no_change = 0
                 prev_count = cur_count
 
         rows = page.query_selector_all("tbody tr")
-        log.info(f"📊 [Playwright] Итого строк на текущей странице: {len(rows)}")
+        log.info(f"📊 [Playwright] Всего найдено `tbody tr` элементов: {len(rows)}")
 
-        full_html = page.content()
-
-        soup = BeautifulSoup(full_html, "html.parser")
-        has_pagination = bool(
-            soup.select_one(".pagination") 
-            or soup.select("a[href*='p=']") 
-            or soup.select("a[href*='page=']")
-        )
-
-        return full_html, has_pagination
+        return page.content()
 
     def fetch_all(self) -> list[dict]:
         all_rows: list[dict] = []
@@ -314,36 +277,13 @@ class CoinalyzeScraper:
                     new += 1
             return new
 
-        base_url = COINALYZE_URL
+        html_text = self._load(COINALYZE_URL)
+        if self.debug:
+            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
 
-        for page_num in range(1, self.max_pages + 1):
-            if page_num == 1:
-                url = base_url
-            else:
-                sep = "&" if "?" in base_url else "?"
-                url = f"{base_url}{sep}p={page_num}"
-
-            log.info(f"\n📑 === ЗАГРУЗКА СТРАНИЦЫ #{page_num} ({url}) ===")
-            try:
-                html_text, has_pagination = self._load(url)
-                if self.debug and page_num == 1:
-                    DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-
-                parsed_page = parse_table(html_text)
-                new_added = add_rows(parsed_page)
-                log.info(f"🏁 Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}")
-
-                if not has_pagination:
-                    log.info("ℹ️ Пагинация на странице отсутствует (все монеты находятся на одной странице). Сбор завершен.")
-                    break
-
-                if new_added == 0:
-                    log.info(f"✅ На странице #{page_num} нет новых монет. Завершаем сбор.")
-                    break
-
-            except Exception as e:
-                log.error(f"❌ Ошибка при загрузке страницы #{page_num}: {e}")
-                break
+        parsed = parse_table(html_text)
+        new_added = add_rows(parsed)
+        log.info(f"🏁 Распарсено={len(parsed)}, добавлено_уникальных={new_added}")
 
         log.info(f"\n🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО: {len(all_rows)}")
         if all_rows:
