@@ -275,7 +275,6 @@ def fetch_data() -> list[dict]:
     with sync_playwright() as p:
         browser, page = _setup_browser_context(p)
         try:
-            # Первая страница
             html_text = _load_page(page, COINALYZE_URL)
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
             rows = parse_table(html_text)
@@ -284,26 +283,46 @@ def fetch_data() -> list[dict]:
                 seen_symbols.add(r.get("symbol"))
             log.info(f"Страница 1: {len(rows)} монет")
 
-            # Пагинация: парсим реальные URL из блока .pagination
             page_urls = get_page_urls(html_text)
             log.info(f"Пагинация: найдено {len(page_urls)} страниц")
 
-            # Загружаем остальные страницы (первую уже загрузили)
-            for i, page_url in enumerate(page_urls[1:], start=2):
-                try:
-                    html_text = _load_page(page, page_url)
-                    rows = parse_table(html_text)
-                    new_count = 0
-                    for r in rows:
-                        sym = r.get("symbol")
-                        if sym and sym not in seen_symbols:
-                            all_rows.append(r)
-                            seen_symbols.add(sym)
-                            new_count += 1
-                    log.info(f"Страница {i}: +{new_count} новых монет")
-                except Exception as e:
-                    log.error(f"Ошибка страницы {i} ({page_url}): {e}")
-                    continue
+            if len(page_urls) > 1:
+                for i, page_url in enumerate(page_urls[1:], start=2):
+                    try:
+                        html_text = _load_page(page, page_url)
+                        rows = parse_table(html_text)
+                        new_count = 0
+                        for r in rows:
+                            sym = r.get("symbol")
+                            if sym and sym not in seen_symbols:
+                                all_rows.append(r)
+                                seen_symbols.add(sym)
+                                new_count += 1
+                        log.info(f"Страница {i}: +{new_count} новых монет")
+                    except Exception as e:
+                        log.error(f"Ошибка страницы {i} ({page_url}): {e}")
+                        continue
+            else:
+                soup = BeautifulSoup(html_text, "lxml")
+                if soup.select_one(".pagination"):
+                    log.info("href не найдены, пробуем клики по .pagination")
+                    page_num = 1
+                    while page_num < MAX_PAGES:
+                        if not click_next_page(page, page_num):
+                            break
+                        page.wait_for_selector("tbody tr", timeout=15_000)
+                        page.wait_for_timeout(500)
+                        html_text = page.content()
+                        rows = parse_table(html_text)
+                        new_count = 0
+                        for r in rows:
+                            sym = r.get("symbol")
+                            if sym and sym not in seen_symbols:
+                                all_rows.append(r)
+                                seen_symbols.add(sym)
+                                new_count += 1
+                        page_num += 1
+                        log.info(f"Страница {page_num}: +{new_count} новых монет (клик)")
         except Exception as e:
             log.error(f"Загрузка: {e}")
             try:
