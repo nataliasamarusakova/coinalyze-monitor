@@ -1,9 +1,8 @@
 """
-monitor.py
-Система распознавания жизненного цикла деривативного движения + журнал сделок.
-Запуск: python monitor.py
+monitor.py — event-driven research engine для оценки качества сигналов.
+LIFECYCLE_ENGINE_VERSION = 2 — FREEZE. Любые изменения только через новый эксперимент.
 """
-import os, sys, time, json, shutil
+import os, sys, time, json, shutil, hashlib
 import html as html_mod
 import logging
 from pathlib import Path
@@ -16,17 +15,18 @@ try:
     from playwright_stealth import stealth_sync
 except ImportError:
     def stealth_sync(page): pass
+from conditions import check_confirmed_path_a, check_confirmed_path_b
 
 BASE = Path(__file__).resolve().parent
-MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
-SNAPSHOTS_FILE      = BASE / "snapshots.jsonl"
-HEARTBEAT_FILE      = BASE / "heartbeat.jsonl"
-WATCHLIST_FILE      = BASE / "watchlist.json"
-CALIBRATION_FILE    = BASE / "calibration.jsonl"
-TRADES_FILE         = BASE / "trades.jsonl"
-PENDING_FILE        = BASE / "pending_trades.jsonl"
-PENDING_FILE_LEGACY = BASE / "pending_trades.json"
-DEBUG_HTML_FILE     = BASE / "debug_page.html"
+MARKET_HISTORY_FILE  = BASE / "market_history.jsonl"
+SNAPSHOTS_FILE       = BASE / "snapshots.jsonl"
+HEARTBEAT_FILE       = BASE / "heartbeat.jsonl"
+WATCHLIST_FILE       = BASE / "watchlist.json"
+CALIBRATION_FILE     = BASE / "calibration.jsonl"
+TRADES_FILE          = BASE / "trades.jsonl"
+PENDING_FILE         = BASE / "pending_trades.jsonl"
+LIFECYCLE_STATE_FILE = BASE / "lifecycle_state.json"
+DEBUG_HTML_FILE      = BASE / "debug_page.html"
 
 COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
@@ -42,23 +42,35 @@ COINALYZE_URL = (
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
+
 MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
 MISS_EXIT_RUNS=2; MISS_REMOVE_RUNS=4; NEUTRAL_HYSTERESIS=2
-TRADE_SCHEMA_VERSION=2; SIGNAL_LOGIC_VERSION=1
-TRADE_TIMEOUT_MIN=240; FEE_PCT=0.0; TP_PCT=None; SL_PCT=None
+
+TRADE_SCHEMA_VERSION=2; SIGNAL_LOGIC_VERSION=1; LIFECYCLE_ENGINE_VERSION=2
+ENGINE_VERSIONS={"schema":TRADE_SCHEMA_VERSION,"signal":SIGNAL_LOGIC_VERSION,"lifecycle":LIFECYCLE_ENGINE_VERSION,"created":"2026-08-04"}
+HASH_VERSION="sha256_v1"
+TRADE_TIMEOUT_MIN=240; FEE_PCT=0.0
+STOP_MODE="fixed"; STOP_LOSS_PCT=5.0
+SIGNAL_DECAY_MIN=90
+IDEA_REGISTRY_TTL_DAYS=30
 TRADE_HORIZONS=[30,60,120,240]; TRADE_WIN_PCT=1.0
 PENDING_GRACE_MIN=10; PENDING_WAIT_MAX_MIN=60; HORIZON_MAX_LAG_MIN=15
 PENDING=[]
+COOLDOWN_BY_EXIT_REASON={"STOP_LOSS":120,"INVALIDATED":60,"DISTRIBUTION":60,"EXHAUSTION":45,"SIGNAL_DECAY":30,"TIMEOUT":0,"MISSED":0,"NEUTRAL":0}
+PROTECTION_REASONS={"STOP_LOSS"}
+EXIT_PRIORITY=["INVALIDATED","EXHAUSTION","DISTRIBUTION","STOP_LOSS","SIGNAL_DECAY","TIMEOUT","MISSED","NEUTRAL"]
+EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL","STOP_LOSS":"PROTECTION","TIMEOUT":"LIFETIME","SIGNAL_DECAY":"LIFETIME","MISSED":"DATA","NEUTRAL":"LIFETIME"}
+STATE_RANK={"ACCUMULATION":1,"EARLY_MOVE":2,"CONFIRMED_TREND":3,"ACCELERATION":4,"EXHAUSTION":5,"DISTRIBUTION":6}
 EQUITY_SYMBOLS={"META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA","GOOGL","MSTR","COIN","BZ"}
 EQUITY_HINTS=("Inc","Corp","Technologies","Platforms")
 COMMODITY_SYMBOLS={"CL"}; COMMODITY_HINTS=("Crude","Oil","Gold","Silver")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger("monitor")
+logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s",datefmt="%Y-%m-%d %H:%M:%S")
+log=logging.getLogger("monitor")
 
 def parse_number(raw):
     if raw is None: return None
-    s = raw.strip().replace("$","").replace("%","").replace(",","").replace("+","")
+    s=raw.strip().replace("$","").replace("%","").replace(",","").replace("+","")
     if s in ("","n/a","-","—","N/A"): return None
     mult=1.0
     if s and s[-1].lower() in ("k","m","b","t"):
@@ -67,38 +79,45 @@ def parse_number(raw):
     except ValueError: return None
 
 def now_ts(): return int(time.time())
-def esc(val): return html_mod.escape(str(val), quote=False)
+def esc(val): return html_mod.escape(str(val),quote=False)
 def fmt_pct(val):
     if val is None: return "—"
     return f"{'+' if val>0 else ''}{val:.1f}%"
-def fmt_num(val, suffix="", dec=1):
+def fmt_num(val,suffix="",dec=1):
     if val is None: return "—"
     return f"{val:.{dec}f}{suffix}"
 def fmt_price(val):
     if val is None: return "—"
     n=float(val); dec=4 if abs(n)>=0.01 else 10
     return f"{n:.{dec}f}".rstrip("0").rstrip(".")
-def safe(val, default=0.0): return val if val is not None else default
-def clamp(val, lo, hi): return max(lo, min(hi, val))
+def safe(val,default=0.0): return val if val is not None else default
+def clamp(val,lo,hi): return max(lo,min(hi,val))
 def valid_price(p): return p is not None and p>0
 def classify_asset_class(r):
     sym=r.get("symbol",""); name=r.get("name","")
     if sym in COMMODITY_SYMBOLS or any(h in name for h in COMMODITY_HINTS): return "commodity"
     if sym in EQUITY_SYMBOLS or any(h in name for h in EQUITY_HINTS): return "equity"
     return "crypto"
-def price_at(price_full, sym, ts_target, max_lag_sec=None):
+def price_at(price_full,sym,ts_target,max_lag_sec=None):
     idx=price_full.get(sym,[])
     if not idx: return None
-    i=bisect_left([t for t,_ in idx], ts_target)
+    i=bisect_left([t for t,_ in idx],ts_target)
     if i>=len(idx): return None
-    found_ts, found_price=idx[i]
+    found_ts,found_price=idx[i]
     if max_lag_sec is not None and (found_ts-ts_target)>max_lag_sec: return None
     return found_price
+def resolve_exit_reason(candidates):
+    all_triggered=[r for r in EXIT_PRIORITY if candidates.get(r,False)]
+    resolved=all_triggered[0] if all_triggered else None
+    return resolved,all_triggered
+def compute_snapshot_hash(snapshot):
+    snapshot_json=json.dumps(snapshot,sort_keys=True,ensure_ascii=False)
+    return {"algorithm":"sha256","version":"v1","value":hashlib.sha256(snapshot_json.encode()).hexdigest()}
 
 def fetch_html():
     with sync_playwright() as p:
         browser=p.chromium.launch(headless=True)
-        ctx=browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", viewport={"width":1920,"height":1080}, locale="en-US")
+        ctx=browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",viewport={"width":1920,"height":1080},locale="en-US")
         if COINALYZE_P_SID or COINALYZE_CHAT_SID:
             cookies=[]
             if COINALYZE_P_SID: cookies.append({"name":"p_sid","value":COINALYZE_P_SID,"domain":"coinalyze.net","path":"/","secure":True})
@@ -107,16 +126,16 @@ def fetch_html():
             ctx.add_cookies(cookies)
         page=ctx.new_page(); stealth_sync(page)
         try:
-            page.goto(COINALYZE_URL, wait_until="domcontentloaded", timeout=50000)
+            page.goto(COINALYZE_URL,wait_until="domcontentloaded",timeout=50000)
             page.wait_for_timeout(4000)
             if "Attention Required" in page.content(): log.warning("Cloudflare..."); page.wait_for_timeout(10000)
-            page.wait_for_selector("tbody tr", timeout=25000)
+            page.wait_for_selector("tbody tr",timeout=25000)
             html_text=page.content()
         except Exception as e:
             log.error(f"Загрузка: {e}")
             try: html_text=page.content()
             except: html_text=""
-            try: page.screenshot(path=str(BASE/"debug_screenshot.png"), full_page=True)
+            try: page.screenshot(path=str(BASE/"debug_screenshot.png"),full_page=True)
             except: pass
         finally: browser.close()
     return html_text
@@ -129,16 +148,16 @@ def parse_table(html_text):
         if len(tds)<23: continue
         spans=tds[1].find_all("span"); name=spans[0].get_text(strip=True) if spans else (symbol or "?")
         rec={"ts":ts,"symbol":symbol,"name":name,
-             "price":parse_number(tds[2].get_text(strip=True)),"price_chg24":parse_number(tds[3].get_text(strip=True)),
-             "mktcap":parse_number(tds[4].get_text(strip=True)),"volume24":parse_number(tds[5].get_text(strip=True)),
-             "oi":parse_number(tds[6].get_text(strip=True)),"oi_chg24_pct":parse_number(tds[7].get_text(strip=True)),
-             "oi_chg4h_pct":parse_number(tds[9].get_text(strip=True)),"oi_vol_ratio":parse_number(tds[11].get_text(strip=True)),
-             "oi_mktcap_ratio":parse_number(tds[12].get_text(strip=True)),"fr_avg":parse_number(tds[13].get_text(strip=True)),
-             "pfr_avg":parse_number(tds[14].get_text(strip=True)),"fr_oiw":parse_number(tds[15].get_text(strip=True)),
-             "pfr_oiw":parse_number(tds[16].get_text(strip=True)),"liq_short24":parse_number(tds[17].get_text(strip=True)),
-             "liq_long24":parse_number(tds[18].get_text(strip=True)),"ls_accounts":parse_number(tds[19].get_text(strip=True)),
-             "btc_corr7d":parse_number(tds[20].get_text(strip=True)),"cvd24":parse_number(tds[21].get_text(strip=True)),
-             "lls24":parse_number(tds[22].get_text(strip=True))}
+            "price":parse_number(tds[2].get_text(strip=True)),"price_chg24":parse_number(tds[3].get_text(strip=True)),
+            "mktcap":parse_number(tds[4].get_text(strip=True)),"volume24":parse_number(tds[5].get_text(strip=True)),
+            "oi":parse_number(tds[6].get_text(strip=True)),"oi_chg24_pct":parse_number(tds[7].get_text(strip=True)),
+            "oi_chg4h_pct":parse_number(tds[9].get_text(strip=True)),"oi_vol_ratio":parse_number(tds[11].get_text(strip=True)),
+            "oi_mktcap_ratio":parse_number(tds[12].get_text(strip=True)),"fr_avg":parse_number(tds[13].get_text(strip=True)),
+            "pfr_avg":parse_number(tds[14].get_text(strip=True)),"fr_oiw":parse_number(tds[15].get_text(strip=True)),
+            "pfr_oiw":parse_number(tds[16].get_text(strip=True)),"liq_short24":parse_number(tds[17].get_text(strip=True)),
+            "liq_long24":parse_number(tds[18].get_text(strip=True)),"ls_accounts":parse_number(tds[19].get_text(strip=True)),
+            "btc_corr7d":parse_number(tds[20].get_text(strip=True)),"cvd24":parse_number(tds[21].get_text(strip=True)),
+            "lls24":parse_number(tds[22].get_text(strip=True))}
         cvd=rec.get("cvd24"); lls=rec.get("lls24")
         if (cvd is not None and not(0<=cvd<=100)) or (lls is not None and not(0<=lls<=100)) or (rec.get("price") is not None and rec["price"]<=0): range_violations+=1
         out.append(rec)
@@ -146,12 +165,12 @@ def parse_table(html_text):
     return out
 
 def fetch_data():
-    html_text=fetch_html(); DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+    html_text=fetch_html(); DEBUG_HTML_FILE.write_text(html_text,encoding="utf-8")
     rows=parse_table(html_text)
     if not rows: send_tg("⚠️ <b>Monitor</b>\nДанные не получены."); sys.exit(1)
     return rows
 
-def append_jsonl(path, rec):
+def append_jsonl(path,rec):
     with open(path,"a",encoding="utf-8") as f: f.write(json.dumps(rec,ensure_ascii=False)+"\n")
 def load_jsonl(path):
     if not path.exists(): return []
@@ -163,7 +182,7 @@ def load_jsonl(path):
                 try: out.append(json.loads(line))
                 except json.JSONDecodeError: continue
     return out
-def cleanup_jsonl(path, ttl_days):
+def cleanup_jsonl(path,ttl_days):
     if not path.exists(): return
     cutoff=now_ts()-ttl_days*86400; recs=load_jsonl(path)
     fresh=[r for r in recs if r.get("ts",0)>cutoff]; removed=len(recs)-len(fresh)
@@ -181,13 +200,20 @@ def load_watchlist():
     try: data=json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         backup=_quarantine_corrupt_file(WATCHLIST_FILE)
-        msg=f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\nBackup: {backup.name if backup else 'нет'}\nПрогон остановлен."
+        msg=f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\nПрогон остановлен."
         log.error(msg.replace("<b>","").replace("</b>","")); send_tg(msg); sys.exit(1)
     for sym,rec in data.items():
         if rec.get("trade_id") and not rec.get("open_trade"): log.error(f"CORRUPTION: {sym} trade_id без open_trade")
         if rec.get("open_trade") and not rec.get("trade_id"): log.error(f"CORRUPTION: {sym} open_trade без trade_id")
     return data
 def save_watchlist(wl): WATCHLIST_FILE.write_text(json.dumps(wl,ensure_ascii=False,indent=2),encoding="utf-8")
+def load_lifecycle_state():
+    if not LIFECYCLE_STATE_FILE.exists(): return {}
+    try: data=json.loads(LIFECYCLE_STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError: return {}
+    now=time.time()
+    return {sym:v for sym,v in data.items() if now-v.get("idea_first_seen_ts",0)<IDEA_REGISTRY_TTL_DAYS*86400}
+def save_lifecycle_state(state): LIFECYCLE_STATE_FILE.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
 def load_market_history():
     cutoff=now_ts()-LIFECYCLE_WINDOW_MIN*60; recs=load_jsonl(MARKET_HISTORY_FILE)
     grouped={}; seen=set()
@@ -211,36 +237,19 @@ def load_existing_trade_ids():
         if tid: ids.add(tid)
     return ids
 def load_pending():
-    if not PENDING_FILE.exists() and PENDING_FILE_LEGACY.exists():
-        try:
-            legacy=PENDING_FILE_LEGACY.read_text(encoding="utf-8")
-            PENDING_FILE.write_text(legacy,encoding="utf-8"); PENDING_FILE_LEGACY.unlink()
-            log.info("pending: миграция .json → .jsonl")
-        except Exception as e: log.error(f"pending миграция: {e}")
     if not PENDING_FILE.exists(): return []
-    raw=PENDING_FILE.read_text(encoding="utf-8"); stripped=raw.strip(); data=None
-    if stripped.startswith("["):
-        try: data=json.loads(stripped)
-        except json.JSONDecodeError as e:
-            backup=_quarantine_corrupt_file(PENDING_FILE)
-            msg=f"⚠️ <b>Monitor CRITICAL</b>\npending legacy повреждён: {e}\nПрогон остановлен."
-            log.error(msg.replace("<b>","").replace("</b>","")); send_tg(msg); sys.exit(1)
-    else:
-        data=[]; bad=0
-        for ln in raw.splitlines():
-            ln=ln.strip()
-            if not ln: continue
-            try: data.append(json.loads(ln))
-            except json.JSONDecodeError: bad+=1
-        if bad and not data:
-            backup=_quarantine_corrupt_file(PENDING_FILE)
-            msg=f"⚠️ <b>Monitor CRITICAL</b>\npending полностью бит ({bad} строк)\nПрогон остановлен."
-            log.error(msg.replace("<b>","").replace("</b>","")); send_tg(msg); sys.exit(1)
-        if bad: log.warning(f"pending: {bad} битых строк пропущено")
-    if not isinstance(data,list):
+    raw=PENDING_FILE.read_text(encoding="utf-8")
+    data=[]; bad=0
+    for ln in raw.splitlines():
+        ln=ln.strip()
+        if not ln: continue
+        try: data.append(json.loads(ln))
+        except json.JSONDecodeError: bad+=1
+    if bad and not data:
         backup=_quarantine_corrupt_file(PENDING_FILE)
-        msg="⚠️ <b>Monitor CRITICAL</b>\npending неожиданный формат\nПрогон остановлен."
+        msg=f"⚠️ <b>Monitor CRITICAL</b>\npending_trades.jsonl полностью бит ({bad} строк)\nПрогон остановлен."
         log.error(msg.replace("<b>","").replace("</b>","")); send_tg(msg); sys.exit(1)
+    if bad: log.warning(f"pending_trades.jsonl: {bad} битых строк пропущено")
     seen,out=set(),[]
     for item in data:
         tid=item.get("rec",{}).get("trade_id")
@@ -254,7 +263,7 @@ def save_pending(pending):
         for item in pending: f.write(json.dumps(item,ensure_ascii=False)+"\n")
 
 def passes_filter(r):
-    v=r.get("volume24");  pc=r.get("price_chg24"); oi=r.get("oi_chg24_pct")
+    v=r.get("volume24"); pc=r.get("price_chg24"); oi=r.get("oi_chg24_pct")
     oi4=r.get("oi_chg4h_pct"); cvd=r.get("cvd24"); lls=r.get("lls24")
     oim=r.get("oi_mktcap_ratio"); oiv=r.get("oi_vol_ratio"); fr=r.get("fr_oiw")
     if v is None or v<=1_000_000: return False
@@ -368,7 +377,6 @@ def fetch_btc_price_chg():
             if chg is not None: return float(chg)
     except Exception as e: log.warning(f"CoinGecko: {e}")
     return None
-
 def detect_market_phase(rows):
     btc=next((r for r in rows if r["symbol"]=="BTCUSDT"),None)
     if btc: btc_pc=btc.get("price_chg24") or 0
@@ -420,21 +428,11 @@ def detect_lifecycle(symbol,snaps,score,derived,prev_state="NEUTRAL"):
             return "ACCELERATION",reasons,warnings,None
     if allowed("CONFIRMED_TREND") and n>=MIN_SNAPS_LIFECYCLE:
         recent=snaps[-MIN_SNAPS_LIFECYCLE:]
-        oi_not_falling=all(safe(recent[i].get("oi_chg24_pct"))>=safe(recent[i-1].get("oi_chg24_pct"))-1 for i in range(1,len(recent)))
-        cvd_not_falling=all(safe(recent[i].get("cvd24"))>=safe(recent[i-1].get("cvd24"))-5 for i in range(1,len(recent)))
-        all_oi4=all(safe(s.get("oi_chg4h_pct"))>0 for s in recent)
-        all_fr=all(s.get("fr_oiw") is not None and s.get("fr_oiw")<0.05 for s in recent)
-        all_lls=all(s.get("lls24") is not None and s.get("lls24")<40 for s in recent)
-        all_pc=all(safe(recent[i].get("price_chg24"))>=safe(recent[i-1].get("price_chg24"))-0.5 for i in range(1,len(recent)))
-        pc_net_up=safe(recent[-1].get("price_chg24"))>=safe(recent[0].get("price_chg24"))-0.5
-        oi_growing_faster=False
-        if len(recent)>=3:
-            ov=[safe(s.get("oi_chg24_pct")) for s in recent[-3:]]; d1,d2=ov[1]-ov[0],ov[2]-ov[1]; oi_growing_faster=d2>d1 and d1>0
-        path_a=all(safe(s.get("oi_chg24_pct"))>5 for s in recent) and all(safe(s.get("cvd24"))>55 for s in recent)
-        path_b=all(safe(s.get("oi_chg24_pct"))>2 for s in recent) and all(safe(s.get("cvd24"))>50 for s in recent) and oi_growing_faster and cvd_mom>5
+        result_a=check_confirmed_path_a(recent)
+        result_b=check_confirmed_path_b(recent,cvd_mom)
         trends_ok=derived["cvd_trend"]!="down" and derived["oi_trend"]!="down"
-        if (path_a or path_b) and all_oi4 and all_fr and all_lls and all_pc and pc_net_up and oi_not_falling and cvd_not_falling and trends_ok:
-            is_early=path_b and not path_a
+        if (result_a["passed"] or result_b["passed"]) and trends_ok:
+            is_early=result_b["passed"] and not result_a["passed"]
             if is_early: reasons.append("Раннее подтверждение: OI>2 CVD>50 + ускорение + momentum")
             else: reasons.append(f"{MIN_SNAPS_LIFECYCLE} снимков: OI>5 CVD>55 LLS<40 OI4h>0 P↑ FR<0.05")
             reasons.append("OI и CVD не снижаются (шагово и по тренду)")
@@ -447,14 +445,16 @@ def detect_lifecycle(symbol,snaps,score,derived,prev_state="NEUTRAL"):
         cvd_up=all(safe(last3[i].get("cvd24"))>safe(last3[i-1].get("cvd24"))-3 for i in range(1,3))
         vol_up=all(safe(last3[i].get("volume24"))>safe(last3[i-1].get("volume24"))*0.95 for i in range(1,3))
         if price_up and oi_up and cvd_up and vol_up:
-            reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑"); return "EARLY_MOVE",reasons,warnings,None
+            reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑")
+            return "EARLY_MOVE",reasons,warnings,None
     if allowed("ACCUMULATION") and n>=3:
         last3=snaps[-3:]
         oi4_pos=all(safe(s.get("oi_chg4h_pct"))>0 for s in last3)
         cvd_avg=sum(safe(s.get("cvd24")) for s in last3)/3
         fr_ok=all(s.get("fr_oiw") is not None and s.get("fr_oiw")<0.03 for s in last3)
         if oi4_pos and cvd_avg>50 and pc<5 and fr_ok:
-            reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03"); reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
+            reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
+            reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
             return "ACCUMULATION",reasons,warnings,None
     return "NEUTRAL",["нет подтверждённого движения"],warnings,None
 
@@ -465,15 +465,17 @@ def calc_confidence(state,snaps,score,derived,market_mod):
     if derived["oi_accel"]<0 and state in("ACCELERATION","CONFIRMED_TREND"): penalty+=10
     if len(snaps)>0 and safe(snaps[-1].get("cvd24"))>95 and state=="ACCELERATION": penalty+=5
     return clamp(base+snap_bonus+score+market_mod*3-penalty,0,100)
-
 def entry_earliness(r):
-    pc_pos=min(safe(r.get("price_chg24"))/15.0,1.0); oi_pos=min(safe(r.get("oi_chg24_pct"))/50.0,1.0); fr_pos=min(max(safe(r.get("fr_oiw"))/0.05,0),1.0)
+    pc_pos=min(safe(r.get("price_chg24"))/15.0,1.0)
+    oi_pos=min(safe(r.get("oi_chg24_pct"))/50.0,1.0)
+    fr_pos=min(max(safe(r.get("fr_oiw"))/0.05,0),1.0)
     avg=(pc_pos+oi_pos+fr_pos)/3
     return avg,("ранняя" if avg<0.35 else "средняя" if avg<0.65 else "поздняя")
 
 def send_tg(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: log.warning("TG не настроен"); return
-    url=f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"; chunks,rem=[],text
+    url=f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    chunks,rem=[],text
     while len(rem)>3800:
         sp=rem.rfind("\n",0,3800)
         if sp==-1: sp=3800
@@ -490,14 +492,17 @@ def format_signal(symbol,wl,cur,snaps,reasons,warnings,market):
     state=wl["state"]; emoji=STATE_EMOJI.get(state,"⚪"); action=ACTIONS.get(state,"")
     conf=wl.get("confidence",0); score=cur.get("score",0); mom=cur.get("momentum",0)
     pattern=cur.get("pattern","—"); derived=cur.get("derived",{}); prev=wl.get("previous_state","")
-    s=snaps[-1] if snaps else {}; ar={"up":"↑","down":"↓","flat":"→"}
+    s=snaps[-1] if snaps else {}
+    ar={"up":"↑","down":"↓","flat":"→"}
     oi_t=ar.get(derived.get("oi_trend"),"→"); cvd_t=ar.get(derived.get("cvd_trend"),"→"); prc_t=ar.get(derived.get("price_trend"),"→")
     _,early_label=entry_earliness(s); line="━━━━━━━━━━━━━━━━━━"
     reas=" · ".join(reasons[:3]) if reasons else ""; warns=" · ".join(warnings[:3]) if warnings else ""
     prev_line=f" ({esc(prev)} →)" if prev and prev!=state else ""
     msg=(f"{emoji} <b>{esc(cur.get('name',symbol))} ({esc(symbol)})</b>\n{line}\n"
-         f"{esc(state)}{prev_line} → {esc(action)}\nScore {score}/10 · Momentum {mom}/10 · Conf {conf}%\n"
-         f"Вход: {early_label} · Паттерн: {esc(pattern)}\nOI {oi_t} CVD {cvd_t} Price {prc_t}")
+         f"{esc(state)}{prev_line} → {esc(action)}\n"
+         f"Score {score}/10 · Momentum {mom}/10 · Conf {conf}%\n"
+         f"Вход: {early_label} · Паттерн: {esc(pattern)}\n"
+         f"OI {oi_t} CVD {cvd_t} Price {prc_t}")
     if market.get("note"): msg+=f" · {esc(market['note'])}"
     msg+=(f"\n{line}\nP {fmt_pct(s.get('price_chg24'))} | OI {fmt_pct(s.get('oi_chg24_pct'))} | "
           f"4h {fmt_pct(s.get('oi_chg4h_pct'))} | CVD {fmt_num(s.get('cvd24'),dec=0)} | LLS {fmt_num(s.get('lls24'),'%',0)}\n")
@@ -507,17 +512,19 @@ def format_signal(symbol,wl,cur,snaps,reasons,warnings,market):
     return msg
 
 def format_trade_close(rec):
-    pnl=rec.get("strategy_pnl_pct"); pnl_s="—" if pnl is None else f"{pnl:+.1f}%"
+    pnl=rec.get("strategy_pnl_pct")
+    pnl_s="—" if pnl is None else f"{pnl:+.1f}%"
     emoji="💚" if (pnl is not None and pnl>0) else "💔" if (pnl is not None and pnl<0) else "➖"
     peak=rec.get("max_pnl_pct"); dd=rec.get("drawdown_from_peak_pct"); line="━━━━━━━━━━━━━━━━━━"
-    stale_min=rec.get("exit_price_stale_min"); stale_note=f" (цена устарела на {fmt_num(stale_min,' мин',0)})" if stale_min else ""
-    dd_display=fmt_pct(-dd) if dd is not None else "—"
+    stale_min=rec.get("exit_price_stale_min")
+    stale_note=f" (цена устарела на {fmt_num(stale_min,' мин',0)})" if stale_min else ""
     msg=(f"{emoji} <b>{esc(rec.get('name',rec['symbol']))} ({esc(rec['symbol'])})</b> — сделка закрыта\n{line}\n"
          f"Вход {fmt_price(rec.get('entry_price'))} → Выход {fmt_price(rec.get('exit_price'))}{esc(stale_note)}   <b>{pnl_s}</b>\n"
-         f"Держали {rec.get('hold_min')} мин · пик {fmt_pct(peak)} · просадка {dd_display}\n"
+         f"Держали {rec.get('hold_min')} мин · пик {fmt_pct(peak)} · просадка {fmt_pct(-dd if dd else None)}\n"
          f"Выход по: {esc(rec.get('exit_reason'))}\n"
          f"Вход был: {esc(rec.get('entry_path'))} · mom {rec.get('entry_momentum')} · "
-         f"cvd_m {fmt_num(rec.get('entry_cvd_momentum'),dec=0)} · {esc(rec.get('entry_pattern'))} · {esc(rec.get('entry_earliness_label'))}\n")
+         f"cvd_m {fmt_num(rec.get('entry_cvd_momentum'),dec=0)} · {esc(rec.get('entry_pattern'))} · "
+         f"{esc(rec.get('entry_earliness_label'))}\n")
     r60=rec.get("return_60m")
     if r60 is not None: msg+=f"Signal@60m: {r60:+.1f}%\n"
     return msg
@@ -542,26 +549,65 @@ def llm_verify(symbol,wl,cur,snaps):
     except Exception as e: log.warning(f"LLM: {e}")
     return None
 
-# [FIX] Имя: _fill_horizons (с подчёркиванием)
 def _fill_horizons(ot,sym,as_of_ts,price_full):
     ep=ot.get("entry_price")
     if not ep: return
     max_lag=HORIZON_MAX_LAG_MIN*60
     for h in TRADE_HORIZONS:
-        key=f"return_{h}m"  # [FIX] с подчёркиванием
+        key=f"return_{h}m"
         if ot.get(key) is None and as_of_ts>=ot["entry_ts"]+h*60:
             ph=price_at(price_full,sym,ot["entry_ts"]+h*60,max_lag_sec=max_lag)
-            if ph: ot[key]=round((ph-ep)/ep*100,3); ot[f"{key}_available"]=True
+            if ph:
+                ot[key]=round((ph-ep)/ep*100,3)
+                ot[f"{key}_available"]=True
 
-def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,first_seen,snapshots,price):
-    ot={"entry_ts":ts,"entry_price":price,"entry_state":state,"entry_path":path,"last_price":price,"last_price_ts":ts,
-        "max_pnl_pct":0.0,"min_pnl_pct":0.0,"peak_ts":ts,"signal_age_min":round((ts-first_seen)/60,1),
-        "snapshot_count_before_entry":snapshots,"asset_class":classify_asset_class(r),
-        "name":r.get("name",r.get("symbol","")),"signal_logic_version":SIGNAL_LOGIC_VERSION,
-        "entry_score":score,"entry_momentum":momentum,"entry_cvd_momentum":round(derived["cvd_momentum"],2),
-        "entry_oi_accel":round(derived["oi_accel"],3),"entry_price_accel":round(derived["price_accel"],3),
-        "entry_confidence":conf,"entry_earliness":round(early_val,2),"entry_earliness_label":early_label,
-        "entry_pattern":pattern,"entry_oi_trend":derived["oi_trend"],"entry_cvd_trend":derived["cvd_trend"],
+def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,snapshots,price):
+    if state=="CONFIRMED_TREND": trigger=f"confirmed_trend_{path}_path"
+    elif state=="ACCELERATION": trigger="acceleration_confirmation"
+    else: trigger=state.lower()
+    entry_snapshot={
+        "timestamp":ts,"price":price,"symbol":r.get("symbol"),
+        "features":{
+            "price_chg24":safe(r.get("price_chg24")),"oi_chg24":safe(r.get("oi_chg24_pct")),
+            "oi_chg4h":safe(r.get("oi_chg4h_pct")),"funding":safe(r.get("fr_avg")),
+            "funding_oiw":safe(r.get("fr_oiw")),"cvd24":safe(r.get("cvd24")),
+            "lls24":safe(r.get("lls24")),"oi_vol_ratio":safe(r.get("oi_vol_ratio")),
+            "oi_mcap_ratio":safe(r.get("oi_mktcap_ratio")),"ls_accounts":r.get("ls_accounts"),
+            "volume24":r.get("volume24"),"liq_short24":safe(r.get("liq_short24")),
+            "liq_long24":safe(r.get("liq_long24")),"btc_corr7d":r.get("btc_corr7d"),
+            "cvd_momentum":round(derived["cvd_momentum"],2),"oi_accel":round(derived["oi_accel"],3),
+            "price_accel":round(derived["price_accel"],3),"funding_pressure":round(derived["funding_pressure"],5),
+            "oi_trend":derived["oi_trend"],"cvd_trend":derived["cvd_trend"],
+            "price_trend":derived["price_trend"],"oi4h_trend":derived["oi4h_trend"],
+            "divergence":derived["divergence"],
+        },
+        "decision":{"state":state,"score":score,"momentum":momentum,"path":path,
+                    "pattern":pattern,"market_phase":market.get("phase","unknown"),
+                    "entry_reason":{"state":state,"path":path,"trigger":trigger}},
+    }
+    ot={
+        "entry_ts":ts,"entry_price":price,"entry_state":state,"entry_path":path,
+        "last_price":price,"last_price_ts":ts,
+        "max_pnl_pct":0.0,"min_pnl_pct":0.0,"peak_ts":ts,
+        "max_state":state,"state_history":[{"ts":ts,"state":state,"score":score,"reason":"entry"}],
+        "current_state":state,"current_state_start_ts":ts,"time_in_states":{},
+        "idea_first_seen_ts":idea_first_seen_ts,
+        "idea_age_minutes":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
+        "signal_age_min":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
+        "snapshot_count_before_entry":snapshots,
+        "asset_class":classify_asset_class(r),"name":r.get("name",r.get("symbol","")),
+        "engine_versions":dict(ENGINE_VERSIONS),
+        "entry_snapshot":entry_snapshot,
+        "entry_snapshot_hash":compute_snapshot_hash(entry_snapshot),
+        "entry_reason":{"state":state,"path":path,"trigger":trigger},
+        "entry_score":score,"entry_momentum":momentum,
+        "entry_cvd_momentum":round(derived["cvd_momentum"],2),
+        "entry_oi_accel":round(derived["oi_accel"],3),
+        "entry_price_accel":round(derived["price_accel"],3),
+        "entry_confidence":conf,
+        "entry_earliness":round(early_val,2),"entry_earliness_label":early_label,
+        "entry_pattern":pattern,
+        "entry_oi_trend":derived["oi_trend"],"entry_cvd_trend":derived["cvd_trend"],
         "entry_price_trend":derived["price_trend"],"entry_divergence":derived["divergence"],
         "entry_price_chg24":safe(r.get("price_chg24")),"entry_oi_chg24":safe(r.get("oi_chg24_pct")),
         "entry_oi_chg4h":safe(r.get("oi_chg4h_pct")),"entry_cvd24":safe(r.get("cvd24")),
@@ -569,16 +615,21 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "entry_oi_vol_ratio":safe(r.get("oi_vol_ratio")),"entry_oi_mktcap_ratio":safe(r.get("oi_mktcap_ratio")),
         "entry_liq_short24":safe(r.get("liq_short24")),"entry_liq_long24":safe(r.get("liq_long24")),
         "entry_ls_accounts":r.get("ls_accounts"),"entry_btc_corr7d":r.get("btc_corr7d"),
-        "entry_market_phase":market.get("phase","unknown")}
-    for h in TRADE_HORIZONS: ot[f"return_{h}m"]=None; ot[f"return_{h}m_available"]=False
+        "entry_market_phase":market.get("phase","unknown"),
+        "data_quality":{"entry_price_source":"live","exit_price_source":None,"missing_snapshots":0,"max_price_age_min":0,"price_unknown":False},
+    }
+    for h in TRADE_HORIZONS:
+        ot[f"return_{h}m"]=None
+        ot[f"return_{h}m_available"]=False
     return ot
 
 def _exit_meta(source,exit_ts,last_price_ts):
     if source=="live" or last_price_ts is None: return source,0.0
     return source,round(max(0,exit_ts-last_price_ts)/60,1)
 
-def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live"):
-    ep=ot.get("entry_price"); _fill_horizons(ot,symbol,exit_ts,price_full)
+def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live",exit_candidates=None,lifecycle_complete=True):
+    ep=ot.get("entry_price")
+    _fill_horizons(ot,symbol,exit_ts,price_full)
     gross=round((exit_price-ep)/ep*100,3) if (exit_price and ep) else None
     max_pnl=ot.get("max_pnl_pct",0.0); min_pnl=ot.get("min_pnl_pct",0.0); peak_ts=ot.get("peak_ts",ot["entry_ts"])
     if gross is not None:
@@ -589,35 +640,87 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
     drawdown=round(max_pnl-gross,3) if gross is not None else None
     time_to_peak=round((peak_ts-ot["entry_ts"])/60,1)
     _,stale_min=_exit_meta(exit_price_source,exit_ts,ot.get("last_price_ts"))
+    if ot.get("data_quality"):
+        ot["data_quality"]["exit_price_source"]=exit_price_source
+        ot["data_quality"]["price_unknown"]=stale_min>30
+    duration_min=round((exit_ts-ot.get("current_state_start_ts",exit_ts))/60,1)
+    last_state=ot.get("current_state","UNKNOWN")
+    time_in_states=dict(ot.get("time_in_states",{}))
+    time_in_states[last_state]=time_in_states.get(last_state,0)+duration_min
+    protections_triggered=[r for r in (exit_candidates or []) if r in PROTECTION_REASONS]
     def winflag(h):
         v=ot.get(f"return_{h}m")
         if v is None: return None
         return 1 if v>=TRADE_WIN_PCT else 0
-    rec={"schema_version":TRADE_SCHEMA_VERSION,"trade_id":f"{symbol}_{ot['entry_ts']}","symbol":symbol,
-         "name":ot.get("name",symbol),"asset_class":ot.get("asset_class",classify_asset_class({"symbol":symbol})),
-         "entry_ts":ot["entry_ts"],"entry_price":ep,"exit_ts":exit_ts,"exit_price":exit_price,
-         "exit_reason":exit_reason,"exit_state":exit_state,"exit_price_source":exit_price_source,
-         "exit_price_stale_min":stale_min,"closed_before_60m":hold_min<60,"hold_min":hold_min,
-         "entry_state":ot.get("entry_state"),"entry_path":ot.get("entry_path"),
-         "signal_age_min":ot.get("signal_age_min"),"snapshot_count_before_entry":ot.get("snapshot_count_before_entry"),
-         "signal_logic_version":ot.get("signal_logic_version"),"entry_score":ot.get("entry_score"),
-         "entry_momentum":ot.get("entry_momentum"),"entry_cvd_momentum":ot.get("entry_cvd_momentum"),
-         "entry_oi_accel":ot.get("entry_oi_accel"),"entry_price_accel":ot.get("entry_price_accel"),
-         "entry_confidence":ot.get("entry_confidence"),"entry_earliness":ot.get("entry_earliness"),
-         "entry_earliness_label":ot.get("entry_earliness_label"),"entry_pattern":ot.get("entry_pattern"),
-         "entry_oi_trend":ot.get("entry_oi_trend"),"entry_cvd_trend":ot.get("entry_cvd_trend"),
-         "entry_price_trend":ot.get("entry_price_trend"),"entry_divergence":ot.get("entry_divergence"),
-         "entry_price_chg24":ot.get("entry_price_chg24"),"entry_oi_chg24":ot.get("entry_oi_chg24"),
-         "entry_oi_chg4h":ot.get("entry_oi_chg4h"),"entry_cvd24":ot.get("entry_cvd24"),
-         "entry_lls24":ot.get("entry_lls24"),"entry_fr_oiw":ot.get("entry_fr_oiw"),
-         "entry_oi_vol_ratio":ot.get("entry_oi_vol_ratio"),"entry_oi_mktcap_ratio":ot.get("entry_oi_mktcap_ratio"),
-         "entry_liq_short24":ot.get("entry_liq_short24"),"entry_liq_long24":ot.get("entry_liq_long24"),
-         "entry_ls_accounts":ot.get("entry_ls_accounts"),"entry_btc_corr7d":ot.get("entry_btc_corr7d"),
-         "entry_market_phase":ot.get("entry_market_phase"),"fee_pct":FEE_PCT,
-         "gross_pnl_pct":gross,"strategy_pnl_pct":strategy_pnl,"max_pnl_pct":max_pnl,"min_pnl_pct":min_pnl,
-         "drawdown_from_peak_pct":drawdown,"time_to_peak_min":time_to_peak}
-    for h in TRADE_HORIZONS: rec[f"return_{h}m"]=ot.get(f"return_{h}m"); rec[f"return_{h}m_available"]=bool(ot.get(f"return_{h}m_available"))
-    rec["win_60m"]=winflag(60); rec["win_120m"]=winflag(120)
+    rec={
+        "schema_version":TRADE_SCHEMA_VERSION,
+        "trade_id":f"{symbol}_{ot['entry_ts']}",
+        "symbol":symbol,"name":ot.get("name",symbol),
+        "asset_class":ot.get("asset_class",classify_asset_class({"symbol":symbol})),
+        "entry_ts":ot["entry_ts"],"entry_price":ep,
+        "exit_ts":exit_ts,"exit_price":exit_price,
+        "exit_reason":exit_reason,"exit_state":exit_state,
+        "exit_class":EXIT_CLASS.get(exit_reason,"UNKNOWN"),
+        "exit_candidates":exit_candidates or [exit_reason],
+        "exit_count":len(exit_candidates or [exit_reason]),
+        "protections_triggered":protections_triggered,
+        "close_type":"natural" if lifecycle_complete else "technical",
+        "trade_lifecycle_complete":lifecycle_complete,
+        "exit_price_source":exit_price_source,
+        "exit_price_stale_min":stale_min,
+        "closed_before_60m":hold_min<60,
+        "hold_min":hold_min,
+        "entry_state":ot.get("entry_state"),
+        "entry_path":ot.get("entry_path"),
+        "entry_reason":ot.get("entry_reason",{}),
+        "entry_snapshot":ot.get("entry_snapshot",{}),
+        "entry_snapshot_hash":ot.get("entry_snapshot_hash",{}),
+        "idea_first_seen_ts":ot.get("idea_first_seen_ts"),
+        "idea_age_minutes":ot.get("idea_age_minutes"),
+        "signal_age_min":ot.get("signal_age_min"),
+        "snapshot_count_before_entry":ot.get("snapshot_count_before_entry"),
+        "engine_versions":ot.get("engine_versions",dict(ENGINE_VERSIONS)),
+        "max_state":ot.get("max_state"),
+        "state_history":ot.get("state_history",[]),
+        "time_in_states":time_in_states,
+        "data_quality":ot.get("data_quality",{}),
+        "entry_score":ot.get("entry_score"),
+        "entry_momentum":ot.get("entry_momentum"),
+        "entry_cvd_momentum":ot.get("entry_cvd_momentum"),
+        "entry_oi_accel":ot.get("entry_oi_accel"),
+        "entry_price_accel":ot.get("entry_price_accel"),
+        "entry_confidence":ot.get("entry_confidence"),
+        "entry_earliness":ot.get("entry_earliness"),
+        "entry_earliness_label":ot.get("entry_earliness_label"),
+        "entry_pattern":ot.get("entry_pattern"),
+        "entry_oi_trend":ot.get("entry_oi_trend"),
+        "entry_cvd_trend":ot.get("entry_cvd_trend"),
+        "entry_price_trend":ot.get("entry_price_trend"),
+        "entry_divergence":ot.get("entry_divergence"),
+        "entry_price_chg24":ot.get("entry_price_chg24"),
+        "entry_oi_chg24":ot.get("entry_oi_chg24"),
+        "entry_oi_chg4h":ot.get("entry_oi_chg4h"),
+        "entry_cvd24":ot.get("entry_cvd24"),
+        "entry_lls24":ot.get("entry_lls24"),
+        "entry_fr_oiw":ot.get("entry_fr_oiw"),
+        "entry_oi_vol_ratio":ot.get("entry_oi_vol_ratio"),
+        "entry_oi_mktcap_ratio":ot.get("entry_oi_mktcap_ratio"),
+        "entry_liq_short24":ot.get("entry_liq_short24"),
+        "entry_liq_long24":ot.get("entry_liq_long24"),
+        "entry_ls_accounts":ot.get("entry_ls_accounts"),
+        "entry_btc_corr7d":ot.get("entry_btc_corr7d"),
+        "entry_market_phase":ot.get("entry_market_phase"),
+        "fee_pct":FEE_PCT,
+        "gross_pnl_pct":gross,"strategy_pnl_pct":strategy_pnl,
+        "max_pnl_pct":max_pnl,"min_pnl_pct":min_pnl,
+        "mfe_pct":max_pnl,"mae_pct":min_pnl,
+        "drawdown_from_peak_pct":drawdown,"time_to_peak_min":time_to_peak,
+    }
+    for h in TRADE_HORIZONS:
+        rec[f"return_{h}m"]=ot.get(f"return_{h}m")
+        rec[f"return_{h}m_available"]=bool(ot.get(f"return_{h}m_available"))
+    rec["win_60m"]=winflag(60)
+    rec["win_120m"]=winflag(120)
     PENDING.append({"rec":rec,"entry_ts":ot["entry_ts"],"symbol":symbol,"entry_price":ep})
     log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} hold={hold_min}m")
     send_tg(format_trade_close(rec))
@@ -628,12 +731,15 @@ def flush_pending(price_full,now,existing_trade_ids):
     for item in PENDING:
         rec=item["rec"]; sym,ep,ets=item["symbol"],item["entry_price"],item["entry_ts"]
         tid=rec.get("trade_id")
-        if tid and tid in existing_trade_ids: log.warning(f"[{sym}] DUP_SKIP {tid}"); continue
+        if tid and tid in existing_trade_ids:
+            log.warning(f"[{sym}] DUP_FINALIZED_SKIP trade_id={tid}"); continue
         for h in TRADE_HORIZONS:
             key=f"return_{h}m"
             if rec.get(key) is None and now>=ets+h*60:
                 ph=price_at(price_full,sym,ets+h*60,max_lag_sec=HORIZON_MAX_LAG_MIN*60)
-                if ph and ep: rec[key]=round((ph-ep)/ep*100,3); rec[f"{key}_available"]=True
+                if ph and ep:
+                    rec[key]=round((ph-ep)/ep*100,3)
+                    rec[f"{key}_available"]=True
         for h in (60,120):
             v=rec.get(f"return_{h}m")
             rec[f"win_{h}m"]=(1 if (v is not None and v>=TRADE_WIN_PCT) else (0 if v is not None else None))
@@ -645,128 +751,228 @@ def flush_pending(price_full,now,existing_trade_ids):
             else: rec["pending_finalize_reason"]="MISSING_PRICE"
             append_jsonl(TRADES_FILE,rec)
             if tid: existing_trade_ids.add(tid)
-            log.info(f"[{sym}] FINALIZED {rec['trade_id']} reason={rec['pending_finalize_reason']}")
+            log.info(f"[{sym}] TRADE FINALIZED trade_id={rec['trade_id']} reason={rec['pending_finalize_reason']}")
         else: still.append(item)
     PENDING=still
 
 TG_STATES={"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"}
 ACTIVE_STATES={"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"}
-ENTRY_STATES={"CONFIRMED_TREND","ACCELERATION"}; CLOSE_STATES={"EXHAUSTION","DISTRIBUTION"}
+ENTRY_STATES={"CONFIRMED_TREND","ACCELERATION"}
+CLOSE_STATES={"EXHAUSTION","DISTRIBUTION"}
 
 def run():
     log.info("═══ Прогон ═══")
     wl_all=load_watchlist()
-    global PENDING; PENDING=load_pending(); existing_trade_ids=load_existing_trade_ids()
-    rows=fetch_data(); log.info(f"Монет: {len(rows)}")
-    market=detect_market_phase(rows); log.info(f"Market: {market['phase']} {market['note']}")
-    current_symbols={r["symbol"] for r in rows}; ts=now_ts()
+    global PENDING
+    PENDING=load_pending()
+    existing_trade_ids=load_existing_trade_ids()
+    lifecycle_state=load_lifecycle_state()
+    rows=fetch_data()
+    log.info(f"Монет после discovery-фильтра: {len(rows)}")
+    market=detect_market_phase(rows)
+    log.info(f"Market: {market['phase']} {market['note']}")
+    current_symbols={r["symbol"] for r in rows}
+    ts=now_ts()
     for r in rows:
         append_jsonl(HEARTBEAT_FILE,{"ts":ts,"symbol":r["symbol"],"price":r.get("price")})
-        sym=r["symbol"]; lifecycle_state=wl_all.get(sym,{}).get("state")
-        append_jsonl(MARKET_HISTORY_FILE,{**r,"lifecycle_state":lifecycle_state})
-    history_all=load_market_history(); price_full=load_price_full()
+        sym=r["symbol"]
+        append_jsonl(MARKET_HISTORY_FILE,{**r,"lifecycle_state":wl_all.get(sym,{}).get("state")})
+    history_all=load_market_history()
+    price_full=load_price_full()
     for sym,hist in history_all.items():
         if not hist or sym not in current_symbols: continue
-        r=hist[-1]; cur_price=r.get("price") if valid_price(r.get("price")) else None
-        raw_score,pros,cons=calculate_score(r); score=clamp(raw_score+market["modifier"],0,10)
-        derived=calc_derived(hist); momentum,mom_tags=calc_momentum(derived)
+        r=hist[-1]
+        cur_price=r.get("price") if valid_price(r.get("price")) else None
+        raw_score,pros,cons=calculate_score(r)
+        score=clamp(raw_score+market["modifier"],0,10)
+        derived=calc_derived(hist)
+        momentum,mom_tags=calc_momentum(derived)
         pattern=detect_pattern(r,derived,momentum)
         prev_state=wl_all.get(sym,{}).get("state","NEUTRAL")
         state,reasons,warnings,path=detect_lifecycle(sym,hist,score,derived,prev_state)
         if state=="NEUTRAL":
             if sym in wl_all:
                 old=wl_all[sym]["state"]
+                ot=wl_all[sym].get("open_trade")
                 if old in ACTIVE_STATES:
-                    nr=wl_all[sym].get("neutral_runs",0)+1; wl_all[sym]["neutral_runs"]=nr; wl_all[sym]["last_seen"]=ts
-                    if nr>=NEUTRAL_HYSTERESIS:
-                        ot=wl_all[sym].get("open_trade")
-                        if ot:
-                            exit_price=cur_price or ot.get("last_price"); src="live" if cur_price else "last_seen"
-                            close_trade(ot,sym,ts,exit_price,"NEUTRAL",old,price_full,exit_price_source=src)
-                        send_tg(f"⚪ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n{esc(old)} → NEUTRAL\n<i>Снята: условия не выполняются {nr} прогона подряд</i>\n")
-                        log.info(f"[{sym}] {old} → NEUTRAL (×{nr}), remove"); del wl_all[sym]
-                    else: log.info(f"[{sym}] {old}: NEUTRAL {nr}/{NEUTRAL_HYSTERESIS}")
-                else:
-                    ot=wl_all[sym].get("open_trade")
+                    nr=wl_all[sym].get("neutral_runs",0)+1
+                    wl_all[sym]["neutral_runs"]=nr
+                    wl_all[sym]["last_seen"]=ts
                     if ot:
-                        exit_price=cur_price or ot.get("last_price"); src="live" if cur_price else "last_seen"
-                        close_trade(ot,sym,ts,exit_price,"NEUTRAL",old,price_full,exit_price_source=src)
-                    log.info(f"[{sym}] {old} → NEUTRAL, remove"); del wl_all[sym]
+                        ot["state_history"].append({"ts":ts,"state":"NEUTRAL","score":score,"reason":"signal_pause"})
+                    if nr>=NEUTRAL_HYSTERESIS:
+                        if ot:
+                            log.info(f"[{sym}] {old} → NEUTRAL (×{nr}), сделка открыта — держим")
+                        else:
+                            send_tg(f"⚪ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n{esc(old)} → NEUTRAL\n<i>Снята: условия тренда не выполняются {nr} прогона подряд</i>\n")
+                            log.info(f"[{sym}] {old} → NEUTRAL (×{nr}), remove")
+                            if sym in lifecycle_state: del lifecycle_state[sym]
+                            del wl_all[sym]
+                    else:
+                        log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}")
+                else:
+                    if ot:
+                        ot["state_history"].append({"ts":ts,"state":"NEUTRAL","score":score,"reason":"signal_pause"})
+                    log.info(f"[{sym}] {old} → NEUTRAL, remove")
+                    if sym in lifecycle_state: del lifecycle_state[sym]
+                    del wl_all[sym]
             continue
         if state=="INVALIDATED":
             if sym in wl_all:
-                old=wl_all[sym]["state"]; ot=wl_all[sym].get("open_trade")
+                old=wl_all[sym]["state"]
+                ot=wl_all[sym].get("open_trade")
                 if ot:
-                    exit_price=cur_price or ot.get("last_price"); src="live" if cur_price else "last_seen"
-                    close_trade(ot,sym,ts,exit_price,"INVALIDATED",state,price_full,exit_price_source=src)
+                    exit_price=cur_price or ot.get("last_price")
+                    src="live" if cur_price else "last_seen"
+                    close_trade(ot,sym,ts,exit_price,"INVALIDATED",state,price_full,exit_price_source=src,exit_candidates=["INVALIDATED"],lifecycle_complete=True)
                 send_tg(f"❌ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n{esc(old)} → INVALIDATED\n<i>Сценарий сломан: {esc(' · '.join(reasons[:2]))}</i>\n")
-                log.info(f"[{sym}] INVALIDATED → remove"); del wl_all[sym]
+                log.info(f"[{sym}] INVALIDATED → remove")
+                if sym in lifecycle_state: del lifecycle_state[sym]
+                del wl_all[sym]
             continue
-        conf=calc_confidence(state,hist,score,derived,market["modifier"]); early_val,early_label=entry_earliness(r)
-        existing=wl_all.get(sym,{}); ot=existing.get("open_trade"); tid=existing.get("trade_id"); new_ot,new_tid=None,None
+        conf=calc_confidence(state,hist,score,derived,market["modifier"])
+        early_val,early_label=entry_earliness(r)
+        existing=wl_all.get(sym,{})
+        ot=existing.get("open_trade")
+        tid=existing.get("trade_id")
+        new_ot,new_tid=None,None
         if ot is not None:
-            close_reason=None
-            if state in CLOSE_STATES: close_reason=state
-            elif ts-ot["entry_ts"]>=TRADE_TIMEOUT_MIN*60: close_reason="TIMEOUT"
+            ot=dict(ot)
+            if state!=ot.get("current_state"):
+                duration_min=round((ts-ot.get("current_state_start_ts",ts))/60,1)
+                old_state=ot.get("current_state","UNKNOWN")
+                ot["time_in_states"][old_state]=ot["time_in_states"].get(old_state,0)+duration_min
+                ot["current_state"]=state
+                ot["current_state_start_ts"]=ts
+                ot["state_history"].append({"ts":ts,"state":state,"score":score,"reason":"state_transition"})
+                if STATE_RANK.get(state,0)>STATE_RANK.get(ot.get("max_state"),0):
+                    ot["max_state"]=state
+            exit_candidates={
+                "INVALIDATED":state=="INVALIDATED",
+                "EXHAUSTION":state=="EXHAUSTION",
+                "DISTRIBUTION":state=="DISTRIBUTION",
+                "STOP_LOSS":False,
+                "SIGNAL_DECAY":False,
+                "TIMEOUT":ts-ot["entry_ts"]>=TRADE_TIMEOUT_MIN*60,
+                "MISSED":False,
+                "NEUTRAL":False,
+            }
+            if cur_price and ot.get("entry_price"):
+                pnl_pct=(cur_price-ot["entry_price"])/ot["entry_price"]*100
+                if pnl_pct<=-STOP_LOSS_PCT: exit_candidates["STOP_LOSS"]=True
+            last_signal_ts=ot.get("last_signal_ts",ot["entry_ts"])
+            if ts-last_signal_ts>=SIGNAL_DECAY_MIN*60: exit_candidates["SIGNAL_DECAY"]=True
+            if score>=5 or state in("CONFIRMED_TREND","ACCELERATION"): ot["last_signal_ts"]=ts
+            close_reason,all_triggered=resolve_exit_reason(exit_candidates)
             if close_reason:
-                exit_price=cur_price or ot.get("last_price"); src="live" if cur_price else "last_seen"
-                close_trade(ot,sym,ts,exit_price,close_reason,state,price_full,exit_price_source=src)
+                exit_price=cur_price or ot.get("last_price")
+                src="live" if cur_price else "last_seen"
+                close_trade(ot,sym,ts,exit_price,close_reason,state,price_full,exit_price_source=src,exit_candidates=all_triggered,lifecycle_complete=True)
+                cooldown_min=COOLDOWN_BY_EXIT_REASON.get(close_reason,0)
+                if cooldown_min>0: lifecycle_state[sym]={"cooldown_until":ts+cooldown_min*60,"idea_first_seen_ts":lifecycle_state.get(sym,{}).get("idea_first_seen_ts")}
             else:
-                ot=dict(ot)
                 if cur_price:
-                    ot["last_price"]=cur_price; ot["last_price_ts"]=ts; ep=ot.get("entry_price")
+                    ot["last_price"]=cur_price
+                    ot["last_price_ts"]=ts
+                    ep=ot.get("entry_price")
                     if ep:
                         pnl_now=(cur_price-ep)/ep*100
                         if pnl_now>ot.get("max_pnl_pct",0.0): ot["max_pnl_pct"]=pnl_now; ot["peak_ts"]=ts
                         if pnl_now<ot.get("min_pnl_pct",0.0): ot["min_pnl_pct"]=pnl_now
-                _fill_horizons(ot,sym,ts,price_full); new_ot,new_tid=ot,tid
+                    ot["data_quality"]["max_price_age_min"]=max(ot["data_quality"]["max_price_age_min"],0)
+                else:
+                    ot["data_quality"]["missing_snapshots"]+=1
+                    age=round((ts-ot.get("last_price_ts",ts))/60,1)
+                    ot["data_quality"]["max_price_age_min"]=max(ot["data_quality"]["max_price_age_min"],age)
+                _fill_horizons(ot,sym,ts,price_full)
+                new_ot,new_tid=ot,tid
         else:
             if state in ENTRY_STATES and cur_price:
-                new_tid=f"{sym}_{ts}"
-                new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,existing.get("first_seen",ts),existing.get("snapshots",0)+1,cur_price)
-                log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
-        entry={"state":state,"previous_state":prev_state,"action":ACTIONS.get(state,""),"confidence":conf,
-               "score":score,"momentum":momentum,"pattern":pattern,"name":r.get("name",sym),
-               "first_seen":existing.get("first_seen",ts),"last_seen":ts,"snapshots":existing.get("snapshots",0)+1,
-               "missed_runs":0,"neutral_runs":0,"entry_earliness":round(early_val,2),
-               "reasons":reasons,"warnings":warnings,"mom_tags":mom_tags}
-        if new_ot is not None: entry["open_trade"]=new_ot; entry["trade_id"]=new_tid
+                cooldown_info=lifecycle_state.get(sym,{})
+                if cooldown_info.get("cooldown_until",0)>ts:
+                    log.info(f"[{sym}] COOLDOWN активен, пропускаем вход")
+                else:
+                    idea_first_seen_ts=cooldown_info.get("idea_first_seen_ts")
+                    if idea_first_seen_ts is None and state in("ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION"):
+                        idea_first_seen_ts=ts
+                    new_tid=f"{sym}_{ts}"
+                    new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,existing.get("snapshots",0)+1,cur_price)
+                    log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
+        idea_first_seen=lifecycle_state.get(sym,{}).get("idea_first_seen_ts")
+        if idea_first_seen is None and state in("ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION"):
+            idea_first_seen=ts
+            lifecycle_state[sym]={"idea_first_seen_ts":idea_first_seen}
+        entry={
+            "state":state,"previous_state":prev_state,
+            "action":ACTIONS.get(state,""),
+            "confidence":conf,"score":score,"momentum":momentum,
+            "pattern":pattern,"name":r.get("name",sym),
+            "first_seen":existing.get("first_seen",ts),"last_seen":ts,
+            "snapshots":existing.get("snapshots",0)+1,
+            "missed_runs":0,"neutral_runs":0,
+            "entry_earliness":round(early_val,2),
+            "reasons":reasons,"warnings":warnings,"mom_tags":mom_tags,
+        }
+        if new_ot is not None:
+            entry["open_trade"]=new_ot
+            entry["trade_id"]=new_tid
         wl_all[sym]=entry
         cur={**r,"score":score,"pros":pros,"cons":cons,"derived":derived,"momentum":momentum,"pattern":pattern}
         if state!=prev_state:
             log.info(f"[{sym}] {prev_state} → {state} | {reasons}")
             if state in TG_STATES:
-                append_jsonl(CALIBRATION_FILE,{"ts":ts,"symbol":sym,"state":state,"oi_accel":round(derived["oi_accel"],3),
-                    "cvd_momentum":round(derived["cvd_momentum"],2),"price_accel":round(derived["price_accel"],3),
-                    "funding_pressure":round(derived["funding_pressure"],5),"oi_trend":derived["oi_trend"],
-                    "cvd_trend":derived["cvd_trend"],"score":score,"momentum":momentum,"confidence":conf,
-                    "signal_logic_version":SIGNAL_LOGIC_VERSION})
-                llm_res=llm_verify(sym,wl_all[sym],cur,hist); msg=format_signal(sym,wl_all[sym],cur,hist,reasons,warnings,market)
+                append_jsonl(CALIBRATION_FILE,{
+                    "ts":ts,"symbol":sym,"state":state,
+                    "oi_accel":round(derived["oi_accel"],3),
+                    "cvd_momentum":round(derived["cvd_momentum"],2),
+                    "price_accel":round(derived["price_accel"],3),
+                    "funding_pressure":round(derived["funding_pressure"],5),
+                    "oi_trend":derived["oi_trend"],"cvd_trend":derived["cvd_trend"],
+                    "score":score,"momentum":momentum,"confidence":conf,
+                    "signal_logic_version":SIGNAL_LOGIC_VERSION,
+                })
+                llm_res=llm_verify(sym,wl_all[sym],cur,hist)
+                msg=format_signal(sym,wl_all[sym],cur,hist,reasons,warnings,market)
                 if llm_res:
-                    agree="✅" if llm_res.get("agree") is True else "❌"; risk=llm_res.get("risk","?"); reason=llm_res.get("reason","")
+                    agree="✅" if llm_res.get("agree") is True else "❌"
+                    risk=llm_res.get("risk","?")
+                    reason=llm_res.get("reason","")
                     msg+=f"\n🤖 {agree} {esc(risk)} · {esc(reason)}"
                 send_tg(msg)
     for sym in list(wl_all.keys()):
         if sym in current_symbols: continue
-        missed=wl_all[sym].get("missed_runs",0)+1; wl_all[sym]["missed_runs"]=missed; wl_all[sym]["last_seen"]=ts
+        missed=wl_all[sym].get("missed_runs",0)+1
+        wl_all[sym]["missed_runs"]=missed
+        wl_all[sym]["last_seen"]=ts
         stage=wl_all[sym]["state"]
         if stage in ACTIVE_STATES and missed==MISS_EXIT_RUNS:
-            log.info(f"[{sym}] выпала {missed} прогона → пауза")
-            send_tg(f"⏸ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\nНаблюдение на паузе ({esc(stage)})\nВыпала из discovery-фильтра {missed} прогона подряд\n<i>Стадия сохранена.</i>\n")
+            log.info(f"[{sym}] выпала из фильтра {missed} прогона → пауза")
+            send_tg(f"⏸ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\nНаблюдение на паузе ({esc(stage)})\nВыпала из discovery-фильтра {missed} прогона подряд\n<i>Стадия сохранена — при возврате пересчитается.</i>\n")
         if missed>=MISS_REMOVE_RUNS:
             ot=wl_all[sym].get("open_trade")
-            if ot: close_trade(ot,sym,ts,ot.get("last_price"),"MISSED",stage,price_full,exit_price_source="last_seen")
-            log.info(f"[{sym}] нет {missed} прогонов → remove"); del wl_all[sym]
-    flush_pending(price_full,ts,existing_trade_ids); save_pending(PENDING); save_watchlist(wl_all)
+            if ot:
+                close_trade(ot,sym,ts,ot.get("last_price"),"MISSED",stage,price_full,exit_price_source="last_seen",exit_candidates=["MISSED"],lifecycle_complete=False)
+            log.info(f"[{sym}] нет в данных {missed} прогонов → remove")
+            if sym in lifecycle_state: del lifecycle_state[sym]
+            del wl_all[sym]
+    flush_pending(price_full,ts,existing_trade_ids)
+    save_pending(PENDING)
+    save_watchlist(wl_all)
+    save_lifecycle_state(lifecycle_state)
     for r in rows:
         if passes_filter(r):
-            sc,pr,co=calculate_score(r); append_jsonl(SNAPSHOTS_FILE,{**r,"score":sc,"pros":pr,"cons":co})
-    cleanup_jsonl(MARKET_HISTORY_FILE,MARKET_TTL_DAYS); cleanup_jsonl(SNAPSHOTS_FILE,SNAPSHOTS_TTL_DAYS)
-    cleanup_jsonl(HEARTBEAT_FILE,HEARTBEAT_TTL_DAYS); cleanup_jsonl(CALIBRATION_FILE,SNAPSHOTS_TTL_DAYS)
+            sc,pr,co=calculate_score(r)
+            append_jsonl(SNAPSHOTS_FILE,{**r,"score":sc,"pros":pr,"cons":co})
+    cleanup_jsonl(MARKET_HISTORY_FILE,MARKET_TTL_DAYS)
+    cleanup_jsonl(SNAPSHOTS_FILE,SNAPSHOTS_TTL_DAYS)
+    cleanup_jsonl(HEARTBEAT_FILE,HEARTBEAT_TTL_DAYS)
+    cleanup_jsonl(CALIBRATION_FILE,SNAPSHOTS_TTL_DAYS)
     open_n=sum(1 for v in wl_all.values() if v.get("open_trade"))
-    log.info(f"═══ Готово. Active: {len(wl_all)} · open: {open_n} · pending: {len(PENDING)} ═══")
+    log.info(f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} · pending: {len(PENDING)} ═══")
 
 if __name__=="__main__":
     try: run()
     except Exception as e:
-        log.exception(f"Фатал: {e}"); send_tg(f"⚠️ <b>Monitor</b>\n{esc(str(e)[:500])}"); sys.exit(1)
+        log.exception(f"Фатал: {e}")
+        send_tg(f"⚠️ <b>Monitor</b>\n{esc(str(e)[:500])}")
+        sys.exit(1)
