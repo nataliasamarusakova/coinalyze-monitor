@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает верный параметр пагинации (&p=N).
+Поддерживает глубокий скроллинг всех монет первой страницы и умную пагинацию.
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Browser, Page
@@ -196,7 +196,7 @@ class CoinalyzeScraper:
             cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
         ctx.add_cookies(cookies)
 
-    def _load(self, url: str) -> str:
+    def _load(self, url: str) -> Tuple[str, bool]:
         page = self._page
         log.info(f"🌐 Загружаем URL: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=50_000)
@@ -208,29 +208,50 @@ class CoinalyzeScraper:
 
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # Прокрутка текущей страницы
+        # ═══════════════════════════════════════════════════════════
+        # ГЛУБОКИЙ СКТРОЛЛИНГ С НАЖАТИЕМ КЛАВИШ (ДО 30 ШАГОВ)
+        # ═══════════════════════════════════════════════════════════
+        log.info("📜 Начинаем глубокий скроллинг страницы...")
         prev_count = 0
         no_change = 0
 
-        for step in range(1, 15):
-            page.mouse.wheel(0, 2000)
-            page.evaluate("window.scrollBy(0, 2000)")
-            page.wait_for_timeout(1000)
+        for step in range(1, 30):
+            # Прокрутка через JS, колесо мыши и клавиши
+            page.mouse.wheel(0, 3000)
+            page.keyboard.press("PageDown")
+            page.keyboard.press("End")
+            page.evaluate("window.scrollBy(0, 2500)")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+            # Даем 2.0 секунды на AJAX подгрузку строк
+            page.wait_for_timeout(2000)
 
             cur_count = len(page.query_selector_all("tbody tr"))
+            log.info(f"   [Скролл #{step}] Загружено строк в DOM: {cur_count}")
+
             if cur_count == prev_count:
                 no_change += 1
-                if no_change >= 2:
+                if no_change >= 5:  # Ждем 5 шагов (10 секунд без изменений)
+                    log.info(f"✅ Скроллинг завершен на шаге {step}. Всего строк: {cur_count}")
                     break
             else:
                 no_change = 0
                 prev_count = cur_count
 
         rows = page.query_selector_all("tbody tr")
-        log.info(f"📊 [Playwright] Строк на текущей странице: {len(rows)}")
+        log.info(f"📊 [Playwright] Итого строк на текущей странице: {len(rows)}")
 
         full_html = page.content()
-        return full_html
+
+        # Проверяем, есть ли на странице пагинация
+        soup = BeautifulSoup(full_html, "html.parser")
+        has_pagination = bool(
+            soup.select_one(".pagination") 
+            or soup.select("a[href*='p=']") 
+            or soup.select("a[href*='page=']")
+        )
+
+        return full_html, has_pagination
 
     def fetch_all(self) -> list[dict]:
         all_rows: list[dict] = []
@@ -249,9 +270,6 @@ class CoinalyzeScraper:
         base_url = COINALYZE_URL
 
         for page_num in range(1, self.max_pages + 1):
-            # ═══════════════════════════════════════════════════════════
-            # ИСПОЛЬЗУЕМ ВЕРНЫЙ ПАРАМЕТР ПАГИНАЦИИ &p=N (ВМЕСТО &page=N)
-            # ═══════════════════════════════════════════════════════════
             if page_num == 1:
                 url = base_url
             else:
@@ -260,7 +278,7 @@ class CoinalyzeScraper:
 
             log.info(f"\n📑 === ЗАГРУЗКА СТРАНИЦЫ #{page_num} ({url}) ===")
             try:
-                html_text = self._load(url)
+                html_text, has_pagination = self._load(url)
                 if self.debug and page_num == 1:
                     DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
 
@@ -268,16 +286,20 @@ class CoinalyzeScraper:
                 new_added = add_rows(parsed_page)
                 log.info(f"🏁 Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}")
 
-                # Если на новой странице 0 новых монет — все монеты собраны
+                # Если пагинация отсутствует на сайте или монеты перестали добавляться — завершаем
+                if not has_pagination:
+                    log.info("ℹ️ Пагинация на странице отсутствует (все монеты находятся на одной странице). Сбор завершен.")
+                    break
+
                 if new_added == 0:
-                    log.info(f"✅ Все данные собраны (на странице #{page_num} нет новых монет). Завершаем сбор.")
+                    log.info(f"✅ На странице #{page_num} нет новых монет. Завершаем сбор.")
                     break
 
             except Exception as e:
                 log.error(f"❌ Ошибка при загрузке страницы #{page_num}: {e}")
                 break
 
-        log.info(f"\n🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО СО ВСЕХ СТРАНИЦ: {len(all_rows)}")
+        log.info(f"\n🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО: {len(all_rows)}")
         if all_rows:
             sample = all_rows[0]
             log.info(f"📋 Пример первой монеты: symbol={sample.get('symbol')}, name={sample.get('name')}, price={sample.get('price')}")
