@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает вывод первой и последней монеты в итоговых логах.
+Содержит полный дамп содержимого <tbody> в логи для детального аудита каждого TR.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ log = logging.getLogger("coinalyze_loader")
 
 BASE = Path(__file__).resolve().parent
 DEBUG_HTML_FILE = BASE / "debug_page.html"
+DEBUG_TBODY_FILE = BASE / "debug_tbody.html"
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
@@ -105,11 +106,28 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
 def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
     ts = ts or time.time()
     soup = BeautifulSoup(html_text, "html.parser")
-    rows = soup.select("tbody tr")
+    tbody = soup.select_one("tbody")
     
-    log.info(f"📊 [PARSER] Найдено тегов `tbody tr`: {len(rows)} шт.")
-    if not rows:
-        rows = soup.select("tr")
+    # ═══════════════════════════════════════════════════════════
+    # ДАМП ВСЕГО TBODY В ЛОГИ ДЛЯ ПРОВЕРКИ СТРОК
+    # ═══════════════════════════════════════════════════════════
+    if tbody:
+        tbody_html = str(tbody)
+        DEBUG_TBODY_FILE.write_text(tbody_html, encoding="utf-8")
+        log.info(f"💾 [DEBUG] Фрагмент <tbody> сохранен в {DEBUG_TBODY_FILE.name} ({len(tbody_html)} байт)")
+
+        tr_elements = tbody.find_all("tr")
+        log.info("=" * 70)
+        log.info(f"🔥 [TBODY DUMP] Найдено {len(tr_elements)} строк <tr> внутри <tbody>:")
+        log.info("=" * 70)
+        for idx, tr in enumerate(tr_elements, start=1):
+            coin_attr = tr.get("data-coin", "NO_DATA_COIN")
+            tds_in_tr = tr.find_all(["td", "th"])
+            cell_preview = [td.get_text(strip=True)[:18] for td in tds_in_tr[:4]]
+            log.info(f"  TR #{idx:03d} | data-coin={coin_attr:<10} | td_count={len(tds_in_tr):<2} | cells={cell_preview}")
+        log.info("=" * 70)
+
+    rows = soup.select("tbody tr") if tbody else soup.select("tr")
 
     out = []
     for idx, tr in enumerate(rows, start=1):
@@ -145,13 +163,6 @@ def parse_table(html_text: str, ts: Optional[float] = None) -> list[dict]:
             "lls24": get_td(tds, 22),
         }
         out.append(rec)
-
-        if idx in (1, 2, len(rows)):
-            log.info(
-                f"   [Строка #{idx:03d}] symbol={symbol:<8} name={name:<25} "
-                f"price={str(rec['price']):<10} volume24={str(rec['volume24']):<14} "
-                f"oi={str(rec['oi']):<14}"
-            )
 
     log.info(f"✅ [PARSER] Успешно распарсено записей: {len(out)}/{len(rows)}")
     return out
@@ -350,10 +361,7 @@ class CoinalyzeScraper:
         log.info(f"\n==================================================")
         log.info(f"🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО: {len(all_rows)}")
         log.info(f"==================================================")
-        
-        # ═══════════════════════════════════════════════════════════
-        # ВЫВОД ПЕРВОЙ И ПОСЛЕДНЕЙ МОНЕТЫ В ЛОГИ
-        # ═══════════════════════════════════════════════════════════
+
         if all_rows:
             first_coin = all_rows[0]
             last_coin = all_rows[-1]
