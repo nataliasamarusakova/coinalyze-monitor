@@ -200,6 +200,31 @@ def _load_page(page, url):
 
     return html_text
 
+def click_next_page(page, current_page_num):
+    """Фолбэк: кликаем по номеру страницы в .pagination, если href не найдены."""
+    pag = page.query_selector(".pagination")
+    if not pag:
+        return False
+    first_row = page.query_selector("tbody tr")
+    before = first_row.get_attribute("data-coin") if first_row else None
+    target = None
+    for el in pag.query_selector_all("a, button, li"):
+        if (el.inner_text() or "").strip() == str(current_page_num + 1):
+            target = el
+            break
+    if target is None:
+        target = pag.query_selector("[aria-label='Next'], .next, a[rel='next']")
+    if target is None:
+        return False
+    target.click()
+    page.wait_for_timeout(1500)
+    for _ in range(10):
+        first_row = page.query_selector("tbody tr")
+        after = first_row.get_attribute("data-coin") if first_row else None
+        if after and after != before:
+            return True
+        page.wait_for_timeout(500)
+    return False
 
 def get_page_urls(html_text):
     """Парсит блок .pagination и возвращает список URL всех страниц."""
