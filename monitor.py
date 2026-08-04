@@ -207,9 +207,6 @@ def fetch_data() -> list[dict]:
             # Первая страница
             html_text = _load_page(page, COINALYZE_URL)
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-            
-            log.warning(page.content())
-            
             rows = parse_table(html_text)
             all_rows.extend(rows)
             for r in rows:
