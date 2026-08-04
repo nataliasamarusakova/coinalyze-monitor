@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик данных с Coinalyze.
-Включает диагностику количества колонок для отладки JS-рендеринга.
+Диагностика: 23-я колонка, полный URL, HTML пагинации, сырые href.
 """
 from __future__ import annotations
 
@@ -40,13 +40,13 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
-# ВАЖНО: URL склеен плотно, без пробелов, чтобы сервер применил фильтры
 COINALYZE_URL = (
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
+
 
 # ─────────────────────────── парсинг чисел / таблицы ───────────────────────────
 
@@ -145,6 +145,7 @@ class CoinalyzeScraper:
     @staticmethod
     def _add_cookies(ctx):
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
+            log.warning("⚠️ Куки не установлены: COINALYZE_P_SID и COINALYZE_CHAT_SID пусты. Сайт может отдать дефолтную таблицу.")
             return
         cookies = []
         if COINALYZE_P_SID:
@@ -156,6 +157,7 @@ class CoinalyzeScraper:
         cookies.append({"name": "cookies_accepted", "value": "1",
                          "domain": "coinalyze.net", "path": "/", "secure": True})
         ctx.add_cookies(cookies)
+        log.info(f"✅ Куки установлены: p_sid={'есть' if COINALYZE_P_SID else 'нет'}, chat_sid={'есть' if COINALYZE_CHAT_SID else 'нет'}")
 
     # ───────── загрузка одной страницы ─────────
 
@@ -168,21 +170,58 @@ class CoinalyzeScraper:
             log.warning("Cloudflare, waiting...")
             page.wait_for_timeout(10_000)
 
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Ждем именно 23-ю колонку, а не просто tr.
-        # Это заставляет Playwright ждать, пока JS Coinalyze не перестроит таблицу
-        # и не применит фильтры из URL.
+        # Ждём 23-ю колонку (кастомная таблица после применения JS-фильтров)
         try:
             page.wait_for_selector("tbody tr td:nth-child(23)", timeout=15_000)
             log.info("✅ Найдена 23-я колонка (таблица успешно перестроена JS)")
         except Exception:
             log.warning("⚠️ 23-я колонка не найдена за 15с. JS не успел или фильтры не применились.")
-            # Фолбэк: ждем хотя бы обычные строки
             page.wait_for_selector("tbody tr", timeout=10_000)
 
+        # === ДИАГНОСТИКА ПАГИНАЦИИ ===
+        pagination_found = False
         try:
             page.wait_for_selector(".pagination", timeout=10_000)
+            pagination_found = True
+            log.info("✅ Блок .pagination найден в DOM")
+
+            # Получаем элемент пагинации
+            pag_el = page.query_selector(".pagination")
+            if pag_el:
+                pag_html = pag_el.evaluate("el => el.outerHTML")
+                # Сохраняем полный HTML пагинации в файл
+                DEBUG_PAGINATION_FILE.write_text(pag_html, encoding="utf-8")
+                log.info(f"💾 Полный HTML пагинации сохранён в {DEBUG_PAGINATION_FILE.name} ({len(pag_html)} символов)")
+
+                # Выводим превью в лог (первые 800 символов)
+                preview = pag_html[:800].replace("\n", " ").replace("  ", " ")
+                log.info(f"📋 Пагинация (превью, первые 800 симв.): {preview}...")
+
+                # Собираем ВСЕ href и text из ссылок
+                links = pag_el.query_selector_all("a")
+                log.info(f"🔗 Всего <a> внутри .pagination: {len(links)}")
+                for i, a in enumerate(links):
+                    href = a.get_attribute("href") or ""
+                    text = (a.inner_text() or "").strip()
+                    aria = a.get_attribute("aria-label") or ""
+                    classes = a.get_attribute("class") or ""
+                    log.info(f"   [{i}] href='{href}' text='{text}' aria='{aria}' class='{classes}'")
+
+                # Также ищем button и li
+                buttons = pag_el.query_selector_all("button")
+                if buttons:
+                    log.info(f"🔘 <button> внутри .pagination: {len(buttons)}")
+                    for b in buttons:
+                        log.info(f"   button: text='{(b.inner_text() or '').strip()}' class='{b.get_attribute('class') or ''}'")
+
+                lis = pag_el.query_selector_all("li")
+                if lis:
+                    log.info(f"📍 <li> внутри .pagination: {len(lis)}")
+                    for li in lis:
+                        log.info(f"   li: text='{(li.inner_text() or '').strip()[:60]}' class='{li.get_attribute('class') or ''}'")
         except Exception:
-            log.info("Блок .pagination не найден (все монеты на одной странице)")
+            log.info("ℹ️ Блок .pagination не найден за 10с (возможно, все монеты на одной странице)")
+        # =============================
 
         # Скроллим для подгрузки всех строк (ленивая отрисовка)
         prev_count = 0
@@ -198,29 +237,26 @@ class CoinalyzeScraper:
 
         rows = page.query_selector_all("tbody tr[data-coin]") or page.query_selector_all("tbody tr")
         row_count = len(rows)
-        
-        # === ДИАГНОСТИКА ===
+
+        # === ДИАГНОСТИКА КОЛОНОК ===
         log.info(f"🔗 Полный URL: {url}")
-        
+
         if row_count > 0:
             first_row = rows[0]
             tds = first_row.query_selector_all("td")
             log.info(f"🔍 В первой строке таблицы найдено КОЛОНОК (td): {len(tds)}")
-            
+
             if len(tds) < 23:
                 log.warning(f"⚠️ ВНИМАНИЕ: Таблица имеет {len(tds)} колонок, а парсер требует >= 23.")
                 log.warning(f"⚠️ Все {row_count} строк будут отброшены функцией parse_table!")
-                # Сохраняем HTML для ручного анализа
                 Path(BASE / "debug_first_row.html").write_text(first_row.inner_html(), encoding="utf-8")
                 log.info(f"💾 HTML первой строки сохранен в {BASE / 'debug_first_row.html'}")
         else:
             log.warning("❌ В таблице вообще нет строк! Возможно, Cloudflare.")
-        # ===================
+        # ==========================
 
-        has_pagination = page.query_selector(".pagination") is not None
-        log.info(f"Итог: строк={row_count}, пагинация={'есть' if has_pagination else 'нет'}")
+        log.info(f"Итог: строк={row_count}, пагинация={'есть' if pagination_found else 'нет'}")
 
-        # Берем innerHTML body, чтобы захватить динамически подгруженный контент
         return page.inner_html("body")
 
     # ───────── пагинация: href (быстрый путь) ─────────
@@ -230,18 +266,28 @@ class CoinalyzeScraper:
         soup = BeautifulSoup(html_text, "lxml")
         pagination = soup.select_one(".pagination")
         if not pagination:
+            log.info("ℹ️ .pagination не найден в HTML — возвращаем только базовый URL")
             return [COINALYZE_URL]
+
         urls = [COINALYZE_URL]
+        raw_hrefs = []
         for a in pagination.select("a[href]"):
             href = a.get("href", "")
             if not href:
                 continue
+            raw_hrefs.append(href)
             full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
             if full_url not in urls:
                 urls.append(full_url)
+
+        log.info(f"🔗 Сырые href из BeautifulSoup ({len(raw_hrefs)} шт.): {raw_hrefs}")
+        log.info(f"🔗 Итоговые URL для загрузки ({len(urls)} шт.):")
+        for i, u in enumerate(urls):
+            log.info(f"   [{i}] {u}")
+
         return urls[:MAX_PAGES]
 
-    # ───────── пагинация: клики (фолбэк, если href не найден) ─────────
+    # ───────── пагинация: клики (фолбэк) ─────────
 
     def _click_next_page(self, current_page_num: int) -> bool:
         page = self._page
@@ -275,14 +321,7 @@ class CoinalyzeScraper:
         if not self.debug:
             return
         DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-        soup = BeautifulSoup(html_text, "lxml")
-        pag = soup.select_one(".pagination")
-        if pag:
-            DEBUG_PAGINATION_FILE.write_text(pag.prettify(), encoding="utf-8")
-            log.info(
-                f"debug: a[href]={len(pag.select('a[href]'))} "
-                f"button={len(pag.select('button'))} li={len(pag.select('li'))}"
-            )
+        log.info(f"💾 Полный HTML страницы сохранён в {DEBUG_HTML_FILE.name} ({len(html_text)} символов)")
 
     # ───────── публичный метод ─────────
 
@@ -335,7 +374,7 @@ class CoinalyzeScraper:
         return all_rows
 
 
-# ─────────────────────────── самостоятельный запуск для теста ───────────────────────────
+# ─────────────────────────── самостоятельный запуск ───────────────────────────
 
 def main():
     with CoinalyzeScraper() as scraper:
