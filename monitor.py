@@ -202,13 +202,11 @@ def _load_page(page, url):
 
 
 def get_page_urls(html_text):
-    """Парсит блок .pagination и возвращает список URL всех страниц.
-    Если пагинации нет — возвращает только базовый URL."""
+    """Парсит блок .pagination и возвращает список URL всех страниц."""
     soup = BeautifulSoup(html_text, "lxml")
     pagination = soup.select_one(".pagination")
     if not pagination:
         return [COINALYZE_URL]
-
     urls = [COINALYZE_URL]
     for a in pagination.select("a[href]"):
         href = a.get("href", "")
@@ -217,7 +215,6 @@ def get_page_urls(html_text):
         full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
         if full_url not in urls:
             urls.append(full_url)
-
     return urls[:MAX_PAGES]
 
 def parse_table(html_text):
