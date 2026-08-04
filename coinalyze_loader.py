@@ -1,6 +1,6 @@
 """
 coinalyze_loader.py — загрузчик с Coinalyze.
-Поддерживает пошаговую подгрузку всех монет через имитацию скролла.
+Поддерживает пошаговую прокрутку и гарантию обхода всех страниц пагинации (&page=N).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ DEBUG_HTML_FILE = BASE / "debug_page.html"
 
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "10"))  # Проверяем до 10 страниц
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 DEBUG = os.environ.get("DEBUG", "true").lower() == "true"
 
@@ -183,6 +183,7 @@ class CoinalyzeScraper:
 
     @staticmethod
     def _add_cookies(ctx):
+        log.info(f"🔑 P_SID: {'SET' if COINALYZE_P_SID else 'EMPTY'}, CHAT_SID: {'SET' if COINALYZE_CHAT_SID else 'EMPTY'}")
         if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
             log.warning("⚠️ Куки не установлены!")
             return
@@ -207,81 +208,29 @@ class CoinalyzeScraper:
 
         page.wait_for_selector("tbody tr", timeout=25_000)
 
-        # ═══════════════════════════════════════════════════════════
-        # ПОШАГОВАЯ ПРОКРУТКА ДЛЯ ПОДГРУЗКИ ВСЕХ СТРОК (LAZY LOADING)
-        # ═══════════════════════════════════════════════════════════
-        log.info("📜 Начинаем пошаговую прокрутку таблицы...")
+        # Прокрутка текущей страницы для подгрузки ячеек
         prev_count = 0
         no_change = 0
 
-        for step in range(1, 25):  # До 25 шагов скроллинга
-            # 1. Крутим колесо мыши и окно вниз
+        for step in range(1, 15):
             page.mouse.wheel(0, 2000)
             page.evaluate("window.scrollBy(0, 2000)")
-
-            # 2. Также прокручиваем внутренние div-контейнеры с сайдбаром/таблицей
-            page.evaluate("""
-                document.querySelectorAll('div, section, main').forEach(el => {
-                    if (el.scrollHeight > el.clientHeight) {
-                        el.scrollTop += 2000;
-                    }
-                });
-            """)
-
-            # 3. Даем 1.5 сек на подгрузку новых монет по JS/AJAX
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1000)
 
             cur_count = len(page.query_selector_all("tbody tr"))
-            log.info(f"   [Скролл #{step}] Загружено строк: {cur_count}")
-
             if cur_count == prev_count:
                 no_change += 1
-                if no_change >= 3:  # Если 3 раза подряд новых монет нет — дошли до конца
-                    log.info(f"✅ Достигнут конец таблицы на шаге {step}.")
+                if no_change >= 2:
                     break
             else:
                 no_change = 0
                 prev_count = cur_count
 
-        # Возвращаем прокрутку наверх
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(500)
-
         rows = page.query_selector_all("tbody tr")
-        log.info(f"📊 [Playwright] Всего найдено `tbody tr` элементов после скролла: {len(rows)}")
+        log.info(f"📊 [Playwright] Строк на текущей странице: {len(rows)}")
 
         full_html = page.content()
         return full_html
-
-    @staticmethod
-    def _get_page_urls(html_text: str, base_url: str) -> list[str]:
-        soup = BeautifulSoup(html_text, "html.parser")
-        urls = [base_url]
-
-        pagination = (
-            soup.select_one(".pagination")
-            or soup.select_one("ul.pagination")
-            or soup.select_one(".paging")
-            or soup.select_one("[class*='pagination']")
-        )
-
-        if pagination:
-            for a in pagination.select("a[href]"):
-                href = a.get("href", "").strip()
-                if not href or href == "#":
-                    continue
-                full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
-                if full_url not in urls:
-                    urls.append(full_url)
-        else:
-            page_links = soup.select("a[href*='page=']")
-            for a in page_links:
-                href = a.get("href", "").strip()
-                full_url = f"https://coinalyze.net{href}" if href.startswith("/") else href
-                if full_url not in urls:
-                    urls.append(full_url)
-
-        return urls[:MAX_PAGES]
 
     def fetch_all(self) -> list[dict]:
         all_rows: list[dict] = []
@@ -297,33 +246,39 @@ class CoinalyzeScraper:
                     new += 1
             return new
 
-        html_text = self._load(COINALYZE_URL)
-        if self.debug:
-            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+        base_url = COINALYZE_URL
 
-        parsed = parse_table(html_text)
-        new_added = add_rows(parsed)
-        log.info(f"🏁 Страница 1: распарсено={len(parsed)}, добавлено_новых={new_added}")
+        for page_num in range(1, self.max_pages + 1):
+            # Формируем URL для следующей страницы
+            sep = "&" if "?" in base_url else "?"
+            if page_num == 1:
+                url = base_url
+            else:
+                url = f"{base_url}{sep}page={page_num}"
 
-        urls = self._get_page_urls(html_text, COINALYZE_URL)
-        if len(urls) > 1:
-            log.info(f"📄 Найдено дополнительных страниц (пагинация): {len(urls) - 1}")
-            for i, url in enumerate(urls[1:], start=2):
-                try:
-                    log.info(f"🔄 Загрузка страницы {i}/{len(urls)}...")
-                    html_text = self._load(url)
-                    parsed_page = parse_table(html_text)
-                    new_count = add_rows(parsed_page)
-                    log.info(f"Страница {i}: распарсено={len(parsed_page)}, +{new_count} новых монет")
-                    if new_count == 0:
-                        break
-                except Exception as e:
-                    log.error(f"❌ Ошибка на странице {i}: {e}")
+            log.info(f"\n📑 === ЗАГРУЗКА СТРАНИЦЫ #{page_num} ===")
+            try:
+                html_text = self._load(url)
+                if self.debug and page_num == 1:
+                    DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
 
-        log.info(f"🎉 ИТОГО уникальных монет сохраненено: {len(all_rows)}")
+                parsed_page = parse_table(html_text)
+                new_added = add_rows(parsed_page)
+                log.info(f"🏁 Страница #{page_num}: распарсено={len(parsed_page)}, добавлено_новых={new_added}")
+
+                # Если на новой странице нет НИ ОДНОЙ новой монеты — мы дошли до конца
+                if new_added == 0:
+                    log.info(f"✅ Достигнут конец данных (на странице #{page_num} нет новых монет). Завершаем сбор.")
+                    break
+
+            except Exception as e:
+                log.error(f"❌ Ошибка при загрузке страницы #{page_num}: {e}")
+                break
+
+        log.info(f"\n🎉 ИТОГО УНИКАЛЬНЫХ МОНЕТ СОБРАНО СО ВСЕХ СТРАНИЦ: {len(all_rows)}")
         if all_rows:
             sample = all_rows[0]
-            log.info(f"📋 Пример: symbol={sample.get('symbol')}, name={sample.get('name')}, price={sample.get('price')}")
+            log.info(f"📋 Пример первой монеты: symbol={sample.get('symbol')}, name={sample.get('name')}, price={sample.get('price')}")
         return all_rows
 
 
