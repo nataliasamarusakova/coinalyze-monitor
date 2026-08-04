@@ -1,4 +1,4 @@
- 
+--- coinalyze_loader.py (原始)
 """
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
 Отдаёт готовый список монет (list[dict]), пригодный для использования в monitor.py.
@@ -331,6 +331,7 @@ if __name__ == "__main__":
     main()
 
 +++ coinalyze_loader.py (修改后)
+from __future__ import annotations
 """
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
 Отдаёт готовый список монет (list[dict]), пригодный для использования в monitor.py.
@@ -340,7 +341,6 @@ browser.py — модуль браузера (Playwright) для scraping coinal
     HEADLESS=false python browser.py      # с видимым окном браузера
     DEBUG=true python browser.py          # + сохранить debug_page.html / debug_pagination.html
 """
-from __future__ import annotations
 
 import os
 import json
