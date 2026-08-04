@@ -195,11 +195,59 @@ def parse_table(html_text):
     if range_violations: log.warning(f"parse_table: {range_violations} подозрительных строк")
     return out
 
-def fetch_data():
-    html_text=fetch_html(); DEBUG_HTML_FILE.write_text(html_text,encoding="utf-8")
-    rows=parse_table(html_text)
-    if not rows: send_tg("⚠️ <b>Monitor</b>\nДанные не получены."); sys.exit(1)
-    return rows
+def fetch_data() -> list[dict]:
+    """Загружает все страницы пагинации, возвращает список всех монет.
+    Один браузер на все страницы. Дедупликация по symbol."""
+    all_rows = []
+    seen_symbols = set()
+
+    with sync_playwright() as p:
+        browser, page = _setup_browser_context(p)
+        try:
+            # Первая страница
+            html_text = _load_page(page, COINALYZE_URL)
+            DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
+            rows = parse_table(html_text)
+            all_rows.extend(rows)
+            for r in rows:
+                seen_symbols.add(r.get("symbol"))
+            log.info(f"Страница 1: {len(rows)} монет")
+
+            # Пагинация: парсим реальные URL из блока .pagination
+            page_urls = get_page_urls(html_text)
+            log.info(f"Пагинация: найдено {len(page_urls)} страниц")
+
+            # Загружаем остальные страницы (первую уже загрузили)
+            for i, page_url in enumerate(page_urls[1:], start=2):
+                try:
+                    html_text = _load_page(page, page_url)
+                    rows = parse_table(html_text)
+                    new_count = 0
+                    for r in rows:
+                        sym = r.get("symbol")
+                        if sym and sym not in seen_symbols:
+                            all_rows.append(r)
+                            seen_symbols.add(sym)
+                            new_count += 1
+                    log.info(f"Страница {i}: +{new_count} новых монет")
+                except Exception as e:
+                    log.error(f"Ошибка страницы {i} ({page_url}): {e}")
+                    continue
+        except Exception as e:
+            log.error(f"Загрузка: {e}")
+            try:
+                page.screenshot(path=str(BASE / "debug_screenshot.png"), full_page=True)
+            except Exception:
+                pass
+        finally:
+            browser.close()
+
+    if not all_rows:
+        send_tg("⚠️ <b>Monitor</b>\nДанные не получены. Проверь debug_page.html")
+        sys.exit(1)
+
+    log.info(f"Всего монет после пагинации: {len(all_rows)}")
+    return all_rows
 
 def append_jsonl(path,rec):
     with open(path,"a",encoding="utf-8") as f: f.write(json.dumps(rec,ensure_ascii=False)+"\n")
