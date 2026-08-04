@@ -2,6 +2,7 @@
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
 Вынесен из monitor.py для отдельного тестирования.
 Запуск: python browser.py
+Запуск с видимым окном локально: HEADLESS=false python browser.py
 """
 import os
 import logging
@@ -29,6 +30,7 @@ DEBUG_PAGINATION_FILE = BASE / "debug_pagination.html"
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 
 COINALYZE_URL = (
     "https://coinalyze.net/"
@@ -182,7 +184,7 @@ def click_next_page(page, current_page_num):
 
 
 def fetch_all_pages_via_click(page, max_pages=MAX_PAGES):
-    """Альтернативный сбор страниц через клики, без предположения о <a href>."""
+    """Собирает HTML всех страниц через клики, без предположения о <a href>."""
     htmls = [page.content()]
     for i in range(1, max_pages):
         ok = click_next_page(page, i)
@@ -197,23 +199,31 @@ def fetch_all_pages_via_click(page, max_pages=MAX_PAGES):
 
 def main():
     with sync_playwright() as p:
-        # headless=False — чтобы своими глазами увидеть, что происходит
-        browser, page = setup_browser_context(p, headless=False)
+        browser, page = setup_browser_context(p, headless=HEADLESS)
         try:
             html_text = load_page(page, COINALYZE_URL)
             DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
             dump_pagination_debug(html_text)
 
             urls = get_page_urls(html_text)
-            log.info(f"get_page_urls() нашёл {len(urls)} URL: {urls}")
+            log.info(f"get_page_urls() (парсинг href) нашёл {len(urls)} URL: {urls}")
 
-            log.info("Пробуем альтернативный способ — клики по пагинации...")
+            log.info("Собираем страницы через клики по .pagination...")
             htmls = fetch_all_pages_via_click(page, MAX_PAGES)
             log.info(f"Через клики получено {len(htmls)} страниц(ы)")
+
+            total_rows = 0
+            seen_symbols = set()
             for idx, h in enumerate(htmls, start=1):
                 soup = BeautifulSoup(h, "lxml")
                 rows = soup.select("tbody tr")
-                log.info(f"  Страница {idx}: {len(rows)} строк")
+                page_symbols = {tr.get("data-coin") for tr in rows if tr.get("data-coin")}
+                new_symbols = page_symbols - seen_symbols
+                seen_symbols |= page_symbols
+                total_rows += len(new_symbols)
+                log.info(f"  Страница {idx}: {len(rows)} строк, новых уникальных монет: {len(new_symbols)}")
+
+            log.info(f"ИТОГО уникальных монет собрано через клики: {total_rows}")
         finally:
             browser.close()
 
