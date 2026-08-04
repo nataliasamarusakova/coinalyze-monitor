@@ -1,4 +1,4 @@
---- coinalyze_loader.py (原始)
+ 
 """
 browser.py — модуль браузера (Playwright) для scraping coinalyze.net.
 Отдаёт готовый список монет (list[dict]), пригодный для использования в monitor.py.
