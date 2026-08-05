@@ -66,12 +66,15 @@ def _request(method: str, path: str, params: dict | None = None, signed: bool = 
 
 
 def to_bx_symbol(symbol: str) -> str:
-    if symbol in SYMBOL_MAP:
-        return SYMBOL_MAP[symbol]
-    s = symbol.strip().upper()
-    if s.endswith("USDT") and "-" not in s:
-        return s[:-4] + "-USDT"
-    return s
+    s = (symbol or "").strip().upper()
+    if s in SYMBOL_MAP:
+        return SYMBOL_MAP[s]
+    s = s.replace("-", "")
+    if s.endswith("USDT"):
+        s = s[:-4]
+    if not s:
+        return symbol
+    return f"{s}-USDT"
 
 
 def _log_event(event: dict):
