@@ -1,6 +1,3 @@
-Ниже полный файл с добавленным методом `find_scroll_container_and_test`, который ищет реальный скроллящийся контейнер таблицы, проверяет рост `tbody` при точечном скролле именно этого контейнера, и скачивает `mainTop,coinsPage.js` напрямую в поисках API-эндпоинта. Старые диагностические методы (`load_and_diagnose` — assets-info + инлайн-скрипты) оставлены, чтобы при необходимости можно было прогнать оба шага.
-
-```python
 """
 coinalyze_loader.py — загрузчик/диагностика данных с Coinalyze.
 
@@ -396,11 +393,9 @@ class CoinalyzeScraper:
         self._wait_cloudflare()
         page.wait_for_timeout(POST_LOAD_WAIT_MS)
 
-        # 1) сколько строк в tbody сразу после загрузки (без скролла)
         initial_count = len(page.query_selector_all("tbody tr"))
         log.info(f"📊 [SCROLL-TEST] Строк в tbody сразу после загрузки: {initial_count}")
 
-        # 2) ищем все элементы, у которых реально есть внутренний скролл
         candidates = page.evaluate("""
             () => {
                 const results = [];
@@ -433,7 +428,6 @@ class CoinalyzeScraper:
                 f"containsTable={c['containsTable']}"
             )
 
-        # 3) пробуем поскроллить именно контейнеры, где containsTable=True
         table_containers = [c for c in candidates if c["containsTable"]]
         if not table_containers:
             log.warning(
@@ -464,7 +458,6 @@ class CoinalyzeScraper:
                 log.info(f"📊 [SCROLL-TEST] После скролла {sel}: строк в tbody = {new_count} "
                          f"(было {initial_count})")
 
-        # 4) скачиваем mainTop,coinsPage.js напрямую и ищем в нём признаки API/виртуализации
         log.info("🌐 [JS-FETCH] Ищем src внешних <script> на странице...")
         script_srcs = page.eval_on_selector_all(
             "script[src]",
@@ -507,20 +500,10 @@ class CoinalyzeScraper:
 def main():
     log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        # шаг 1: assets-info + инлайн-скрипты (можно закомментировать, если уже прогнали)
-        # scraper.load_and_diagnose()
-
-        # шаг 2: поиск реального скролл-контейнера + coinsPage.js
         scraper.find_scroll_container_and_test()
 
-    log.info("🏁 Диагностика завершена. Смотри лог выше: "
-             "🔎 [SCROLL-TEST] покажет реальные скроллящиеся контейнеры, "
-             "📊 [SCROLL-TEST] покажет, растёт ли tbody при их скролле, "
-             "🎯 [JS-FETCH] покажет найденные признаки API в coinsPage.js.")
+    log.info("🏁 Диагностика завершена.")
 
 
 if __name__ == "__main__":
     main()
-```
-
-Запусти и пришли лог целиком, особенно секции `🔎 [SCROLL-TEST]`, `📊 [SCROLL-TEST]` и `🎯 [JS-FETCH]` — по ним сразу станет понятно, где физически растут данные и есть ли скрытый API-путь внутри `coinsPage.js`.
