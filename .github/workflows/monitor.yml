@@ -47,6 +47,11 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ENABLE_BINGX: "true"
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          BINGX_MARGIN_USDT: "1"
+          BINGX_LEVERAGE: "10"
         run: python monitor.py
       - name: Run unentered tracker
         run: python unentered_tracker.py
