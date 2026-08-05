@@ -1,15 +1,16 @@
- 
+"""
+coinalyze_loader.py — сравнение количества строк с фильтром и без, с полным набором куки.
+"""
 from __future__ import annotations
 
 import os
-import re
-import json
 import logging
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
+from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Browser, Page, Response, WebSocket
+from playwright.sync_api import sync_playwright, Browser, Page, Response
 
 try:
     from playwright_stealth import stealth_sync
@@ -26,18 +27,22 @@ log = logging.getLogger("coinalyze_loader")
 
 BASE = Path(__file__).resolve().parent
 
-COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
-COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
-
-ASSETS_INFO_MATCH = os.environ.get("ASSETS_INFO_MATCH", "assets-info")
 NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "40000"))
-POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "4000"))
+POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "5000"))
 
-LOG_CHUNK_SIZE = int(os.environ.get("LOG_CHUNK_SIZE", "4000"))
-MAX_LOG_CHARS = int(os.environ.get("MAX_LOG_CHARS", "0"))
+# Полная строка куки целиком, как в браузере (Set через переменную окружения COINALYZE_COOKIES_RAW).
+# Если переменная не задана — используем дефолт (тот, что вы прислали в чате).
+COINALYZE_COOKIES_RAW = os.environ.get(
+    "COINALYZE_COOKIES_RAW",
+    "_ga=GA1.1.1437320651.1775048231; cookies_accepted=1; theme=dark; "
+    "chat_sid=bfd66807-13b1-42e7-bd4c-047f84aacd56; "
+    "p_sid=s%3ApxWmyam1Q3mxLdmX3wsqYmdZl0TOOEaY.lrXOk%2BfKqC%2BF%2F9b8qiofzHGnWfM%2FdlxAJMY%2BCP3lGnM; "
+    "_ga_S5GL9D82Q3=GS2.1.s1785952092$o129$g1$t1785953007$j60$l0$h0",
+)
 
-COINALYZE_URL = os.environ.get(
+URL_NO_FILTER = "https://coinalyze.net/"
+URL_WITH_FILTER = os.environ.get(
     "COINALYZE_URL",
     "https://coinalyze.net/"
     "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
@@ -46,43 +51,24 @@ COINALYZE_URL = os.environ.get(
 )
 
 
-def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_chars: int = MAX_LOG_CHARS):
-    text = body
-    total_len = len(text)
-    if max_chars and total_len > max_chars:
-        text = text[:max_chars]
-        log.warning(f"⚠️ [{label}] Тело обрезано для лога до {max_chars} из {total_len} символов")
-
-    n_chunks = (len(text) + chunk_size - 1) // chunk_size or 1
-    log.info(f"📦 [{label}] Начинаю вывод: всего_символов={total_len}, кусков={n_chunks}, chunk_size={chunk_size}")
-    for i in range(0, len(text), chunk_size):
-        idx = i // chunk_size + 1
-        chunk = text[i:i + chunk_size]
-        log.info(f"📦 [{label}] chunk {idx}/{n_chunks}:\n{chunk}")
-    log.info(f"📦 [{label}] === КОНЕЦ ===")
-
-
-def try_parse_payload(body: str) -> Optional[Any]:
-    body_stripped = body.strip()
-    try:
-        data = json.loads(body_stripped)
-        log.info(f"✅ [PARSE] Прямой json.loads сработал. Тип: {type(data).__name__}")
-        return data
-    except json.JSONDecodeError as e:
-        log.info(f"ℹ️ [PARSE] Прямой json.loads не сработал ({e}).")
-    return None
-
-
-def describe_payload(data: Any, prefix: str = "STRUCT"):
-    if isinstance(data, list):
-        log.info(f"🔎 [{prefix}] list длиной {len(data)}")
-        if data and isinstance(data[0], dict):
-            log.info(f"🔎 [{prefix}] Ключи первого элемента: {list(data[0].keys())}")
-            log.info(f"🔎 [{prefix}] Пример: {json.dumps(data[0], ensure_ascii=False)[:1500]}")
-    elif isinstance(data, dict):
-        log.info(f"🔎 [{prefix}] dict, ключи: {list(data.keys())}")
-    else:
-        log.info(f"🔎 [{prefix}] Тип: {type(data).__name__}")
+def parse_cookie_header(raw: str) -> list[dict]:
+    """Парсим строку 'name=value; name2=value2; ...' в список cookie-объектов для Playwright."""
+    cookies = []
+    parts = [p.strip() for p in raw.split(";") if p.strip()]
+    for part in parts:
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": "coinalyze.net",
+            "path": "/",
+            "secure": True,
+        })
+    return cookies
 
 
 def parse_number(text: str) -> Optional[float]:
@@ -136,7 +122,7 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
     return symbol, name
 
 
-def parse_table_fallback(html_text: str) -> list[dict]:
+def parse_table(html_text: str) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     rows = soup.select("tbody tr")
     out = []
@@ -156,7 +142,6 @@ def parse_table_fallback(html_text: str) -> list[dict]:
             "oi_chg24_pct": get_td(tds, 7),
         }
         out.append(rec)
-    log.info(f"✅ [FALLBACK-PARSER] Распарсено строк: {len(out)}/{len(rows)}")
     return out
 
 
@@ -166,10 +151,6 @@ class CoinalyzeScraper:
         self._pw = None
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
-        self._captured_responses: list[dict] = []
-        self._doc_html: dict = {}
-        self._ws_frames: list[dict] = []
-        self._ws_connections: list[str] = []
 
     def __enter__(self) -> "CoinalyzeScraper":
         self._pw = sync_playwright().start()
@@ -192,12 +173,9 @@ class CoinalyzeScraper:
         ctx.add_init_script("""() => {
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         }""")
-        self._add_cookies(ctx)
+        self._add_full_cookies(ctx)
         self._page = ctx.new_page()
         stealth_sync(self._page)
-
-        self._page.on("response", self._on_response)
-        self._page.on("websocket", self._on_websocket)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -207,65 +185,16 @@ class CoinalyzeScraper:
             self._pw.stop()
 
     @staticmethod
-    def _add_cookies(ctx):
-        log.info(f"🔑 [COOKIES] COINALYZE_P_SID: {'УСТАНОВЛЕН ✅' if COINALYZE_P_SID else 'ПУСТО ⚠️'}")
-        log.info(f"🔑 [COOKIES] COINALYZE_CHAT_SID: {'УСТАНОВЛЕН ✅' if COINALYZE_CHAT_SID else 'ПУСТО ⚠️'}")
-        if not (COINALYZE_P_SID or COINALYZE_CHAT_SID):
-            log.warning("⚠️ Куки не заданы!")
-            return
-        cookies = [
-            {"name": "cookies_accepted", "value": "1", "domain": "coinalyze.net", "path": "/", "secure": True}
-        ]
-        if COINALYZE_P_SID:
-            cookies.append({"name": "p_sid", "value": COINALYZE_P_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
-        if COINALYZE_CHAT_SID:
-            cookies.append({"name": "chat_sid", "value": COINALYZE_CHAT_SID, "domain": "coinalyze.net", "path": "/", "secure": True})
-        ctx.add_cookies(cookies)
-
-    def _on_response(self, response: Response):
-        try:
-            rtype = response.request.resource_type
-        except Exception:
-            rtype = "?"
-
-        if rtype == "document" and response.status == 200:
-            try:
-                self._doc_html["html"] = response.text()
-                self._doc_html["url"] = response.url
-                log.info(f"📄 [DOC-CAPTURE] Главный HTML: {response.url}, длина={len(self._doc_html['html'])}")
-            except Exception as e:
-                log.warning(f"⚠️ Не удалось прочитать document-ответ: {e}")
-            return
-
-        if rtype in ("xhr", "fetch"):
-            log.info(f"🌐 [XHR/FETCH] status={response.status} url={response.url}")
-
-        if ASSETS_INFO_MATCH in response.url:
-            try:
-                body = response.text()
-            except Exception as e:
-                log.warning(f"⚠️ [CAPTURE] Не удалось прочитать тело {response.url}: {e}")
-                return
-            log.info(f"🎯 [CAPTURE] assets-info: status={response.status}, длина={len(body)}")
-            self._captured_responses.append({"url": response.url, "status": response.status, "body": body})
-
-    def _on_websocket(self, ws: WebSocket):
-        log.info(f"🔌 [WS] Открыт WebSocket: {ws.url}")
-        self._ws_connections.append(ws.url)
-
-        def on_framesent(payload):
-            text = payload if isinstance(payload, str) else repr(payload)
-            log.info(f"📤 [WS SENT] {ws.url}\n{text[:3000]}")
-            self._ws_frames.append({"dir": "sent", "url": ws.url, "payload": text})
-
-        def on_framereceived(payload):
-            text = payload if isinstance(payload, str) else repr(payload)
-            log.info(f"📥 [WS RECV] {ws.url} длина={len(text)}\n{text[:3000]}")
-            self._ws_frames.append({"dir": "recv", "url": ws.url, "payload": text})
-
-        ws.on("framesent", on_framesent)
-        ws.on("framereceived", on_framereceived)
-        ws.on("close", lambda: log.info(f"🔌 [WS] Закрыт: {ws.url}"))
+    def _add_full_cookies(ctx):
+        cookies = parse_cookie_header(COINALYZE_COOKIES_RAW)
+        log.info(f"🔑 [COOKIES] Загружаем {len(cookies)} куки целиком из COINALYZE_COOKIES_RAW:")
+        for c in cookies:
+            preview = c["value"] if len(c["value"]) < 40 else c["value"][:40] + "..."
+            log.info(f"🔑 [COOKIES]   {c['name']} = {preview}")
+        if cookies:
+            ctx.add_cookies(cookies)
+        else:
+            log.warning("⚠️ [COOKIES] Не удалось распарсить ни одной куки из COINALYZE_COOKIES_RAW!")
 
     def _wait_cloudflare(self):
         page = self._page
@@ -277,129 +206,59 @@ class CoinalyzeScraper:
             log.warning("⚠️ Обнаружен Cloudflare челлендж, ждём подольше...")
             page.wait_for_timeout(10_000)
 
-    def diagnose_virtualization(self, url: str = COINALYZE_URL):
+    def load_and_count(self, url: str, label: str) -> list[dict]:
         page = self._page
-        self._captured_responses.clear()
-        self._doc_html.clear()
-        self._ws_frames.clear()
-        self._ws_connections.clear()
-
-        all_responses = []
-
-        def on_any_response(response: Response):
-            try:
-                rtype = response.request.resource_type
-            except Exception:
-                rtype = "?"
-            all_responses.append({"url": response.url, "status": response.status, "rtype": rtype})
-
-        page.on("response", on_any_response)
-
-        log.info(f"🌐 [PLAYWRIGHT] Открываем URL: {url}")
+        log.info(f"🌐 [{label}] Открываем: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         self._wait_cloudflare()
         page.wait_for_timeout(POST_LOAD_WAIT_MS)
 
-        initial_count = len(page.query_selector_all("tbody tr"))
-        log.info(f"📊 [VIRT-TEST] Строк в tbody сразу после загрузки: {initial_count}")
+        html = page.content()
+        rows = parse_table(html)
+        log.info(f"📊 [{label}] Строк в tbody: {len(rows)}")
+        if rows:
+            log.info(f"📊 [{label}] Первая строка: {rows[0]}")
+            log.info(f"📊 [{label}] Последняя строка: {rows[-1]}")
 
-        try:
-            body_text = page.inner_text("body")
-        except Exception as e:
-            log.warning(f"⚠️ Не удалось получить inner_text body: {e}")
-            body_text = ""
+        out_file = BASE / f"dump_{label.lower().replace(' ', '_')}.html"
+        out_file.write_text(html, encoding="utf-8")
+        log.info(f"💾 [{label}] HTML сохранён в {out_file.name}")
+        return rows
 
-        count_patterns = [
-            r"(\d+)\s*(?:of|из)\s*(\d+)",
-            r"Showing\s+(\d+)",
-            r"Total[:\s]+(\d+)",
-            r"Results?[:\s]+(\d+)",
-        ]
-        found_any = False
-        for pat in count_patterns:
-            matches = re.findall(pat, body_text, re.IGNORECASE)
-            if matches:
-                found_any = True
-                log.info(f"🔎 [VIRT-TEST] Паттерн {pat!r} нашёл: {matches}")
-        if not found_any:
-            log.info("ℹ️ [VIRT-TEST] Счётчик 'показано X из Y' в тексте страницы не найден.")
+    def compare_filtered_vs_unfiltered(self):
+        log.info("=" * 60)
+        log.info("ШАГ 1: страница БЕЗ фильтра (базовый URL)")
+        log.info("=" * 60)
+        rows_no_filter = self.load_and_count(URL_NO_FILTER, "NO-FILTER")
 
-        table_box = page.evaluate("""
-            () => {
-                const table = document.querySelector('table');
-                if (!table) return null;
-                const rect = table.getBoundingClientRect();
-                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
-            }
-        """)
-        log.info(f"🔎 [VIRT-TEST] Границы <table>: {table_box}")
+        log.info("=" * 60)
+        log.info("ШАГ 2: страница С вашим фильтром (cm6165/cm6164)")
+        log.info("=" * 60)
+        rows_with_filter = self.load_and_count(URL_WITH_FILTER, "WITH-FILTER")
 
-        if table_box:
-            cx = table_box["x"] + table_box["width"] / 2
-            cy = table_box["y"] + min(table_box["height"] / 2, 400)
-            log.info(f"🖱️ [VIRT-TEST] Двигаем мышь в центр таблицы: ({cx:.0f}, {cy:.0f})")
-            page.mouse.move(cx, cy)
-            page.wait_for_timeout(300)
+        log.info("=" * 60)
+        log.info(f"🏁 ИТОГ: без фильтра = {len(rows_no_filter)} строк, "
+                 f"с фильтром = {len(rows_with_filter)} строк")
+        log.info("=" * 60)
 
-            for step in range(1, 11):
-                page.mouse.wheel(0, 1500)
-                page.wait_for_timeout(800)
-                cur_count = len(page.query_selector_all("tbody tr"))
-                log.info(f"📊 [VIRT-TEST] После wheel-события #{step} над таблицей: строк = {cur_count}")
-                if cur_count > initial_count:
-                    log.info(f"✅ [VIRT-TEST] Рост обнаружен! {initial_count} -> {cur_count}")
-                    initial_count = cur_count
+        no_filter_symbols = {r["symbol"] for r in rows_no_filter}
+        with_filter_symbols = {r["symbol"] for r in rows_with_filter}
+        missing_from_filtered = no_filter_symbols - with_filter_symbols
+        log.info(f"ℹ️ Монет, которые есть без фильтра, но исчезли при фильтре: {len(missing_from_filtered)}")
+        if len(no_filter_symbols) < 95:
+            log.warning(f"⚠️ Даже БЕЗ фильтра строк меньше 95 ({len(no_filter_symbols)}) — "
+                        f"значит дело не в фильтре, а в самой сессии/куках/рендере на данный момент.")
         else:
-            log.warning("⚠️ [VIRT-TEST] Не удалось получить границы <table>, wheel-тест пропущен.")
-
-        final_count = len(page.query_selector_all("tbody tr"))
-        log.info(f"📊 [VIRT-TEST] ИТОГО строк в tbody после всех wheel-попыток: {final_count}")
-
-        script_srcs = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
-        coins_page_js_url = next((s for s in script_srcs if "coinsPage" in s or "mainTop" in s), None)
-        if coins_page_js_url:
-            log.info(f"🌐 [VIRT-JS] Скачиваем: {coins_page_js_url}")
-            try:
-                resp = page.request.get(coins_page_js_url, timeout=20_000)
-                js_body = resp.text()
-                log.info(f"🌐 [VIRT-JS] Статус={resp.status}, длина={len(js_body)}")
-
-                virt_keywords = ["virtual", "pageSize", "page_size", "limit", "offset",
-                                  "rowsPerPage", "rows_per_page", "maxRows", "max_rows",
-                                  "renderVisible", "visibleRows", "slice(", "loadMore", "load_more"]
-                for kw in virt_keywords:
-                    idx = js_body.find(kw)
-                    if idx != -1:
-                        snippet = js_body[max(0, idx - 150): idx + 350]
-                        log.info(f"🎯 [VIRT-JS] Найдено '{kw}' на позиции {idx}:\n{snippet}")
-                    else:
-                        log.info(f"ℹ️ [VIRT-JS] '{kw}' не найдено.")
-            except Exception as e:
-                log.warning(f"⚠️ [VIRT-JS] Не удалось скачать/разобрать {coins_page_js_url}: {e}")
-        else:
-            log.warning("⚠️ [VIRT-JS] coinsPage.js не найден среди <script src>.")
-
-        log.info(f"🌐 [ALL-RESPONSES] Всего ответов за сессию: {len(all_responses)}")
-        for i, r in enumerate(all_responses, start=1):
-            log.info(f"🌐 [ALL-RESPONSES #{i}] rtype={r['rtype']} status={r['status']} url={r['url']}")
-
-        page.remove_listener("response", on_any_response)
-
-        html_live = page.content()
-        rows = parse_table_fallback(html_live)
-        log.info(f"📊 [FINAL] Итоговое число распарсенных строк: {len(rows)}")
-        out_file = BASE / "live_page_dump.html"
-        out_file.write_text(html_live, encoding="utf-8")
-        log.info(f"💾 [FINAL] Полный HTML сохранён в {out_file.name} (длина={len(html_live)})")
+            log.info("✅ Без фильтра строк действительно много (~90-100+), значит куки/сессия рабочие, "
+                     "а разница в количестве объясняется именно параметрами фильтра.")
 
 
 def main():
-    log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
+    log.info(f"🚀 Запуск сравнения в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        scraper.diagnose_virtualization()
-    log.info("🏁 Диагностика завершена.")
+        scraper.compare_filtered_vs_unfiltered()
+    log.info("🏁 Завершено.")
 
 
 if __name__ == "__main__":
     main()
- 
