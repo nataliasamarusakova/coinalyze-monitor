@@ -44,7 +44,7 @@ COINALYZE_URL = (
     "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
     "&order_by=volume_24hour&order_dir=desc"
 )
-
+ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
 MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
 MISS_EXIT_RUNS=2; MISS_REMOVE_RUNS=4; NEUTRAL_HYSTERESIS=2
@@ -798,6 +798,20 @@ def _exit_meta(source,exit_ts,last_price_ts):
 
 def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live",exit_candidates=None,lifecycle_complete=True):
     ep=ot.get("entry_price")
+     # >>> BINGX: закрытие позиции на бирже перед закрытием журнала <<<
+    bx = ot.get("bingx") or {}
+    if ENABLE_BINGX and bx.get("status") in ("opened", "already_open") and bx.get("qty"):
+        try:
+            import bingx_client
+            res = bingx_client.close_long(symbol, bx["qty"])
+            ot["bingx_close"] = res
+            if res.get("status") == "closed":
+                log.info(f"[{symbol}] BingX CLOSE ok orderId={res.get('order_id')}")
+            else:
+                log.error(f"[{symbol}] BingX CLOSE failed: {res.get('error')}")
+        except Exception as e:
+            log.error(f"[{symbol}] BingX CLOSE exception: {e}")
+    # <<< BINGX >>>
     _fill_horizons(ot,symbol,exit_ts,price_full)
     gross=round((exit_price-ep)/ep*100,3) if (exit_price and ep) else None
     max_pnl=ot.get("max_pnl_pct",0.0); min_pnl=ot.get("min_pnl_pct",0.0); peak_ts=ot.get("peak_ts",ot["entry_ts"])
@@ -1066,6 +1080,20 @@ def run():
                         idea_first_seen_ts=ts
                     new_tid=f"{sym}_{ts}"
                     new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,existing.get("snapshots",0)+1,cur_price)
+                     # >>> BINGX: открытие (демо, маржа из env) — не влияет на журнал и lifecycle <<<
+            if ENABLE_BINGX:
+                try:
+                    import bingx_client
+                    bx = bingx_client.open_long(sym, cur_price)
+                    new_ot["bingx"] = bx
+                    if bx.get("status") in ("opened", "already_open"):
+                        log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
+                    else:
+                        log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
+                except Exception as e:
+                    log.error(f"[{sym}] BingX OPEN exception: {e}")
+                    new_ot["bingx"] = {"status": "error", "error": str(e)}
+            # <<< BINGX >>>
                     log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
         # [FIX] setdefault не перезаписывает cooldown_until
         idea_first_seen=lifecycle_state.get(sym,{}).get("idea_first_seen_ts")
