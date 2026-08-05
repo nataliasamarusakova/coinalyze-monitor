@@ -1,18 +1,18 @@
+Ниже полный файл с добавленным методом `find_scroll_container_and_test`, который ищет реальный скроллящийся контейнер таблицы, проверяет рост `tbody` при точечном скролле именно этого контейнера, и скачивает `mainTop,coinsPage.js` напрямую в поисках API-эндпоинта. Старые диагностические методы (`load_and_diagnose` — assets-info + инлайн-скрипты) оставлены, чтобы при необходимости можно было прогнать оба шага.
+
+```python
 """
 coinalyze_loader.py — загрузчик/диагностика данных с Coinalyze.
 
 Логика:
  1. Реальные цифры таблицы (price/volume/OI/funding/liquidations и т.д.)
-    в DOM не подгружаются отдельным XHR и не идут через WebSocket —
-    похоже, они зашиты прямо в HTML главного документа (инлайн <script>).
+    в DOM не подгружаются отдельным XHR и не идут через WebSocket.
  2. assets-info/ — это лишь справочник монет/бирж/символов (метаданные),
     не содержит текущих цифр.
- 3. Этот скрипт:
-    - перехватывает document-ответ (главный HTML) и assets-info/,
-    - вытаскивает все инлайн <script> без src,
-    - логирует их длину и (если найдены) совпадения по ключевым словам,
-    - льёт полное содержимое подозрительных скриптов прямо в лог кусками,
-    - пытается распарсить JSON/JS-обёртки автоматически.
+ 3. Инлайн-скрипты главного HTML тоже не содержат данных таблицы (проверено).
+ 4. Следующий шаг: искать реальный скроллящийся контейнер таблицы (не window/body)
+    и проверять, растёт ли tbody при его скролле, а также скачать
+    mainTop,coinsPage.js напрямую и поискать в нём API-эндпоинт/логику виртуализации.
 """
 from __future__ import annotations
 
@@ -51,8 +51,6 @@ POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "3000"))
 LOG_CHUNK_SIZE = int(os.environ.get("LOG_CHUNK_SIZE", "4000"))
 MAX_LOG_CHARS = int(os.environ.get("MAX_LOG_CHARS", "0"))  # 0 = без ограничений
 
-# минимальная длина инлайн-скрипта, чтобы считать его "подозрительным" и логировать целиком
-# (мелкие GA/tolt скрипты обычно короче)
 BIG_SCRIPT_THRESHOLD = int(os.environ.get("BIG_SCRIPT_THRESHOLD", "5000"))
 
 KEYWORDS = [
@@ -73,7 +71,6 @@ COINALYZE_URL = os.environ.get(
 
 # ─────────────────────────── утилиты логирования ───────────────────────────
 def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_chars: int = MAX_LOG_CHARS):
-    """Льёт содержимое ответа/скрипта прямо в лог кусками, чтобы сразу видеть его в консоли."""
     text = body
     total_len = len(text)
     if max_chars and total_len > max_chars:
@@ -93,7 +90,6 @@ def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_c
 
 
 def try_parse_payload(body: str) -> Optional[Any]:
-    """Пробуем распарсить тело как чистый JSON, иначе вытащить JSON-подстроку из JS-обёртки."""
     body_stripped = body.strip()
 
     try:
@@ -123,7 +119,6 @@ def try_parse_payload(body: str) -> Optional[Any]:
 
 
 def describe_payload(data: Any, prefix: str = "STRUCT"):
-    """Логируем структуру распарсенных данных."""
     if isinstance(data, list):
         log.info(f"🔎 [{prefix}] Это list длиной {len(data)}")
         if data:
@@ -200,7 +195,6 @@ def extract_symbol_and_name(tr, tds, row_idx: int) -> tuple[str, str]:
 
 
 def parse_table_fallback(html_text: str) -> list[dict]:
-    """Fallback-парсер HTML-таблицы (работает только если данные реально есть в <tbody> DOM)."""
     soup = BeautifulSoup(html_text, "html.parser")
     rows = soup.select("tbody tr")
     out = []
@@ -285,13 +279,11 @@ class CoinalyzeScraper:
         ctx.add_cookies(cookies)
 
     def _on_response(self, response: Response):
-        """Ловим все значимые ответы: document, xhr, fetch, и assets-info в частности."""
         try:
             rtype = response.request.resource_type
         except Exception:
             rtype = "?"
 
-        # главный HTML документ — самый важный, туда, вероятно, зашиты данные
         if rtype == "document" and response.status == 200:
             try:
                 self._doc_html["html"] = response.text()
@@ -302,11 +294,9 @@ class CoinalyzeScraper:
                 log.warning(f"⚠️ Не удалось прочитать document-ответ: {e}")
             return
 
-        # любые XHR/fetch — логируем факт, вдруг что-то всё же есть
         if rtype in ("xhr", "fetch"):
             log.info(f"🌐 [XHR/FETCH] status={response.status} url={response.url}")
 
-        # assets-info отдельно, с полным содержимым
         if ASSETS_INFO_MATCH in response.url:
             try:
                 body = response.text()
@@ -329,9 +319,8 @@ class CoinalyzeScraper:
             log.warning("⚠️ Обнаружен Cloudflare челлендж, ждём подольше...")
             page.wait_for_timeout(10_000)
 
+    # ───────────────────── диагностика №1: assets-info + инлайн-скрипты ─────────────────────
     def load_and_diagnose(self, url: str = COINALYZE_URL):
-        """Главный диагностический метод: открываем страницу, ловим document + assets-info,
-        разбираем все инлайн-скрипты главного HTML в поисках реальных данных таблицы."""
         page = self._page
         self._captured_responses.clear()
         self._doc_html.clear()
@@ -341,7 +330,6 @@ class CoinalyzeScraper:
         self._wait_cloudflare()
         page.wait_for_timeout(POST_LOAD_WAIT_MS)
 
-        # ---------- 1. Разбор assets-info (если поймали) ----------
         if self._captured_responses:
             for i, item in enumerate(self._captured_responses, start=1):
                 label = f"ASSETS-INFO #{i}"
@@ -352,7 +340,6 @@ class CoinalyzeScraper:
         else:
             log.warning("⚠️ assets-info ни разу не был пойман.")
 
-        # ---------- 2. Разбор главного HTML документа ----------
         html = self._doc_html.get("html")
         if not html:
             log.warning("⚠️ Главный document-ответ не пойман через listener, беру page.content() напрямую.")
@@ -378,7 +365,6 @@ class CoinalyzeScraper:
             if hits:
                 any_keyword_hit = True
 
-            # логируем целиком, если есть совпадение по ключевым словам ИЛИ скрипт крупный (подозрительный)
             if hits or is_big:
                 log.info(f"🎯 [SCRIPT #{i}] Логируем содержимое целиком (совпадение={bool(hits)}, крупный={is_big}):")
                 log_full_body(f"INLINE-SCRIPT #{i}", content)
@@ -389,27 +375,152 @@ class CoinalyzeScraper:
 
         if not any_keyword_hit:
             log.warning(
-                "⚠️ [DOC] Ни одно ключевое слово не найдено ни в одном инлайн-скрипте. "
-                "Крупные скрипты (если были) всё равно залогированы целиком выше — "
-                "возможно данные закодированы (base64/своя схема, как в columns=/filter= параметрах URL). "
-                "Проверь вывод крупных скриптов вручную."
+                "⚠️ [DOC] Ни одно ключевое слово не найдено ни в одном инлайн-скрипте."
             )
 
-        # ---------- 3. Fallback: пробуем распарсить HTML-таблицу напрямую ----------
         table_rows = parse_table_fallback(html)
         if table_rows:
-            log.info(f"📊 [FALLBACK] Пример первой строки таблицы из DOM: {table_rows[0]}")
+            log.info(f"📊 [FALLBACK] Строк найдено в DOM сразу при загрузке: {len(table_rows)}")
+            log.info(f"📊 [FALLBACK] Пример первой строки: {table_rows[0]}")
         else:
-            log.info("📊 [FALLBACK] В DOM нет заполненной <tbody> с данными (ожидаемо, если данные не в HTML-таблице).")
+            log.info("📊 [FALLBACK] В DOM нет заполненной <tbody> с данными.")
+
+    # ───────────────────── диагностика №2: скролл-контейнер + coinsPage.js ─────────────────────
+    def find_scroll_container_and_test(self, url: str = COINALYZE_URL):
+        """Ищем реальный скроллящийся контейнер таблицы и проверяем, растёт ли tbody при его скролле.
+        Также скачиваем mainTop,coinsPage.js напрямую и логируем поиск API-эндпоинтов внутри него."""
+        page = self._page
+
+        log.info(f"🌐 [PLAYWRIGHT] Открываем URL: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        self._wait_cloudflare()
+        page.wait_for_timeout(POST_LOAD_WAIT_MS)
+
+        # 1) сколько строк в tbody сразу после загрузки (без скролла)
+        initial_count = len(page.query_selector_all("tbody tr"))
+        log.info(f"📊 [SCROLL-TEST] Строк в tbody сразу после загрузки: {initial_count}")
+
+        # 2) ищем все элементы, у которых реально есть внутренний скролл
+        candidates = page.evaluate("""
+            () => {
+                const results = [];
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    const style = window.getComputedStyle(el);
+                    const canScroll = (style.overflowY === 'auto' || style.overflowY === 'scroll');
+                    if (canScroll && el.scrollHeight > el.clientHeight + 10) {
+                        let selector = el.tagName.toLowerCase();
+                        if (el.id) selector += '#' + el.id;
+                        if (el.className) selector += '.' + String(el.className).trim().replace(/\\s+/g, '.');
+                        results.push({
+                            selector: selector,
+                            scrollHeight: el.scrollHeight,
+                            clientHeight: el.clientHeight,
+                            scrollTop: el.scrollTop,
+                            containsTable: el.querySelector('table') !== null
+                        });
+                    }
+                }
+                return results;
+            }
+        """)
+
+        log.info(f"🔎 [SCROLL-TEST] Найдено потенциальных скроллящихся контейнеров: {len(candidates)}")
+        for i, c in enumerate(candidates, start=1):
+            log.info(
+                f"🔎 [SCROLL-TEST] #{i}: selector={c['selector']!r}, "
+                f"scrollHeight={c['scrollHeight']}, clientHeight={c['clientHeight']}, "
+                f"containsTable={c['containsTable']}"
+            )
+
+        # 3) пробуем поскроллить именно контейнеры, где containsTable=True
+        table_containers = [c for c in candidates if c["containsTable"]]
+        if not table_containers:
+            log.warning(
+                "⚠️ [SCROLL-TEST] Ни один найденный скроллящийся контейнер не содержит <table> внутри себя. "
+                "Возможно таблица виртуализирована без обычного overflow-контейнера (canvas/custom render)."
+            )
+        else:
+            for c in table_containers:
+                sel = c["selector"]
+                log.info(f"📜 [SCROLL-TEST] Скроллим контейнер: {sel}")
+                try:
+                    page.evaluate(
+                        """(sel) => {
+                            const el = document.querySelector(sel);
+                            if (el) {
+                                for (let i = 0; i < 15; i++) {
+                                    el.scrollTop += 2000;
+                                }
+                            }
+                        }""",
+                        sel,
+                    )
+                except Exception as e:
+                    log.warning(f"⚠️ [SCROLL-TEST] Не удалось скроллить {sel}: {e}")
+                    continue
+                page.wait_for_timeout(1500)
+                new_count = len(page.query_selector_all("tbody tr"))
+                log.info(f"📊 [SCROLL-TEST] После скролла {sel}: строк в tbody = {new_count} "
+                         f"(было {initial_count})")
+
+        # 4) скачиваем mainTop,coinsPage.js напрямую и ищем в нём признаки API/виртуализации
+        log.info("🌐 [JS-FETCH] Ищем src внешних <script> на странице...")
+        script_srcs = page.eval_on_selector_all(
+            "script[src]",
+            "els => els.map(e => e.src)"
+        )
+        log.info(f"🌐 [JS-FETCH] Всего найдено <script src>: {len(script_srcs)}")
+
+        coins_page_js_url = None
+        for src in script_srcs:
+            if "coinsPage" in src or "mainTop" in src:
+                coins_page_js_url = src
+                break
+
+        if not coins_page_js_url:
+            log.warning("⚠️ [JS-FETCH] Не нашли src, содержащий coinsPage/mainTop, вот все найденные скрипты:")
+            for src in script_srcs:
+                log.info(f"   - {src}")
+            return
+
+        log.info(f"🌐 [JS-FETCH] Скачиваем: {coins_page_js_url}")
+        try:
+            resp = page.request.get(coins_page_js_url, timeout=20_000)
+            js_body = resp.text()
+            log.info(f"🌐 [JS-FETCH] Статус={resp.status}, длина={len(js_body)} символов")
+
+            api_keywords = ["/api/", "fetch(", "XMLHttpRequest", ".ajax(", "endpoint",
+                             "coins-listing", "coins_listing", "websocket", "WebSocket",
+                             "setInterval", "polling"]
+            for kw in api_keywords:
+                idx = js_body.find(kw)
+                if idx != -1:
+                    snippet = js_body[max(0, idx - 150): idx + 350]
+                    log.info(f"🎯 [JS-FETCH] Найдено '{kw}' на позиции {idx}, контекст:\n{snippet}")
+                else:
+                    log.info(f"ℹ️ [JS-FETCH] '{kw}' не найдено в файле.")
+        except Exception as e:
+            log.warning(f"⚠️ [JS-FETCH] Не удалось скачать/разобрать {coins_page_js_url}: {e}")
 
 
 def main():
     log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        scraper.load_and_diagnose()
-    log.info("🏁 Диагностика завершена. Смотри лог выше — там либо найден блок с реальными данными "
-             "(ищи 🎯 [SCRIPT #] с keywords_hits), либо нужно разбирать закодированные крупные скрипты вручную.")
+        # шаг 1: assets-info + инлайн-скрипты (можно закомментировать, если уже прогнали)
+        # scraper.load_and_diagnose()
+
+        # шаг 2: поиск реального скролл-контейнера + coinsPage.js
+        scraper.find_scroll_container_and_test()
+
+    log.info("🏁 Диагностика завершена. Смотри лог выше: "
+             "🔎 [SCROLL-TEST] покажет реальные скроллящиеся контейнеры, "
+             "📊 [SCROLL-TEST] покажет, растёт ли tbody при их скролле, "
+             "🎯 [JS-FETCH] покажет найденные признаки API в coinsPage.js.")
 
 
 if __name__ == "__main__":
     main()
+```
+
+Запусти и пришли лог целиком, особенно секции `🔎 [SCROLL-TEST]`, `📊 [SCROLL-TEST]` и `🎯 [JS-FETCH]` — по ним сразу станет понятно, где физически растут данные и есть ли скрытый API-путь внутри `coinsPage.js`.
