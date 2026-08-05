@@ -1080,20 +1080,23 @@ def run():
                         idea_first_seen_ts=ts
                     new_tid=f"{sym}_{ts}"
                     new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,existing.get("snapshots",0)+1,cur_price)
-                     # >>> BINGX: открытие (демо, маржа из env) — не влияет на журнал и lifecycle <<<
-            if ENABLE_BINGX:
-                try:
-                    import bingx_client
-                    bx = bingx_client.open_long(sym, cur_price)
-                    new_ot["bingx"] = bx
-                    if bx.get("status") in ("opened", "already_open"):
-                        log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
-                    else:
-                        log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
-                except Exception as e:
-                    log.error(f"[{sym}] BingX OPEN exception: {e}")
-                    new_ot["bingx"] = {"status": "error", "error": str(e)}
-            # <<< BINGX >>>
+                    # >>> BINGX: строго ПОСЛЕ open_trade_record, защищено от None <<<
+                    if ENABLE_BINGX and new_ot is not None:
+                        try:
+                            import bingx_client
+                            bx=bingx_client.open_long(sym,cur_price)
+                            new_ot["bingx"]=bx
+                            if bx.get("status") in ("opened","already_open"):
+                                log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
+                            else:
+                                log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
+                        except Exception as e:
+                            log.error(f"[{sym}] BingX OPEN exception: {e}")
+                            try:
+                                new_ot["bingx"]={"status":"error","error":str(e)}
+                            except Exception:
+                                pass
+                    # <<< BINGX >>>
                     log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
         # [FIX] setdefault не перезаписывает cooldown_until
         idea_first_seen=lifecycle_state.get(sym,{}).get("idea_first_seen_ts")
