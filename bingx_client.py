@@ -199,23 +199,32 @@ def open_long(symbol: str, price: float) -> dict:
 
 
 def close_long(symbol: str, qty: float) -> dict:
-    """Закрывает LONG рыночным ордером (reduceOnly)."""
+    """Закрывает LONG рыночным ордером."""
     if not qty or float(qty) <= 0:
         return {"status": "error", "error": "qty <= 0"}
-    bx_symbol = to_bx_symbol(symbol)
+    return _close_position(to_bx_symbol(symbol), float(qty))
+
+
+def _close_position(bx_symbol: str, qty: float) -> dict:
+    # Hedge mode: встречный SELL + positionSide=LONG.
+    # ВАЖНО: reduceOnly здесь запрещён (code=109400).
     params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "LONG",
-              "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"}
+              "type": "MARKET", "quantity": str(qty)}
     resp = _request("POST", ORDER_PATH, params)
-    if resp.get("code") != 0 and "positionside" in str(resp.get("msg", "")).lower():
-        params["positionSide"] = "BOTH"
+
+    # One-way mode fallback: если биржа не принимает positionSide → BOTH + reduceOnly
+    msg = str(resp.get("msg", "")).lower()
+    if resp.get("code") != 0 and ("positionside" in msg or "position side" in msg):
+        params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "BOTH",
+                  "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"}
         resp = _request("POST", ORDER_PATH, params)
 
     if resp.get("code") == 0:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
-        _log_event({"event": "close", "symbol": symbol, "bx_symbol": bx_symbol, "order_id": oid, "qty": qty})
+        _log_event({"event": "close", "bx_symbol": bx_symbol, "order_id": oid, "qty": qty})
         return {"status": "closed", "order_id": oid, "qty": qty, "symbol": bx_symbol}
 
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
-    _log_event({"event": "close_failed", "symbol": symbol, "bx_symbol": bx_symbol, "qty": qty, "error": err})
+    _log_event({"event": "close_failed", "bx_symbol": bx_symbol, "qty": qty, "error": err})
     return {"status": "error", "error": err}
