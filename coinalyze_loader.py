@@ -1,16 +1,20 @@
+Хорошо, сделаем это программно — раскодируем текущий фильтр, убираем `cm6165_gt_45` и `cm6164_lt_60`, перекодируем обратно в base64 и делаем запрос с этим новым URL. Заодно оставим сравнение с полным фильтром и без фильтра вовсе, чтобы увидеть все три цифры сразу.
+
+```python
 """
-coinalyze_loader.py — сравнение количества строк с фильтром и без, с полным набором куки.
+coinalyze_loader.py — сравнение количества строк с полным фильтром, с урезанным
+фильтром (без кастомных метрик cm6165/cm6164) и вовсе без фильтра.
 """
 from __future__ import annotations
 
 import os
+import base64
 import logging
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Browser, Page, Response
+from playwright.sync_api import sync_playwright, Browser, Page
 
 try:
     from playwright_stealth import stealth_sync
@@ -31,8 +35,6 @@ HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "40000"))
 POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "5000"))
 
-# Полная строка куки целиком, как в браузере (Set через переменную окружения COINALYZE_COOKIES_RAW).
-# Если переменная не задана — используем дефолт (тот, что вы прислали в чате).
 COINALYZE_COOKIES_RAW = os.environ.get(
     "COINALYZE_COOKIES_RAW",
     "_ga=GA1.1.1437320651.1775048231; cookies_accepted=1; theme=dark; "
@@ -41,29 +43,43 @@ COINALYZE_COOKIES_RAW = os.environ.get(
     "_ga_S5GL9D82Q3=GS2.1.s1785952092$o129$g1$t1785953007$j60$l0$h0",
 )
 
+COLUMNS_PARAM = "YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
+
+FULL_FILTER_B64 = "Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
+
+# ─── декодируем полный фильтр, убираем cm6165/cm6164, перекодируем обратно ───
+full_filter_decoded = base64.b64decode(FULL_FILTER_B64).decode()
+log.info(f"🔎 [FILTER] Полный фильтр раскодирован: {full_filter_decoded}")
+
+parts = full_filter_decoded.split("&")
+trimmed_parts = [p for p in parts if not p.startswith("cm6165_") and not p.startswith("cm6164_")]
+trimmed_filter_decoded = "&".join(trimmed_parts)
+log.info(f"🔎 [FILTER] После удаления cm6165/cm6164: {trimmed_filter_decoded}")
+
+trimmed_filter_b64 = base64.b64encode(trimmed_filter_decoded.encode()).decode()
+log.info(f"🔎 [FILTER] Перекодировано обратно в base64: {trimmed_filter_b64}")
+
 URL_NO_FILTER = "https://coinalyze.net/"
-URL_WITH_FILTER = os.environ.get(
-    "COINALYZE_URL",
-    "https://coinalyze.net/"
-    "?columns=YSZiJm4mYyZkJmUmZiZzJnQmaCZyJmkmaiZwJnEmbCZtJjYmdiZjbTYxNjUmY202MTY0"
-    "&filter=Y19ndF8yMDAwMDAwJmRfZ3RfMTAwMDAwMCZlX2d0XzAmc19ndF8wJmNtNjE2NV9ndF80NSZjbTYxNjRfbHRfNjA"
-    "&order_by=volume_24hour&order_dir=desc",
+URL_FULL_FILTER = (
+    f"https://coinalyze.net/?columns={COLUMNS_PARAM}&filter={FULL_FILTER_B64}"
+    f"&order_by=volume_24hour&order_dir=desc"
+)
+URL_TRIMMED_FILTER = (
+    f"https://coinalyze.net/?columns={COLUMNS_PARAM}&filter={trimmed_filter_b64}"
+    f"&order_by=volume_24hour&order_dir=desc"
 )
 
 
 def parse_cookie_header(raw: str) -> list[dict]:
-    """Парсим строку 'name=value; name2=value2; ...' в список cookie-объектов для Playwright."""
     cookies = []
     parts = [p.strip() for p in raw.split(";") if p.strip()]
     for part in parts:
         if "=" not in part:
             continue
         name, value = part.split("=", 1)
-        name = name.strip()
-        value = value.strip()
         cookies.append({
-            "name": name,
-            "value": value,
+            "name": name.strip(),
+            "value": value.strip(),
             "domain": "coinalyze.net",
             "path": "/",
             "secure": True,
@@ -187,14 +203,11 @@ class CoinalyzeScraper:
     @staticmethod
     def _add_full_cookies(ctx):
         cookies = parse_cookie_header(COINALYZE_COOKIES_RAW)
-        log.info(f"🔑 [COOKIES] Загружаем {len(cookies)} куки целиком из COINALYZE_COOKIES_RAW:")
-        for c in cookies:
-            preview = c["value"] if len(c["value"]) < 40 else c["value"][:40] + "..."
-            log.info(f"🔑 [COOKIES]   {c['name']} = {preview}")
+        log.info(f"🔑 [COOKIES] Загружаем {len(cookies)} куки")
         if cookies:
             ctx.add_cookies(cookies)
         else:
-            log.warning("⚠️ [COOKIES] Не удалось распарсить ни одной куки из COINALYZE_COOKIES_RAW!")
+            log.warning("⚠️ [COOKIES] Куки не распарсились!")
 
     def _wait_cloudflare(self):
         page = self._page
@@ -225,40 +238,40 @@ class CoinalyzeScraper:
         log.info(f"💾 [{label}] HTML сохранён в {out_file.name}")
         return rows
 
-    def compare_filtered_vs_unfiltered(self):
+    def compare_three(self):
         log.info("=" * 60)
-        log.info("ШАГ 1: страница БЕЗ фильтра (базовый URL)")
+        log.info("ШАГ 1: без фильтра вовсе")
         log.info("=" * 60)
         rows_no_filter = self.load_and_count(URL_NO_FILTER, "NO-FILTER")
 
         log.info("=" * 60)
-        log.info("ШАГ 2: страница С вашим фильтром (cm6165/cm6164)")
+        log.info("ШАГ 2: с ПОЛНЫМ фильтром (включая cm6165/cm6164)")
         log.info("=" * 60)
-        rows_with_filter = self.load_and_count(URL_WITH_FILTER, "WITH-FILTER")
+        rows_full = self.load_and_count(URL_FULL_FILTER, "FULL-FILTER")
 
         log.info("=" * 60)
-        log.info(f"🏁 ИТОГ: без фильтра = {len(rows_no_filter)} строк, "
-                 f"с фильтром = {len(rows_with_filter)} строк")
+        log.info("ШАГ 3: с УРЕЗАННЫМ фильтром (без cm6165/cm6164)")
         log.info("=" * 60)
+        rows_trimmed = self.load_and_count(URL_TRIMMED_FILTER, "TRIMMED-FILTER")
 
-        no_filter_symbols = {r["symbol"] for r in rows_no_filter}
-        with_filter_symbols = {r["symbol"] for r in rows_with_filter}
-        missing_from_filtered = no_filter_symbols - with_filter_symbols
-        log.info(f"ℹ️ Монет, которые есть без фильтра, но исчезли при фильтре: {len(missing_from_filtered)}")
-        if len(no_filter_symbols) < 95:
-            log.warning(f"⚠️ Даже БЕЗ фильтра строк меньше 95 ({len(no_filter_symbols)}) — "
-                        f"значит дело не в фильтре, а в самой сессии/куках/рендере на данный момент.")
-        else:
-            log.info("✅ Без фильтра строк действительно много (~90-100+), значит куки/сессия рабочие, "
-                     "а разница в количестве объясняется именно параметрами фильтра.")
+        log.info("=" * 60)
+        log.info(
+            f"🏁 ИТОГ: без фильтра={len(rows_no_filter)}, "
+            f"полный фильтр={len(rows_full)}, "
+            f"урезанный фильтр (без cm6165/cm6164)={len(rows_trimmed)}"
+        )
+        log.info("=" * 60)
 
 
 def main():
     log.info(f"🚀 Запуск сравнения в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        scraper.compare_filtered_vs_unfiltered()
+        scraper.compare_three()
     log.info("🏁 Завершено.")
 
 
 if __name__ == "__main__":
     main()
+```
+
+Запустите и пришлите лог — особенно три строки `📊 [...] Строк в tbody: N` и финальный `🏁 ИТОГ`. Если "урезанный фильтр" (без `cm6165`/`cm6164`, но с оставшимися `c_gt_2000000&d_gt_1000000&e_gt_0&s_gt_0`) даст число близкое к 90+, значит именно эти две кастомные метрики были главной причиной сужения выборки, и дальше можно точно решить, оставлять их или ослаблять пороги.
