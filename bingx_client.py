@@ -1,151 +1,218 @@
-import os, time, hmac, hashlib, math, logging, requests
+"""
+bingx_client.py — BingX USDT-M Perpetual Swap, демо-счёт (VST).
+
+Все секреты читаются из ENV (GitHub Actions → Settings → Secrets):
+  BINGX_API_KEY       API key демо-счёта
+  BINGX_SECRET_KEY    secret демо-счёта
+  ENABLE_BINGX        "true" / "false"  (по умолчанию false)
+  BINGX_MARGIN_USDT   маржа на сделку, по умолчанию 1
+  BINGX_LEVERAGE      плечо, по умолчанию 10
+  BINGX_MAX_LEVERAGE  потолок авто-поднятия плеча, по умолчанию 50
+  BINGX_BASE_URL      по умолчанию https://open-api-vst.bingx.com (демо)
+  BINGX_SYMBOL_MAP    опциональный JSON-маппинг тикеров, напр. {"PEPEUSDT":"1000PEPE-USDT"}
+"""
+import os, json, time, hmac, hashlib, math, logging
 from urllib.parse import urlencode
+import requests
 
-log = logging.getLogger("bingx_client")
+log = logging.getLogger("bingx")
 
-API_KEY = os.environ.get("BINGX_API_KEY", "")
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
-BASE_URL = "https://open-api-vst.bingx.com"  # ДЕМО (VST)
+API_KEY     = os.environ.get("BINGX_API_KEY", "").strip()
+SECRET_KEY  = os.environ.get("BINGX_SECRET_KEY", "").strip()
+BASE_URL    = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
+MARGIN_USDT = float(os.environ.get("BINGX_MARGIN_USDT", "1"))
+LEVERAGE    = int(os.environ.get("BINGX_LEVERAGE", "10"))
+MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "50"))
 
-ORDER_PATH = "/openApi/swap/v2/trade/order"
+ORDER_PATH     = "/openApi/swap/v2/trade/order"
+POSITION_PATH  = "/openApi/swap/v2/trade/position"
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
-POSITION_PATH = "/openApi/swap/v2/trade/position"
-LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
+LEVERAGE_PATH  = "/openApi/swap/v2/trade/leverage"
 
-LEVERAGE = 10      # Плечо (можно любое для демо)
-MARGIN_USDT = 1.0  # Маржа 1 бакс
+ORDERS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bingx_orders.jsonl")
+
+try:
+    SYMBOL_MAP = json.loads(os.environ.get("BINGX_SYMBOL_MAP", "{}"))
+except json.JSONDecodeError:
+    SYMBOL_MAP = {}
+
+_CONTRACT_CACHE = {"ts": 0.0, "data": {}}
+_CONTRACT_TTL = 3600
+
 
 def _sign(params: dict) -> str:
-    query_string = urlencode(sorted(params.items()))
+    query_string = urlencode(params)  # порядок сохранения: подписываем то, что отправляем
     return hmac.new(SECRET_KEY.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def _request(method: str, path: str, params: dict, signed: bool = True):
+
+def _request(method: str, path: str, params: dict | None = None, signed: bool = True, retries: int = 2):
+    params = dict(params or {})
     if signed:
+        if not API_KEY or not SECRET_KEY:
+            return {"code": -1, "msg": "BINGX_API_KEY / BINGX_SECRET_KEY не заданы в env"}
         params["timestamp"] = str(int(time.time() * 1000))
         params["signature"] = _sign(params)
     headers = {"X-BX-APIKEY": API_KEY} if signed else {}
     url = BASE_URL + path
+    last_err = "unknown"
+    for attempt in range(retries):
+        try:
+            resp = requests.request(method, url, headers=headers, params=params, timeout=10)
+            return resp.json()
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1 + attempt)
+    return {"code": -1, "msg": f"network error: {last_err}"}
+
+
+def to_bx_symbol(symbol: str) -> str:
+    if symbol in SYMBOL_MAP:
+        return SYMBOL_MAP[symbol]
+    s = symbol.strip().upper()
+    if s.endswith("USDT") and "-" not in s:
+        return s[:-4] + "-USDT"
+    return s
+
+
+def _log_event(event: dict):
+    event["ts"] = int(time.time())
     try:
-        resp = requests.request(method, url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        with open(ORDERS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as e:
-        log.error(f"BingX request error {path}: {e}")
-        return {"code": -1, "msg": str(e)}
+        log.error(f"bingx_orders.jsonl write failed: {e}")
 
-def _to_bx_symbol(symbol: str) -> str:
-    return symbol.replace("USDT", "-USDT") if not symbol.endswith("-USDT") else symbol
 
-def ensure_leverage(bx_symbol: str, leverage: int = LEVERAGE):
-    """Выставляет плечо перед первым ордером (обязательно для корректной маржи)."""
-    resp = _request("POST", LEVERAGE_PATH, {
-        "symbol": bx_symbol,
-        "side": "LONG",
-        "leverage": str(leverage),
-    })
-    if resp.get("code") != 0:
-        log.warning(f"[{bx_symbol}] set leverage failed: {resp}")
+def _contracts() -> dict:
+    now = time.time()
+    if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
+        return _CONTRACT_CACHE["data"]
+    resp = _request("GET", CONTRACTS_PATH, signed=False)
+    data = {}
+    if resp.get("code") == 0:
+        for c in resp.get("data", []) or []:
+            sym = c.get("symbol")
+            if sym:
+                data[sym] = c
+        _CONTRACT_CACHE.update({"ts": now, "data": data})
+    else:
+        log.error(f"contracts fetch failed: {resp.get('code')} {resp.get('msg')}")
+    return data
 
-def get_open_position(bx_symbol: str):
-    """Проверка, есть ли уже открытая позиция (защита от дублей)."""
+
+def _position_amt(bx_symbol: str) -> float:
+    """Открытый объём LONG (защита от дублей при перезапуске Actions)."""
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
-    if resp.get("code") == 0:
-        for p in resp.get("data", []):
-            if p.get("positionSide") in ["LONG", "BOTH"] and float(p.get("positionAmt", 0)) > 0:
-                return float(p.get("positionAmt", 0))
-    return 0.0
-
-def calc_quantity(bx_symbol: str, mark_price: float):
-    """
-    Рассчитывает количество КОНТРАКТОВ под маржу MARGIN_USDT.
-    Использует multiplier, quantityPrecision и minQty из спецификации контракта.
-    """
-    if not mark_price or mark_price <= 0:
-        log.error(f"[{bx_symbol}] invalid mark_price: {mark_price}")
-        return None
-
-    resp = _request("GET", CONTRACTS_PATH, {})
     if resp.get("code") != 0:
-        log.error(f"[{bx_symbol}] failed to fetch contracts: {resp}")
-        return None
+        return 0.0
+    total = 0.0
+    for p in resp.get("data", []) or []:
+        if p.get("positionSide") in ("LONG", "BOTH"):
+            try:
+                amt = float(p.get("positionAmt", 0) or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt > 0:
+                total += amt
+    return total
 
-    for c in resp.get("data", []):
-        if c.get("symbol") == bx_symbol:
-            q_precision = int(c.get("quantityPrecision", 0))
-            min_qty = float(c.get("minQty", 1))
-            multiplier = float(c.get("multiplier", 1))
 
-            notional = MARGIN_USDT * LEVERAGE  # 1$ × 10 = 10 USDT
-            raw_qty = notional / (mark_price * multiplier)
+def _set_leverage(bx_symbol: str, leverage: int) -> bool:
+    resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": "LONG", "leverage": str(leverage)})
+    if resp.get("code") == 0:
+        return True
+    resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": "BOTH", "leverage": str(leverage)})
+    if resp.get("code") == 0:
+        return True
+    log.warning(f"[{bx_symbol}] set leverage {leverage}x failed: {resp.get('code')} {resp.get('msg')}")
+    return False
 
-            step = 10 ** -q_precision
-            qty = math.floor(raw_qty / step) * step
-            qty = round(qty, q_precision)
 
-            if qty < min_qty:
-                log.error(f"[{bx_symbol}] qty {qty} < minQty {min_qty}. "
-                          f"notional={notional}, price={mark_price}, multiplier={multiplier}")
-                return None
+def _qty_for(c: dict, price: float, leverage: int):
+    mult = float(c.get("multiplier") or 1)
+    prec = int(c.get("quantityPrecision") or 0)
+    min_qty = float(c.get("minQty") or 0)
+    if not price or price <= 0 or mult <= 0:
+        return None, prec, min_qty
+    raw = (MARGIN_USDT * leverage) / (price * mult)
+    if prec > 0:
+        step = 10 ** -prec
+        qty = round(math.floor(raw / step) * step, prec)
+    else:
+        qty = float(int(raw))
+    return qty, prec, min_qty
 
-            log.info(f"[{bx_symbol}] qty={qty} (notional={notional}$, "
-                     f"price={mark_price}, mult={multiplier}, precision={q_precision})")
-            return qty
 
-    log.error(f"[{bx_symbol}] contract not found in /quote/contracts")
-    return None
+def open_long(symbol: str, price: float) -> dict:
+    """Открывает LONG на BINGX_MARGIN_USDT маржи. Возвращает статус-словарь."""
+    bx_symbol = to_bx_symbol(symbol)
 
-def open_long_market_order(symbol: str, current_price: float):
-    """Возвращает (order_id, quantity) или (None, None)."""
-    bx_symbol = _to_bx_symbol(symbol)
+    amt = _position_amt(bx_symbol)
+    if amt > 0:
+        log.info(f"[{symbol}] позиция уже открыта (amt={amt}) — повторное открытие пропущено")
+        return {"status": "already_open", "order_id": None, "qty": amt, "symbol": bx_symbol}
 
-    # 1. Защита от дублей
-    open_amt = get_open_position(bx_symbol)
-    if open_amt > 0:
-        log.info(f"[{symbol}] Позиция уже открыта (amt={open_amt}), пропускаем")
-        return "ALREADY_OPEN", open_amt
+    c = _contracts().get(bx_symbol)
+    if not c:
+        return {"status": "error", "error": f"контракт {bx_symbol} не найден в /quote/contracts"}
 
-    # 2. Плечо (один раз на тикер, но дёшево вызывать)
-    ensure_leverage(bx_symbol, LEVERAGE)
+    leverage = LEVERAGE
+    qty, prec, min_qty = _qty_for(c, price, leverage)
+    if qty is None:
+        return {"status": "error", "error": "некорректная цена"}
 
-    # 3. Расчет объема под 1$ маржи
-    qty = calc_quantity(bx_symbol, current_price)
-    if not qty:
-        return None, None
+    max_lev = int(c.get("maxLeverage") or MAX_LEVERAGE)
+    max_lev = min(max_lev, MAX_LEVERAGE)
+    if qty < min_qty and leverage < max_lev:
+        need_lev = math.ceil((min_qty * (price or 0) * float(c.get("multiplier") or 1)) / MARGIN_USDT)
+        leverage = min(max(need_lev, leverage), max_lev)
+        qty, prec, min_qty = _qty_for(c, price, leverage)
 
-    # 4. MARKET BUY LONG
-    params = {
-        "symbol": bx_symbol, "side": "BUY", "type": "MARKET",
-        "quantity": str(qty), "positionSide": "LONG",
-    }
+    if qty is None or qty <= 0 or qty < min_qty:
+        return {"status": "error",
+                "error": f"маржа {MARGIN_USDT}$ слишком мала: qty={qty} < minQty={min_qty} "
+                         f"(подними BINGX_LEVERAGE/BINGX_MARGIN_USDT)"}
+
+    _set_leverage(bx_symbol, leverage)
+
+    params = {"symbol": bx_symbol, "side": "BUY", "positionSide": "LONG",
+              "type": "MARKET", "quantity": str(qty)}
     resp = _request("POST", ORDER_PATH, params)
+    if resp.get("code") != 0 and "positionside" in str(resp.get("msg", "")).lower():
+        params["positionSide"] = "BOTH"  # fallback на One-way mode
+        resp = _request("POST", ORDER_PATH, params)
 
-    # Fallback для One-way Mode
-    if resp.get("code") != 0 and "positionside" in resp.get("msg", "").lower():
+    if resp.get("code") == 0:
+        order = (resp.get("data") or {}).get("order") or {}
+        oid = str(order.get("orderId", ""))
+        _log_event({"event": "open", "symbol": symbol, "bx_symbol": bx_symbol, "order_id": oid,
+                    "qty": qty, "price": price, "leverage": leverage, "margin_usdt": MARGIN_USDT})
+        return {"status": "opened", "order_id": oid, "qty": qty, "symbol": bx_symbol,
+                "leverage": leverage, "margin_usdt": MARGIN_USDT}
+
+    err = f"code={resp.get('code')} msg={resp.get('msg')}"
+    _log_event({"event": "open_failed", "symbol": symbol, "bx_symbol": bx_symbol, "error": err})
+    return {"status": "error", "error": err}
+
+
+def close_long(symbol: str, qty: float) -> dict:
+    """Закрывает LONG рыночным ордером (reduceOnly)."""
+    if not qty or float(qty) <= 0:
+        return {"status": "error", "error": "qty <= 0"}
+    bx_symbol = to_bx_symbol(symbol)
+    params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "LONG",
+              "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"}
+    resp = _request("POST", ORDER_PATH, params)
+    if resp.get("code") != 0 and "positionside" in str(resp.get("msg", "")).lower():
         params["positionSide"] = "BOTH"
         resp = _request("POST", ORDER_PATH, params)
 
     if resp.get("code") == 0:
-        order_id = resp.get("data", {}).get("order", {}).get("orderId")
-        log.info(f"[{symbol}] ✅ LONG opened: orderId={order_id}, qty={qty}")
-        return str(order_id), qty
-    else:
-        log.error(f"[{symbol}] ❌ BingX open failed: {resp}")
-        return None, None
+        order = (resp.get("data") or {}).get("order") or {}
+        oid = str(order.get("orderId", ""))
+        _log_event({"event": "close", "symbol": symbol, "bx_symbol": bx_symbol, "order_id": oid, "qty": qty})
+        return {"status": "closed", "order_id": oid, "qty": qty, "symbol": bx_symbol}
 
-def close_long_market_order(symbol: str, qty: float):
-    """Закрытие позиции (MARKET SELL, reduceOnly)."""
-    bx_symbol = _to_bx_symbol(symbol)
-    params = {
-        "symbol": bx_symbol, "side": "SELL", "type": "MARKET",
-        "quantity": str(qty), "reduceOnly": "true", "positionSide": "LONG",
-    }
-    resp = _request("POST", ORDER_PATH, params)
-
-    if resp.get("code") != 0 and "positionside" in resp.get("msg", "").lower():
-        params["positionSide"] = "BOTH"
-        resp = _request("POST", ORDER_PATH, params)
-
-    if resp.get("code") == 0:
-        log.info(f"[{symbol}] ✅ LONG closed")
-    else:
-        log.error(f"[{symbol}] ❌ BingX close failed: {resp}")
+    err = f"code={resp.get('code')} msg={resp.get('msg')}"
+    _log_event({"event": "close_failed", "symbol": symbol, "bx_symbol": bx_symbol, "qty": qty, "error": err})
+    return {"status": "error", "error": err}
