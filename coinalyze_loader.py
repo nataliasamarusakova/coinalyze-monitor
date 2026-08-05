@@ -1,15 +1,10 @@
 """
 coinalyze_loader.py — загрузчик/диагностика данных с Coinalyze.
 
-Логика:
- 1. Реальные цифры таблицы (price/volume/OI/funding/liquidations и т.д.)
-    в DOM не подгружаются отдельным XHR и не идут через WebSocket.
- 2. assets-info/ — это лишь справочник монет/бирж/символов (метаданные),
-    не содержит текущих цифр.
- 3. Инлайн-скрипты главного HTML тоже не содержат данных таблицы (проверено).
- 4. Следующий шаг: искать реальный скроллящийся контейнер таблицы (не window/body)
-    и проверять, растёт ли tbody при его скролле, а также скачать
-    mainTop,coinsPage.js напрямую и поискать в нём API-эндпоинт/логику виртуализации.
+Обновление: в coinsPage.js обнаружен pub.ReconnectingWebSocket — данные таблицы
+(price/volume/OI/funding и т.д.) скорее всего приходят по WebSocket и рендерятся
+клиентским JS в DOM, поэтому их нет ни в assets-info, ни в инлайн-скриптах HTML.
+Этот скрипт перехватывает WS-фреймы и дампит реальный tbody после загрузки.
 """
 from __future__ import annotations
 
@@ -20,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Any
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Browser, Page, Response
+from playwright.sync_api import sync_playwright, Browser, Page, Response, WebSocket
 
 try:
     from playwright_stealth import stealth_sync
@@ -43,19 +38,12 @@ HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 
 ASSETS_INFO_MATCH = os.environ.get("ASSETS_INFO_MATCH", "assets-info")
 NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "40000"))
-POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "3000"))
+POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "8000"))  # увеличено, дать WS время прислать данные
 
 LOG_CHUNK_SIZE = int(os.environ.get("LOG_CHUNK_SIZE", "4000"))
-MAX_LOG_CHARS = int(os.environ.get("MAX_LOG_CHARS", "0"))  # 0 = без ограничений
+MAX_LOG_CHARS = int(os.environ.get("MAX_LOG_CHARS", "0"))
 
-BIG_SCRIPT_THRESHOLD = int(os.environ.get("BIG_SCRIPT_THRESHOLD", "5000"))
-
-KEYWORDS = [
-    "volume_24hour", "volume24", "open_interest", "openInterest", "funding_rate",
-    "fundingRate", "price_change", "priceChange", "oi_change", "liquidation",
-    "market_cap", "marketCap", "mktcap", "oi_vol", "cvd", "long_short",
-    "longShort", "btc_corr",
-]
+WS_FRAME_LOG_LIMIT = int(os.environ.get("WS_FRAME_LOG_LIMIT", "3000"))  # символов на фрейм в логе
 
 COINALYZE_URL = os.environ.get(
     "COINALYZE_URL",
@@ -72,10 +60,7 @@ def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_c
     total_len = len(text)
     if max_chars and total_len > max_chars:
         text = text[:max_chars]
-        log.warning(
-            f"⚠️ [{label}] Тело обрезано для лога до {max_chars} из {total_len} символов "
-            f"(поставь MAX_LOG_CHARS=0, чтобы логировать всё)"
-        )
+        log.warning(f"⚠️ [{label}] Тело обрезано для лога до {max_chars} из {total_len} символов")
 
     n_chunks = (len(text) + chunk_size - 1) // chunk_size or 1
     log.info(f"📦 [{label}] Начинаю вывод: всего_символов={total_len}, кусков={n_chunks}, chunk_size={chunk_size}")
@@ -88,58 +73,28 @@ def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_c
 
 def try_parse_payload(body: str) -> Optional[Any]:
     body_stripped = body.strip()
-
     try:
         data = json.loads(body_stripped)
         log.info(f"✅ [PARSE] Прямой json.loads сработал. Тип: {type(data).__name__}")
         return data
     except json.JSONDecodeError as e:
-        log.info(f"ℹ️ [PARSE] Прямой json.loads не сработал ({e}). Пробуем вытащить JSON из обёртки...")
-
-    candidates = []
-    for open_ch, close_ch in (("{", "}"), ("[", "]")):
-        start = body_stripped.find(open_ch)
-        end = body_stripped.rfind(close_ch)
-        if start != -1 and end != -1 and end > start:
-            candidates.append(body_stripped[start:end + 1])
-
-    for cand in sorted(candidates, key=len, reverse=True):
-        try:
-            data = json.loads(cand)
-            log.info(f"✅ [PARSE] Извлекли JSON из обёртки. Тип: {type(data).__name__}, длина_подстроки={len(cand)}")
-            return data
-        except json.JSONDecodeError:
-            continue
-
-    log.warning("⚠️ [PARSE] Не удалось распознать JSON ни напрямую, ни через извлечение подстроки.")
+        log.info(f"ℹ️ [PARSE] Прямой json.loads не сработал ({e}).")
     return None
 
 
 def describe_payload(data: Any, prefix: str = "STRUCT"):
     if isinstance(data, list):
-        log.info(f"🔎 [{prefix}] Это list длиной {len(data)}")
-        if data:
-            first = data[0]
-            log.info(f"🔎 [{prefix}] Тип первого элемента: {type(first).__name__}")
-            if isinstance(first, dict):
-                log.info(f"🔎 [{prefix}] Ключи первого элемента: {list(first.keys())}")
-                log.info(f"🔎 [{prefix}] Пример: {json.dumps(first, ensure_ascii=False)[:1500]}")
+        log.info(f"🔎 [{prefix}] list длиной {len(data)}")
+        if data and isinstance(data[0], dict):
+            log.info(f"🔎 [{prefix}] Ключи первого элемента: {list(data[0].keys())}")
+            log.info(f"🔎 [{prefix}] Пример: {json.dumps(data[0], ensure_ascii=False)[:1500]}")
     elif isinstance(data, dict):
-        log.info(f"🔎 [{prefix}] Это dict, ключи верхнего уровня: {list(data.keys())}")
-        for k, v in data.items():
-            if isinstance(v, list):
-                log.info(f"🔎 [{prefix}]   '{k}' -> list длиной {len(v)}")
-                if v and isinstance(v[0], dict):
-                    log.info(f"🔎 [{prefix}]     пример: {json.dumps(v[0], ensure_ascii=False)[:1000]}")
-            elif isinstance(v, dict):
-                log.info(f"🔎 [{prefix}]   '{k}' -> dict, ключей={len(v)}, первые_ключи={list(v.keys())[:10]}")
-            else:
-                log.info(f"🔎 [{prefix}]   '{k}' -> {type(v).__name__} = {str(v)[:200]}")
+        log.info(f"🔎 [{prefix}] dict, ключи: {list(data.keys())}")
     else:
-        log.info(f"🔎 [{prefix}] Неожиданный тип верхнего уровня: {type(data).__name__}")
+        log.info(f"🔎 [{prefix}] Тип: {type(data).__name__}")
 
 
-# ─────────────────────────── парсер чисел (fallback для HTML-таблицы) ───────────────────────────
+# ─────────────────────────── парсер таблицы ───────────────────────────
 def parse_number(text: str) -> Optional[float]:
     if not text:
         return None
@@ -224,6 +179,8 @@ class CoinalyzeScraper:
         self._page: Optional[Page] = None
         self._captured_responses: list[dict] = []
         self._doc_html: dict = {}
+        self._ws_frames: list[dict] = []
+        self._ws_connections: list[str] = []
 
     def __enter__(self) -> "CoinalyzeScraper":
         self._pw = sync_playwright().start()
@@ -251,6 +208,7 @@ class CoinalyzeScraper:
         stealth_sync(self._page)
 
         self._page.on("response", self._on_response)
+        self._page.on("websocket", self._on_websocket)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -285,8 +243,7 @@ class CoinalyzeScraper:
             try:
                 self._doc_html["html"] = response.text()
                 self._doc_html["url"] = response.url
-                log.info(f"📄 [DOC-CAPTURE] Поймали главный HTML документ: {response.url}, "
-                         f"длина={len(self._doc_html['html'])} символов")
+                log.info(f"📄 [DOC-CAPTURE] Главный HTML: {response.url}, длина={len(self._doc_html['html'])}")
             except Exception as e:
                 log.warning(f"⚠️ Не удалось прочитать document-ответ: {e}")
             return
@@ -298,13 +255,31 @@ class CoinalyzeScraper:
             try:
                 body = response.text()
             except Exception as e:
-                log.warning(f"⚠️ [CAPTURE] Не удалось прочитать тело ответа {response.url}: {e}")
+                log.warning(f"⚠️ [CAPTURE] Не удалось прочитать тело {response.url}: {e}")
                 return
-            log.info("==================================================")
-            log.info(f"🎯 [CAPTURE] Поймали assets-info ответ! URL={response.url}, "
-                     f"status={response.status}, длина={len(body)}")
-            log.info("==================================================")
+            log.info(f"🎯 [CAPTURE] assets-info: status={response.status}, длина={len(body)}")
             self._captured_responses.append({"url": response.url, "status": response.status, "body": body})
+
+    def _on_websocket(self, ws: WebSocket):
+        log.info(f"🔌 [WS] Открыт WebSocket: {ws.url}")
+        self._ws_connections.append(ws.url)
+
+        def on_framesent(payload):
+            text = payload if isinstance(payload, str) else repr(payload)
+            log.info(f"📤 [WS SENT] {ws.url}\n{text[:WS_FRAME_LOG_LIMIT]}")
+            self._ws_frames.append({"dir": "sent", "url": ws.url, "payload": text})
+
+        def on_framereceived(payload):
+            text = payload if isinstance(payload, str) else repr(payload)
+            log.info(f"📥 [WS RECV] {ws.url} длина={len(text)}\n{text[:WS_FRAME_LOG_LIMIT]}")
+            self._ws_frames.append({"dir": "recv", "url": ws.url, "payload": text})
+
+        def on_close():
+            log.info(f"🔌 [WS] Закрыт: {ws.url}")
+
+        ws.on("framesent", on_framesent)
+        ws.on("framereceived", on_framereceived)
+        ws.on("close", lambda: on_close())
 
     def _wait_cloudflare(self):
         page = self._page
@@ -316,193 +291,68 @@ class CoinalyzeScraper:
             log.warning("⚠️ Обнаружен Cloudflare челлендж, ждём подольше...")
             page.wait_for_timeout(10_000)
 
-    # ───────────────────── диагностика №1: assets-info + инлайн-скрипты ─────────────────────
-    def load_and_diagnose(self, url: str = COINALYZE_URL):
+    def run_full_diagnosis(self, url: str = COINALYZE_URL):
+        """Открываем страницу, ловим WS-фреймы и assets-info, дампим реальный tbody."""
         page = self._page
         self._captured_responses.clear()
         self._doc_html.clear()
+        self._ws_frames.clear()
+        self._ws_connections.clear()
 
         log.info(f"🌐 [PLAYWRIGHT] Открываем URL: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         self._wait_cloudflare()
+
+        log.info(f"⏳ Ждём {POST_LOAD_WAIT_MS}ms, чтобы WS успел прислать данные...")
         page.wait_for_timeout(POST_LOAD_WAIT_MS)
 
+        # ---- сводка по WebSocket ----
+        log.info(f"🔌 [WS SUMMARY] Всего открытых WS-соединений: {len(self._ws_connections)}")
+        for u in self._ws_connections:
+            log.info(f"🔌 [WS SUMMARY]   - {u}")
+        log.info(f"🔌 [WS SUMMARY] Всего пойманных фреймов: {len(self._ws_frames)}")
+
+        recv_frames = [f for f in self._ws_frames if f["dir"] == "recv"]
+        log.info(f"🔌 [WS SUMMARY] Из них полученных (recv): {len(recv_frames)}")
+        for i, f in enumerate(recv_frames, start=1):
+            log.info(f"📥 [WS RECV #{i}] от {f['url']}")
+            data = try_parse_payload(f["payload"])
+            if data is not None:
+                describe_payload(data, prefix=f"WS RECV #{i} STRUCT")
+            else:
+                log_full_body(f"WS RECV #{i} RAW", f["payload"])
+
+        if not self._ws_connections:
+            log.warning("⚠️ [WS] Ни одного WebSocket-соединения не было открыто за время ожидания. "
+                        "Возможно WS открывается по требованию (например, только при видимости вкладки) "
+                        "или использует другой транспорт (long-polling).")
+
+        # ---- сводка по assets-info ----
         if self._captured_responses:
             for i, item in enumerate(self._captured_responses, start=1):
-                label = f"ASSETS-INFO #{i}"
-                log.info(f"📦 [{label}] URL={item['url']} status={item['status']} длина={len(item['body'])}")
-                data = try_parse_payload(item["body"])
-                if data is not None:
-                    describe_payload(data, prefix=label)
-        else:
-            log.warning("⚠️ assets-info ни разу не был пойман.")
+                log.info(f"📦 [ASSETS-INFO #{i}] status={item['status']} длина={len(item['body'])}")
 
-        html = self._doc_html.get("html")
-        if not html:
-            log.warning("⚠️ Главный document-ответ не пойман через listener, беру page.content() напрямую.")
-            html = page.content()
+        # ---- дамп реального tbody после ожидания ----
+        html_live = page.content()
+        rows = parse_table_fallback(html_live)
+        log.info(f"📊 [LIVE-TBODY] Строк в tbody после {POST_LOAD_WAIT_MS}ms ожидания: {len(rows)}")
+        for i, r in enumerate(rows[:10], start=1):
+            log.info(f"📊 [LIVE-TBODY] Строка #{i}: {r}")
+        if len(rows) > 10:
+            log.info(f"📊 [LIVE-TBODY] ... и ещё {len(rows) - 10} строк (не показаны, обрежь вывод при желании)")
 
-        log.info(f"📄 [DOC] Итоговая длина HTML для анализа: {len(html)} символов")
-
-        soup = BeautifulSoup(html, "html.parser")
-        scripts = soup.find_all("script")
-        inline_scripts = [s for s in scripts if not s.get("src") and s.string]
-        log.info(f"📄 [DOC] Всего <script> тегов: {len(scripts)}, инлайн (без src): {len(inline_scripts)}")
-
-        any_keyword_hit = False
-        for i, sc in enumerate(inline_scripts, start=1):
-            content = sc.string or ""
-            length = len(content)
-            hits = [kw for kw in KEYWORDS if kw in content]
-            is_big = length >= BIG_SCRIPT_THRESHOLD
-
-            log.info(f"📄 [SCRIPT #{i}] длина={length} символов, keywords_hits={hits}, "
-                     f"крупный(>{BIG_SCRIPT_THRESHOLD})={is_big}")
-
-            if hits:
-                any_keyword_hit = True
-
-            if hits or is_big:
-                log.info(f"🎯 [SCRIPT #{i}] Логируем содержимое целиком (совпадение={bool(hits)}, крупный={is_big}):")
-                log_full_body(f"INLINE-SCRIPT #{i}", content)
-
-                data = try_parse_payload(content)
-                if data is not None:
-                    describe_payload(data, prefix=f"SCRIPT #{i} STRUCT")
-
-        if not any_keyword_hit:
-            log.warning(
-                "⚠️ [DOC] Ни одно ключевое слово не найдено ни в одном инлайн-скрипте."
-            )
-
-        table_rows = parse_table_fallback(html)
-        if table_rows:
-            log.info(f"📊 [FALLBACK] Строк найдено в DOM сразу при загрузке: {len(table_rows)}")
-            log.info(f"📊 [FALLBACK] Пример первой строки: {table_rows[0]}")
-        else:
-            log.info("📊 [FALLBACK] В DOM нет заполненной <tbody> с данными.")
-
-    # ───────────────────── диагностика №2: скролл-контейнер + coinsPage.js ─────────────────────
-    def find_scroll_container_and_test(self, url: str = COINALYZE_URL):
-        """Ищем реальный скроллящийся контейнер таблицы и проверяем, растёт ли tbody при его скролле.
-        Также скачиваем mainTop,coinsPage.js напрямую и логируем поиск API-эндпоинтов внутри него."""
-        page = self._page
-
-        log.info(f"🌐 [PLAYWRIGHT] Открываем URL: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        self._wait_cloudflare()
-        page.wait_for_timeout(POST_LOAD_WAIT_MS)
-
-        initial_count = len(page.query_selector_all("tbody tr"))
-        log.info(f"📊 [SCROLL-TEST] Строк в tbody сразу после загрузки: {initial_count}")
-
-        candidates = page.evaluate("""
-            () => {
-                const results = [];
-                const all = document.querySelectorAll('*');
-                for (const el of all) {
-                    const style = window.getComputedStyle(el);
-                    const canScroll = (style.overflowY === 'auto' || style.overflowY === 'scroll');
-                    if (canScroll && el.scrollHeight > el.clientHeight + 10) {
-                        let selector = el.tagName.toLowerCase();
-                        if (el.id) selector += '#' + el.id;
-                        if (el.className) selector += '.' + String(el.className).trim().replace(/\\s+/g, '.');
-                        results.push({
-                            selector: selector,
-                            scrollHeight: el.scrollHeight,
-                            clientHeight: el.clientHeight,
-                            scrollTop: el.scrollTop,
-                            containsTable: el.querySelector('table') !== null
-                        });
-                    }
-                }
-                return results;
-            }
-        """)
-
-        log.info(f"🔎 [SCROLL-TEST] Найдено потенциальных скроллящихся контейнеров: {len(candidates)}")
-        for i, c in enumerate(candidates, start=1):
-            log.info(
-                f"🔎 [SCROLL-TEST] #{i}: selector={c['selector']!r}, "
-                f"scrollHeight={c['scrollHeight']}, clientHeight={c['clientHeight']}, "
-                f"containsTable={c['containsTable']}"
-            )
-
-        table_containers = [c for c in candidates if c["containsTable"]]
-        if not table_containers:
-            log.warning(
-                "⚠️ [SCROLL-TEST] Ни один найденный скроллящийся контейнер не содержит <table> внутри себя. "
-                "Возможно таблица виртуализирована без обычного overflow-контейнера (canvas/custom render)."
-            )
-        else:
-            for c in table_containers:
-                sel = c["selector"]
-                log.info(f"📜 [SCROLL-TEST] Скроллим контейнер: {sel}")
-                try:
-                    page.evaluate(
-                        """(sel) => {
-                            const el = document.querySelector(sel);
-                            if (el) {
-                                for (let i = 0; i < 15; i++) {
-                                    el.scrollTop += 2000;
-                                }
-                            }
-                        }""",
-                        sel,
-                    )
-                except Exception as e:
-                    log.warning(f"⚠️ [SCROLL-TEST] Не удалось скроллить {sel}: {e}")
-                    continue
-                page.wait_for_timeout(1500)
-                new_count = len(page.query_selector_all("tbody tr"))
-                log.info(f"📊 [SCROLL-TEST] После скролла {sel}: строк в tbody = {new_count} "
-                         f"(было {initial_count})")
-
-        log.info("🌐 [JS-FETCH] Ищем src внешних <script> на странице...")
-        script_srcs = page.eval_on_selector_all(
-            "script[src]",
-            "els => els.map(e => e.src)"
-        )
-        log.info(f"🌐 [JS-FETCH] Всего найдено <script src>: {len(script_srcs)}")
-
-        coins_page_js_url = None
-        for src in script_srcs:
-            if "coinsPage" in src or "mainTop" in src:
-                coins_page_js_url = src
-                break
-
-        if not coins_page_js_url:
-            log.warning("⚠️ [JS-FETCH] Не нашли src, содержащий coinsPage/mainTop, вот все найденные скрипты:")
-            for src in script_srcs:
-                log.info(f"   - {src}")
-            return
-
-        log.info(f"🌐 [JS-FETCH] Скачиваем: {coins_page_js_url}")
-        try:
-            resp = page.request.get(coins_page_js_url, timeout=20_000)
-            js_body = resp.text()
-            log.info(f"🌐 [JS-FETCH] Статус={resp.status}, длина={len(js_body)} символов")
-
-            api_keywords = ["/api/", "fetch(", "XMLHttpRequest", ".ajax(", "endpoint",
-                             "coins-listing", "coins_listing", "websocket", "WebSocket",
-                             "setInterval", "polling"]
-            for kw in api_keywords:
-                idx = js_body.find(kw)
-                if idx != -1:
-                    snippet = js_body[max(0, idx - 150): idx + 350]
-                    log.info(f"🎯 [JS-FETCH] Найдено '{kw}' на позиции {idx}, контекст:\n{snippet}")
-                else:
-                    log.info(f"ℹ️ [JS-FETCH] '{kw}' не найдено в файле.")
-        except Exception as e:
-            log.warning(f"⚠️ [JS-FETCH] Не удалось скачать/разобрать {coins_page_js_url}: {e}")
+        # сохраняем полный live HTML для ручного анализа, если нужно будет свериться
+        out_file = BASE / "live_page_dump.html"
+        out_file.write_text(html_live, encoding="utf-8")
+        log.info(f"💾 [LIVE] Полный HTML после ожидания сохранён в {out_file.name} (длина={len(html_live)})")
 
 
 def main():
     log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        scraper.find_scroll_container_and_test()
-
-    log.info("🏁 Диагностика завершена.")
+        scraper.run_full_diagnosis()
+    log.info("🏁 Диагностика завершена. Смотри: 🔌 [WS SUMMARY]/[WS RECV] — есть ли реальный WS-трафик с данными, "
+             "📊 [LIVE-TBODY] — сколько строк и что внутри них реально после ожидания.")
 
 
 if __name__ == "__main__":
