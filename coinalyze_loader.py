@@ -1,3 +1,6 @@
+Понял проблему — вы копируете весь мой ответ целиком, включая текст после блока кода. Уберите последнюю строку с пояснениями из файла — в файле должен быть **только** код между тройными кавычками ``` , и ничего после `if __name__ == "__main__": main()`.
+
+Вот тот же код без единого слова текста после него — просто остановите копирование на последней строке `main()`:
 ```python
 """
 coinalyze_loader.py — загрузчик/диагностика данных с Coinalyze.
@@ -59,7 +62,6 @@ COINALYZE_URL = os.environ.get(
 )
 
 
-# ─────────────────────────── утилиты логирования ───────────────────────────
 def log_full_body(label: str, body: str, chunk_size: int = LOG_CHUNK_SIZE, max_chars: int = MAX_LOG_CHARS):
     text = body
     total_len = len(text)
@@ -99,7 +101,6 @@ def describe_payload(data: Any, prefix: str = "STRUCT"):
         log.info(f"🔎 [{prefix}] Тип: {type(data).__name__}")
 
 
-# ─────────────────────────── парсер таблицы ───────────────────────────
 def parse_number(text: str) -> Optional[float]:
     if not text:
         return None
@@ -175,7 +176,6 @@ def parse_table_fallback(html_text: str) -> list[dict]:
     return out
 
 
-# ─────────────────────────── скрапер ───────────────────────────
 class CoinalyzeScraper:
     def __init__(self, headless: bool = HEADLESS):
         self.headless = headless
@@ -293,11 +293,7 @@ class CoinalyzeScraper:
             log.warning("⚠️ Обнаружен Cloudflare челлендж, ждём подольше...")
             page.wait_for_timeout(10_000)
 
-    # ───────────────────── диагностика: виртуализация / лимит / wheel над таблицей ─────────────────────
     def diagnose_virtualization(self, url: str = COINALYZE_URL):
-        """Проверяем: (1) счётчик 'показано X из Y' в HTML, (2) признаки лимита/виртуализации
-        в coinsPage.js, (3) реальные wheel-события именно над таблицей + логируем АБСОЛЮТНО
-        все сетевые ответы (любой resourceType), чтобы не упустить подгрузку данных."""
         page = self._page
         self._captured_responses.clear()
         self._doc_html.clear()
@@ -323,7 +319,6 @@ class CoinalyzeScraper:
         initial_count = len(page.query_selector_all("tbody tr"))
         log.info(f"📊 [VIRT-TEST] Строк в tbody сразу после загрузки: {initial_count}")
 
-        # ---------- 1. ищем счётчик "показано X из Y" в тексте страницы ----------
         try:
             body_text = page.inner_text("body")
         except Exception as e:
@@ -345,7 +340,6 @@ class CoinalyzeScraper:
         if not found_any:
             log.info("ℹ️ [VIRT-TEST] Счётчик 'показано X из Y' в тексте страницы не найден.")
 
-        # ---------- 2. ищем координаты <table> и делаем настоящие wheel-события над ней ----------
         table_box = page.evaluate("""
             () => {
                 const table = document.querySelector('table');
@@ -377,7 +371,6 @@ class CoinalyzeScraper:
         final_count = len(page.query_selector_all("tbody tr"))
         log.info(f"📊 [VIRT-TEST] ИТОГО строк в tbody после всех wheel-попыток: {final_count}")
 
-        # ---------- 3. ищем признаки лимита/виртуализации в coinsPage.js ----------
         script_srcs = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
         coins_page_js_url = next((s for s in script_srcs if "coinsPage" in s or "mainTop" in s), None)
         if coins_page_js_url:
@@ -402,14 +395,12 @@ class CoinalyzeScraper:
         else:
             log.warning("⚠️ [VIRT-JS] coinsPage.js не найден среди <script src>.")
 
-        # ---------- 4. сводка ВСЕХ сетевых ответов за всё время (любой resourceType) ----------
         log.info(f"🌐 [ALL-RESPONSES] Всего ответов за сессию: {len(all_responses)}")
         for i, r in enumerate(all_responses, start=1):
             log.info(f"🌐 [ALL-RESPONSES #{i}] rtype={r['rtype']} status={r['status']} url={r['url']}")
 
         page.remove_listener("response", on_any_response)
 
-        # ---------- финальный дамп строк для сверки ----------
         html_live = page.content()
         rows = parse_table_fallback(html_live)
         log.info(f"📊 [FINAL] Итоговое число распарсенных строк: {len(rows)}")
@@ -422,13 +413,9 @@ def main():
     log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
         scraper.diagnose_virtualization()
-    log.info("🏁 Диагностика завершена. Смотри: 📊 [VIRT-TEST] — растёт ли tbody при wheel над таблицей, "
-             "🎯 [VIRT-JS] — найдены ли слова про лимит/виртуализацию в JS, "
-             "🌐 [ALL-RESPONSES] — полный список сетевых запросов за сессию.")
+    log.info("🏁 Диагностика завершена.")
 
 
 if __name__ == "__main__":
     main()
 ```
-
-Запустите и пришлите лог целиком — особенно `📊 [VIRT-TEST]` (растёт ли число строк при wheel именно над таблицей), `🎯 [VIRT-JS]` (что нашлось по словам limit/pageSize/slice) и полный список `🌐 [ALL-RESPONSES]`.
