@@ -1,14 +1,21 @@
+```python
 """
 coinalyze_loader.py — загрузчик/диагностика данных с Coinalyze.
 
-Обновление: в coinsPage.js обнаружен pub.ReconnectingWebSocket — данные таблицы
-(price/volume/OI/funding и т.д.) скорее всего приходят по WebSocket и рендерятся
-клиентским JS в DOM, поэтому их нет ни в assets-info, ни в инлайн-скриптах HTML.
-Этот скрипт перехватывает WS-фреймы и дампит реальный tbody после загрузки.
+Статус диагностики:
+ - assets-info/ — справочник монет/бирж (не содержит текущих цифр).
+ - WebSocket не используется (0 соединений за 8с ожидания).
+ - Реальные данные ЕСТЬ в живом tbody после рендера (цены/объёмы верные),
+   но с текущим фильтром там только 42 строки, хотя в браузере видно 90+.
+ - Этот шаг: (1) ищем счётчик "показано X из Y" в тексте страницы,
+   (2) пробуем настоящие wheel-события именно над <table> (не над body/window),
+   (3) ищем признаки виртуализации/лимита (pageSize, limit, slice() и т.п.) в coinsPage.js,
+   (4) логируем АБСОЛЮТНО все сетевые ответы за сессию (любой resourceType).
 """
 from __future__ import annotations
 
 import os
+import re
 import json
 import logging
 from pathlib import Path
@@ -38,12 +45,10 @@ HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 
 ASSETS_INFO_MATCH = os.environ.get("ASSETS_INFO_MATCH", "assets-info")
 NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "40000"))
-POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "8000"))  # увеличено, дать WS время прислать данные
+POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "4000"))
 
 LOG_CHUNK_SIZE = int(os.environ.get("LOG_CHUNK_SIZE", "4000"))
 MAX_LOG_CHARS = int(os.environ.get("MAX_LOG_CHARS", "0"))
-
-WS_FRAME_LOG_LIMIT = int(os.environ.get("WS_FRAME_LOG_LIMIT", "3000"))  # символов на фрейм в логе
 
 COINALYZE_URL = os.environ.get(
     "COINALYZE_URL",
@@ -266,20 +271,17 @@ class CoinalyzeScraper:
 
         def on_framesent(payload):
             text = payload if isinstance(payload, str) else repr(payload)
-            log.info(f"📤 [WS SENT] {ws.url}\n{text[:WS_FRAME_LOG_LIMIT]}")
+            log.info(f"📤 [WS SENT] {ws.url}\n{text[:3000]}")
             self._ws_frames.append({"dir": "sent", "url": ws.url, "payload": text})
 
         def on_framereceived(payload):
             text = payload if isinstance(payload, str) else repr(payload)
-            log.info(f"📥 [WS RECV] {ws.url} длина={len(text)}\n{text[:WS_FRAME_LOG_LIMIT]}")
+            log.info(f"📥 [WS RECV] {ws.url} длина={len(text)}\n{text[:3000]}")
             self._ws_frames.append({"dir": "recv", "url": ws.url, "payload": text})
-
-        def on_close():
-            log.info(f"🔌 [WS] Закрыт: {ws.url}")
 
         ws.on("framesent", on_framesent)
         ws.on("framereceived", on_framereceived)
-        ws.on("close", lambda: on_close())
+        ws.on("close", lambda: log.info(f"🔌 [WS] Закрыт: {ws.url}"))
 
     def _wait_cloudflare(self):
         page = self._page
@@ -291,69 +293,142 @@ class CoinalyzeScraper:
             log.warning("⚠️ Обнаружен Cloudflare челлендж, ждём подольше...")
             page.wait_for_timeout(10_000)
 
-    def run_full_diagnosis(self, url: str = COINALYZE_URL):
-        """Открываем страницу, ловим WS-фреймы и assets-info, дампим реальный tbody."""
+    # ───────────────────── диагностика: виртуализация / лимит / wheel над таблицей ─────────────────────
+    def diagnose_virtualization(self, url: str = COINALYZE_URL):
+        """Проверяем: (1) счётчик 'показано X из Y' в HTML, (2) признаки лимита/виртуализации
+        в coinsPage.js, (3) реальные wheel-события именно над таблицей + логируем АБСОЛЮТНО
+        все сетевые ответы (любой resourceType), чтобы не упустить подгрузку данных."""
         page = self._page
         self._captured_responses.clear()
         self._doc_html.clear()
         self._ws_frames.clear()
         self._ws_connections.clear()
 
+        all_responses = []
+
+        def on_any_response(response: Response):
+            try:
+                rtype = response.request.resource_type
+            except Exception:
+                rtype = "?"
+            all_responses.append({"url": response.url, "status": response.status, "rtype": rtype})
+
+        page.on("response", on_any_response)
+
         log.info(f"🌐 [PLAYWRIGHT] Открываем URL: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         self._wait_cloudflare()
-
-        log.info(f"⏳ Ждём {POST_LOAD_WAIT_MS}ms, чтобы WS успел прислать данные...")
         page.wait_for_timeout(POST_LOAD_WAIT_MS)
 
-        # ---- сводка по WebSocket ----
-        log.info(f"🔌 [WS SUMMARY] Всего открытых WS-соединений: {len(self._ws_connections)}")
-        for u in self._ws_connections:
-            log.info(f"🔌 [WS SUMMARY]   - {u}")
-        log.info(f"🔌 [WS SUMMARY] Всего пойманных фреймов: {len(self._ws_frames)}")
+        initial_count = len(page.query_selector_all("tbody tr"))
+        log.info(f"📊 [VIRT-TEST] Строк в tbody сразу после загрузки: {initial_count}")
 
-        recv_frames = [f for f in self._ws_frames if f["dir"] == "recv"]
-        log.info(f"🔌 [WS SUMMARY] Из них полученных (recv): {len(recv_frames)}")
-        for i, f in enumerate(recv_frames, start=1):
-            log.info(f"📥 [WS RECV #{i}] от {f['url']}")
-            data = try_parse_payload(f["payload"])
-            if data is not None:
-                describe_payload(data, prefix=f"WS RECV #{i} STRUCT")
-            else:
-                log_full_body(f"WS RECV #{i} RAW", f["payload"])
+        # ---------- 1. ищем счётчик "показано X из Y" в тексте страницы ----------
+        try:
+            body_text = page.inner_text("body")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось получить inner_text body: {e}")
+            body_text = ""
 
-        if not self._ws_connections:
-            log.warning("⚠️ [WS] Ни одного WebSocket-соединения не было открыто за время ожидания. "
-                        "Возможно WS открывается по требованию (например, только при видимости вкладки) "
-                        "или использует другой транспорт (long-polling).")
+        count_patterns = [
+            r"(\d+)\s*(?:of|из)\s*(\d+)",
+            r"Showing\s+(\d+)",
+            r"Total[:\s]+(\d+)",
+            r"Results?[:\s]+(\d+)",
+        ]
+        found_any = False
+        for pat in count_patterns:
+            matches = re.findall(pat, body_text, re.IGNORECASE)
+            if matches:
+                found_any = True
+                log.info(f"🔎 [VIRT-TEST] Паттерн {pat!r} нашёл: {matches}")
+        if not found_any:
+            log.info("ℹ️ [VIRT-TEST] Счётчик 'показано X из Y' в тексте страницы не найден.")
 
-        # ---- сводка по assets-info ----
-        if self._captured_responses:
-            for i, item in enumerate(self._captured_responses, start=1):
-                log.info(f"📦 [ASSETS-INFO #{i}] status={item['status']} длина={len(item['body'])}")
+        # ---------- 2. ищем координаты <table> и делаем настоящие wheel-события над ней ----------
+        table_box = page.evaluate("""
+            () => {
+                const table = document.querySelector('table');
+                if (!table) return null;
+                const rect = table.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+            }
+        """)
+        log.info(f"🔎 [VIRT-TEST] Границы <table>: {table_box}")
 
-        # ---- дамп реального tbody после ожидания ----
+        if table_box:
+            cx = table_box["x"] + table_box["width"] / 2
+            cy = table_box["y"] + min(table_box["height"] / 2, 400)
+            log.info(f"🖱️ [VIRT-TEST] Двигаем мышь в центр таблицы: ({cx:.0f}, {cy:.0f})")
+            page.mouse.move(cx, cy)
+            page.wait_for_timeout(300)
+
+            for step in range(1, 11):
+                page.mouse.wheel(0, 1500)
+                page.wait_for_timeout(800)
+                cur_count = len(page.query_selector_all("tbody tr"))
+                log.info(f"📊 [VIRT-TEST] После wheel-события #{step} над таблицей: строк = {cur_count}")
+                if cur_count > initial_count:
+                    log.info(f"✅ [VIRT-TEST] Рост обнаружен! {initial_count} -> {cur_count}")
+                    initial_count = cur_count
+        else:
+            log.warning("⚠️ [VIRT-TEST] Не удалось получить границы <table>, wheel-тест пропущен.")
+
+        final_count = len(page.query_selector_all("tbody tr"))
+        log.info(f"📊 [VIRT-TEST] ИТОГО строк в tbody после всех wheel-попыток: {final_count}")
+
+        # ---------- 3. ищем признаки лимита/виртуализации в coinsPage.js ----------
+        script_srcs = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
+        coins_page_js_url = next((s for s in script_srcs if "coinsPage" in s or "mainTop" in s), None)
+        if coins_page_js_url:
+            log.info(f"🌐 [VIRT-JS] Скачиваем: {coins_page_js_url}")
+            try:
+                resp = page.request.get(coins_page_js_url, timeout=20_000)
+                js_body = resp.text()
+                log.info(f"🌐 [VIRT-JS] Статус={resp.status}, длина={len(js_body)}")
+
+                virt_keywords = ["virtual", "pageSize", "page_size", "limit", "offset",
+                                  "rowsPerPage", "rows_per_page", "maxRows", "max_rows",
+                                  "renderVisible", "visibleRows", "slice(", "loadMore", "load_more"]
+                for kw in virt_keywords:
+                    idx = js_body.find(kw)
+                    if idx != -1:
+                        snippet = js_body[max(0, idx - 150): idx + 350]
+                        log.info(f"🎯 [VIRT-JS] Найдено '{kw}' на позиции {idx}:\n{snippet}")
+                    else:
+                        log.info(f"ℹ️ [VIRT-JS] '{kw}' не найдено.")
+            except Exception as e:
+                log.warning(f"⚠️ [VIRT-JS] Не удалось скачать/разобрать {coins_page_js_url}: {e}")
+        else:
+            log.warning("⚠️ [VIRT-JS] coinsPage.js не найден среди <script src>.")
+
+        # ---------- 4. сводка ВСЕХ сетевых ответов за всё время (любой resourceType) ----------
+        log.info(f"🌐 [ALL-RESPONSES] Всего ответов за сессию: {len(all_responses)}")
+        for i, r in enumerate(all_responses, start=1):
+            log.info(f"🌐 [ALL-RESPONSES #{i}] rtype={r['rtype']} status={r['status']} url={r['url']}")
+
+        page.remove_listener("response", on_any_response)
+
+        # ---------- финальный дамп строк для сверки ----------
         html_live = page.content()
         rows = parse_table_fallback(html_live)
-        log.info(f"📊 [LIVE-TBODY] Строк в tbody после {POST_LOAD_WAIT_MS}ms ожидания: {len(rows)}")
-        for i, r in enumerate(rows[:10], start=1):
-            log.info(f"📊 [LIVE-TBODY] Строка #{i}: {r}")
-        if len(rows) > 10:
-            log.info(f"📊 [LIVE-TBODY] ... и ещё {len(rows) - 10} строк (не показаны, обрежь вывод при желании)")
-
-        # сохраняем полный live HTML для ручного анализа, если нужно будет свериться
+        log.info(f"📊 [FINAL] Итоговое число распарсенных строк: {len(rows)}")
         out_file = BASE / "live_page_dump.html"
         out_file.write_text(html_live, encoding="utf-8")
-        log.info(f"💾 [LIVE] Полный HTML после ожидания сохранён в {out_file.name} (длина={len(html_live)})")
+        log.info(f"💾 [FINAL] Полный HTML сохранён в {out_file.name} (длина={len(html_live)})")
 
 
 def main():
     log.info(f"🚀 Запуск диагностики в {'HEADLESS' if HEADLESS else 'GUI'} режиме")
     with CoinalyzeScraper() as scraper:
-        scraper.run_full_diagnosis()
-    log.info("🏁 Диагностика завершена. Смотри: 🔌 [WS SUMMARY]/[WS RECV] — есть ли реальный WS-трафик с данными, "
-             "📊 [LIVE-TBODY] — сколько строк и что внутри них реально после ожидания.")
+        scraper.diagnose_virtualization()
+    log.info("🏁 Диагностика завершена. Смотри: 📊 [VIRT-TEST] — растёт ли tbody при wheel над таблицей, "
+             "🎯 [VIRT-JS] — найдены ли слова про лимит/виртуализацию в JS, "
+             "🌐 [ALL-RESPONSES] — полный список сетевых запросов за сессию.")
 
 
 if __name__ == "__main__":
     main()
+```
+
+Запустите и пришлите лог целиком — особенно `📊 [VIRT-TEST]` (растёт ли число строк при wheel именно над таблицей), `🎯 [VIRT-JS]` (что нашлось по словам limit/pageSize/slice) и полный список `🌐 [ALL-RESPONSES]`.
