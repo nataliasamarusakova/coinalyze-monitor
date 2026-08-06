@@ -990,26 +990,37 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
     # состояние поднимает критический алерт вместо тихого игнорирования.
     bx = ot.get("bingx") or {}
     if ENABLE_BINGX and bx:
-        status = bx.get("status"); qty = bx.get("qty")
-        if qty:
+        status = bx.get("status")
+        # >>> PARTIAL BINGX: закрываем только remaining, а не весь qty <<<
+        qty_to_close = safe(bx.get("qty_remaining"), safe(bx.get("qty"), 0.0))
+        # <<< PARTIAL BINGX >>>
+
+        if qty_to_close and qty_to_close > 0:
             try:
                 import bingx_client
-                res = bingx_client.close_long(symbol, qty)
+                res = bingx_client.close_long(symbol, qty_to_close)
                 ot["bingx_close"] = res
                 if res.get("status") == "closed":
-                    log.info(f"[{symbol}] BingX CLOSE ok orderId={res.get('order_id')}")
+                    bx["qty_remaining"] = 0.0
+                    ot["bingx"] = bx
+                    log.info(f"[{symbol}] BingX CLOSE ok orderId={res.get('order_id')} qty={qty_to_close}")
                 else:
                     log.error(f"[{symbol}] BingX CLOSE failed: {res.get('error')}")
-                    send_tg(f"⚠️ <b>BingX CLOSE FAILED</b>\n{esc(symbol)} qty={esc(qty)}\n"
+                    send_tg(f"⚠️ <b>BingX CLOSE FAILED</b>\n{esc(symbol)} qty={esc(qty_to_close)}\n"
                             f"{esc(str(res.get('error'))[:200])}\n<i>Проверить позицию вручную.</i>")
             except Exception as e:
                 log.error(f"[{symbol}] BingX CLOSE exception: {e}")
                 send_tg(f"⚠️ <b>BingX CLOSE EXCEPTION</b>\n{esc(symbol)}\n{esc(str(e)[:200])}\n"
                         f"<i>Проверить позицию вручную.</i>")
         elif status not in ("skipped","rejected",None):
-            log.error(f"[{symbol}] BingX: закрытие невозможно, qty неизвестен (status={status})")
-            send_tg(f"⚠️ <b>BingX: НЕОПРЕДЕЛЁННАЯ ПОЗИЦИЯ</b>\n{esc(symbol)} status={esc(status)}\n"
-                    f"<i>qty неизвестен — проверить позицию на бирже вручную.</i>")
+            if qty_to_close == 0:
+                # позиция уже полностью закрыта partial TP
+                log.info(f"[{symbol}] BingX CLOSE skipped: qty_remaining=0 (all partial TP done)")
+                ot["bingx_close"] = {"status": "skipped", "reason": "qty_remaining_zero"}
+            else:
+                log.error(f"[{symbol}] BingX: закрытие невозможно, qty неизвестен (status={status})")
+                send_tg(f"⚠️ <b>BingX: НЕОПРЕДЕЛЁННАЯ ПОЗИЦИЯ</b>\n{esc(symbol)} status={esc(status)}\n"
+                        f"<i>qty неизвестен — проверить позицию на бирже вручную.</i>")
     # <<< BINGX >>>
     _fill_horizons(ot,symbol,exit_ts,price_full)
     gross=round((exit_price-ep)/ep*100,3) if (exit_price and ep) else None
