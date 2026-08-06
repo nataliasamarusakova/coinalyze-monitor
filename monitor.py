@@ -1466,6 +1466,9 @@ def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
     }
     close_reason,all_triggered=resolve_exit_reason(cand)
     if not close_reason:
+        # >>> PARTIAL BINGX: частичная фиксация только если нет close_reason <<<
+        maybe_close_partial_take_profit(ot, sym, cur_price)
+        # <<< PARTIAL BINGX >>>
         return None,[],None,None
     exit_price=cur_price or ot.get("last_price")
     src="live" if cur_price else "last_seen"
