@@ -1549,18 +1549,32 @@ def run():
                                          sig["price"],history_len=sig["history_len"],
                                          window=sig["window"],strength=sig["strength"],
                                          shadow=sig["shadow"])
-                if ENABLE_BINGX and new_ot is not None:
-                    try:
-                        import bingx_client
-                        bx=bingx_client.open_long(sym,sig["price"])
-                        new_ot["bingx"]=bx
-                        if bx.get("status") in ("opened","already_open"):
-                            log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
-                        else:
-                            log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
-                    except Exception as e:
-                        log.error(f"[{sym}] BingX OPEN exception: {e}")
-                        new_ot["bingx"]={"status":"error","error":str(e)}
+                                    # >>> BINGX: строго ПОСЛЕ open_trade_record, защищено от None <<<
+                    if ENABLE_BINGX and new_ot is not None:
+                        try:
+                            import bingx_client
+                            bx_symbol = bingx_client.to_bx_symbol(sym)
+                            if not bingx_client.contract_exists(sym):
+                                new_ot["bingx"] = {
+                                    "status": "skipped",
+                                    "reason": "contract_not_found",
+                                    "symbol": bx_symbol
+                                }
+                                log.info(f"[{sym}] BingX SKIP: контракт {bx_symbol} не найден")
+                            else:
+                                bx = bingx_client.open_long(sym, cur_price)
+                                new_ot["bingx"] = bx
+                                if bx.get("status") in ("opened", "already_open"):
+                                    log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
+                                else:
+                                    log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
+                        except Exception as e:
+                            log.error(f"[{sym}] BingX OPEN exception: {e}")
+                            try:
+                                new_ot["bingx"] = {"status": "error", "error": str(e)}
+                            except Exception:
+                                pass
+                    # <<< BINGX >>>
                 log.info(f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
                          f"strength={sig['strength']} window={sig['window']['span_min']}м")
         # [FIX 6.2] idea_first_seen_ts живёт в реестре и НЕ удаляется вместе с
