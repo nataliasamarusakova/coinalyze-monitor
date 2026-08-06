@@ -16,7 +16,9 @@ try:
 except ImportError:
     def stealth_sync(page): pass
 
-from conditions import check_confirmed_path_a, check_confirmed_path_b
+from conditions import (check_confirmed_path_a, check_confirmed_path_b,
+                        signal_strength, window_quality, shadow_variants,
+                        SHADOW_VARIANTS, CONFIG as CONDITIONS_CONFIG)
 
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY_FILE  = BASE / "market_history.jsonl"
@@ -27,6 +29,9 @@ CALIBRATION_FILE     = BASE / "calibration.jsonl"
 TRADES_FILE          = BASE / "trades.jsonl"
 PENDING_FILE         = BASE / "pending_trades.jsonl"
 LIFECYCLE_STATE_FILE = BASE / "lifecycle_state.json"
+SHADOW_SIGNALS_FILE  = BASE / "shadow_signals.jsonl"
+DISCOVERY_HISTORY_FILE = BASE / "discovery_history.jsonl"
+RECONCILE_FILE       = BASE / "reconciliation.jsonl"
 DEBUG_HTML_FILE      = BASE / "debug_page.html"
 
 COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
@@ -46,8 +51,10 @@ MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
 MISS_EXIT_RUNS=2; MISS_REMOVE_RUNS=4; NEUTRAL_HYSTERESIS=2
 
-TRADE_SCHEMA_VERSION=2; SIGNAL_LOGIC_VERSION=1; LIFECYCLE_ENGINE_VERSION=2
-ENGINE_VERSIONS={"schema":TRADE_SCHEMA_VERSION,"signal":SIGNAL_LOGIC_VERSION,"lifecycle":LIFECYCLE_ENGINE_VERSION,"created":"2026-08-04"}
+TRADE_SCHEMA_VERSION=3; SIGNAL_LOGIC_VERSION=2; LIFECYCLE_ENGINE_VERSION=3
+ENGINE_VERSIONS={"schema":TRADE_SCHEMA_VERSION,"signal":SIGNAL_LOGIC_VERSION,
+                 "lifecycle":LIFECYCLE_ENGINE_VERSION,"created":"2026-08-05",
+                 "conditions":CONDITIONS_CONFIG}
 HASH_VERSION="sha256_v1"
 TRADE_TIMEOUT_MIN=240; FEE_PCT=0.0
 STOP_MODE="fixed"; STOP_LOSS_PCT=5.0
@@ -56,10 +63,67 @@ IDEA_REGISTRY_TTL_DAYS=30
 TRADE_HORIZONS=[30,60,120,240]; TRADE_WIN_PCT=1.0
 PENDING_GRACE_MIN=10; PENDING_WAIT_MAX_MIN=60; HORIZON_MAX_LAG_MIN=15
 PENDING=[]
-COOLDOWN_BY_EXIT_REASON={"STOP_LOSS":120,"INVALIDATED":60,"DISTRIBUTION":60,"EXHAUSTION":45,"SIGNAL_DECAY":30,"TIMEOUT":0,"MISSED":0,"NEUTRAL":0}
+DISCOVERY={}          # отпечаток discovery-конфигурации текущего прогона
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ДВИЖОК v3 — исправления по аудиту логики от 2026-08-05.
+#
+# П1  Менеджер позиции вынесен из-под ветки NEUTRAL (manage_open_trade).
+#     Было: `if state=="NEUTRAL": ... continue` прерывал обработку ДО блока
+#     управления, поэтому стоп-лосс, таймаут, затухание сигнала, обновление
+#     last_price и _fill_horizons не выполнялись. Медианная сделка проводила
+#     в этом состоянии 17 прогонов (85 мин) — 66% своей жизни.
+#     Замер: 0 стоп-лоссов на 97 сделок, 13 сделок дольше лимита 240 мин
+#     (максимум 505), 65% выходов по цене медианной давностью 70 мин.
+#
+# П2  Явный выход DATA_STALE вместо аварийного MISSED через 4 прогона.
+#     Было: устарелость цены выхода до 380 мин при том, что у 89% сделок
+#     свежая цена лежала в market_history.jsonl.
+#
+# П4  Cooldown для DATA_STALE / MISSED / TIMEOUT сделан ненулевым и вынесен
+#     в отдельный реестр, который не удаляется вместе с записью watchlist.
+#
+# П3  Порог стоп-лосса НЕ меняется. Наблюдаемый MAE занижен тем же дефектом
+#     П1, поэтому калибровать его можно только на данных, собранных ПОСЛЕ
+#     внедрения П1. До тех пор пишем теневые уровни (SHADOW_STOP_LEVELS).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# П2: возраст цены, после которого позиция закрывается явно
+PRICE_STALE_EXIT_MIN=15
+# Теневой эксперимент по предикату входа (И1/И3/И2). Пишем расхождения вариантов,
+# решения не меняем. TTL как у snapshots.
+SHADOW_SIGNALS_TTL_DAYS=7
+
+# ─── Сверка журнала с биржей ────────────────────────────────────────────────
+# Клиент умеет спрашивать позиции (_position_amt), но монитор никогда этого не
+# делал: вызывались только open_long/close_long. В bingx_orders.jsonl это дало
+# 50 открытий против 21 успешного закрытия — 29 позиций остались на бирже с
+# плечом 10x, а из журнала исчезли. Причина отказов была детерминированной:
+# code=109400 «In the Hedge mode, the ReduceOnly field can not be filled».
+#
+# Автозакрытие расхождений по умолчанию ВЫКЛЮЧЕНО: это необратимая операция с
+# реальными деньгами. По умолчанию — журнал + алерт.
+RECONCILE_AUTOCLOSE = os.environ.get("BINGX_RECONCILE_AUTOCLOSE","false").lower()=="true"
+RECONCILE_QTY_TOLERANCE = 0.02      # относительное расхождение объёма, которое игнорируем
+# П3: теневые уровни стопа — только пишем «сработал бы», решения не меняем
+SHADOW_STOP_LEVELS=(1.5,2.5)
+# И4: триггер Шмитта на непрерывной силе сигнала. Пока теневой режим.
+USE_SCHMITT=False
+SCHMITT_ENTER=9.5; SCHMITT_EXIT=8.0
+# 6.4: фаза рынка. Символ BTC исправлен, но модификатор пока не включаем —
+# иначе поведение изменится одновременно с исправлением измерений.
+BTC_SYMBOLS=("BTC","BTCUSDT","BTCUSD","XBTUSD")
+MARKET_PHASE_MODIFIER_ENABLED=False
+
+COOLDOWN_BY_EXIT_REASON={"STOP_LOSS":120,"INVALIDATED":60,"DISTRIBUTION":60,"EXHAUSTION":45,
+                         "SIGNAL_DECAY":30,"TIMEOUT":15,"DATA_STALE":15,"MISSED":15,"NEUTRAL":15}
 PROTECTION_REASONS={"STOP_LOSS"}
-EXIT_PRIORITY=["INVALIDATED","EXHAUSTION","DISTRIBUTION","STOP_LOSS","SIGNAL_DECAY","TIMEOUT","MISSED","NEUTRAL"]
-EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL","STOP_LOSS":"PROTECTION","TIMEOUT":"LIFETIME","SIGNAL_DECAY":"LIFETIME","MISSED":"DATA","NEUTRAL":"LIFETIME"}
+EXIT_PRIORITY=["EXCHANGE_CLOSED","INVALIDATED","EXHAUSTION","DISTRIBUTION","STOP_LOSS","SIGNAL_DECAY","TIMEOUT","DATA_STALE","MISSED","NEUTRAL"]
+EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL","STOP_LOSS":"PROTECTION",
+            "TIMEOUT":"LIFETIME","SIGNAL_DECAY":"LIFETIME","DATA_STALE":"DATA","MISSED":"DATA","NEUTRAL":"LIFETIME",
+            # позиция закрыта вне нашего контура: ликвидация, ручное закрытие
+            # или наш ордер исполнился, но ответ не дошёл
+            "EXCHANGE_CLOSED":"EXTERNAL"}
 STATE_RANK={"ACCUMULATION":1,"EARLY_MOVE":2,"CONFIRMED_TREND":3,"ACCELERATION":4,"EXHAUSTION":5,"DISTRIBUTION":6}
 EQUITY_SYMBOLS={"META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA","GOOGL","MSTR","COIN","BZ"}
 EQUITY_HINTS=("Inc","Corp","Technologies","Platforms")
@@ -112,6 +176,62 @@ def resolve_exit_reason(candidates):
 def compute_snapshot_hash(snapshot):
     snapshot_json=json.dumps(snapshot,sort_keys=True,ensure_ascii=False)
     return {"algorithm":"sha256","version":"v1","value":hashlib.sha256(snapshot_json.encode()).hexdigest()}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ОТПЕЧАТОК DISCOVERY-КОНФИГУРАЦИИ
+#
+# COINALYZE_URL задаётся переменной окружения и содержит base64-параметр
+# filter, который определяет ВСЮ вселенную сигналов. В коде его больше нет,
+# в журнале не было — то есть невозможно сказать, каким фильтром порождена
+# сделка и не менялся ли он между прогонами. Для системы, где выводы делаются
+# по накопленной статистике, это самый важный неверсионированный параметр.
+#
+# Пишем: sha256 полного URL (сам URL целиком не логируем — он приходит извне
+# и может содержать что угодно) + расшифрованные параметры отбора.
+# ═══════════════════════════════════════════════════════════════════════════
+def discovery_fingerprint():
+    from urllib.parse import urlparse,parse_qs
+    import base64
+    url=COINALYZE_URL or ""
+    out={"url_sha256":hashlib.sha256(url.encode()).hexdigest()[:16],
+         "url_len":len(url),"max_pages":MAX_PAGES,"url_configured":bool(url)}
+    try:
+        q=parse_qs(urlparse(url).query)
+        for key in ("filter","columns","order_by","order_dir"):
+            v=(q.get(key) or [None])[0]
+            if v is None: continue
+            if key in ("filter","columns"):
+                try:
+                    out[key]=base64.urlsafe_b64decode(v+"="*(-len(v)%4)).decode("utf-8","replace")
+                except Exception:
+                    out[key]=f"<base64 не декодируется, len={len(v)}>"
+            else:
+                out[key]=v
+    except Exception as e:
+        out["parse_error"]=str(e)[:80]
+    return out
+
+def log_discovery_change(fp,ts):
+    """Пишет строку в discovery_history.jsonl только при СМЕНЕ отпечатка.
+    Смена фильтра = новая вселенная = новый эксперимент, и это должно быть
+    видно в истории, а не только в настройках репозитория."""
+    prev=load_jsonl(DISCOVERY_HISTORY_FILE)
+    last=prev[-1] if prev else None
+    if last and last.get("url_sha256")==fp["url_sha256"]:
+        return False
+    append_jsonl(DISCOVERY_HISTORY_FILE,{"ts":ts,**fp,
+        "previous_sha256":(last or {}).get("url_sha256"),
+        "lifecycle_engine_version":LIFECYCLE_ENGINE_VERSION,
+        "signal_logic_version":SIGNAL_LOGIC_VERSION})
+    if last:
+        log.warning(f"DISCOVERY CHANGED {last.get('url_sha256')} → {fp['url_sha256']}")
+        send_tg(f"⚙️ <b>Discovery-фильтр изменён</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"{esc(last.get('url_sha256'))} → {esc(fp['url_sha256'])}\n"
+                f"<i>Вселенная сигналов другая. Статистику до и после смешивать нельзя.</i>\n"
+                f"filter: <code>{esc(str(fp.get('filter'))[:200])}</code>")
+    else:
+        log.info(f"DISCOVERY baseline {fp['url_sha256']}")
+    return True
 
 def _setup_browser_context(p):
     """Создаёт browser context с cookies. Возвращает (browser, page)."""
@@ -377,8 +497,16 @@ def load_lifecycle_state():
     if not LIFECYCLE_STATE_FILE.exists(): return {}
     try: data=json.loads(LIFECYCLE_STATE_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError: return {}
-    now=time.time()
-    return {sym:v for sym,v in data.items() if now-v.get("idea_first_seen_ts",0)<IDEA_REGISTRY_TTL_DAYS*86400}
+    # [FIX 6.2] Было: запись без idea_first_seen_ts давала now-0 → сразу
+    # отбрасывалась. Из-за этого cooldown, записанный без возраста идеи, не
+    # выживал до следующего прогона — механизм существовал, но не действовал.
+    now=time.time(); ttl=IDEA_REGISTRY_TTL_DAYS*86400; out={}
+    for sym,v in data.items():
+        if not isinstance(v,dict): continue
+        idea_fresh=(now-v.get("idea_first_seen_ts",0))<ttl if v.get("idea_first_seen_ts") else False
+        cooldown_active=v.get("cooldown_until",0)>now
+        if idea_fresh or cooldown_active: out[sym]=v
+    return out
 def save_lifecycle_state(state): LIFECYCLE_STATE_FILE.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
 def load_market_history():
     cutoff=now_ts()-LIFECYCLE_WINDOW_MIN*60; recs=load_jsonl(MARKET_HISTORY_FILE)
@@ -544,17 +672,31 @@ def fetch_btc_price_chg():
     except Exception as e: log.warning(f"CoinGecko: {e}")
     return None
 def detect_market_phase(rows):
-    btc=next((r for r in rows if r["symbol"]=="BTCUSDT"),None)
+    """[FIX 6.4] Искали символ 'BTCUSDT', которого в данных нет — там 'BTC'.
+    Ветка была мертва, всегда шёл запрос в CoinGecko, у всех 97 сделок фаза
+    записана как neutral. Теперь символ ищется по списку вариантов.
+
+    Модификатор пока принудительно 0 (MARKET_PHASE_MODIFIER_ENABLED=False):
+    фазу нужно сначала накопить в журнале, а уже потом позволять ей менять
+    Score и confidence. Иначе исправление измерения и изменение поведения
+    произойдут одновременно и их нельзя будет разделить."""
+    btc=next((r for r in rows if r.get("symbol") in BTC_SYMBOLS),None)
+    btc_src="rows"
     if btc: btc_pc=btc.get("price_chg24") or 0
     else:
-        btc_pc=fetch_btc_price_chg()
-        if btc_pc is None: return {"phase":"unknown","note":"","modifier":0}
+        btc_pc=fetch_btc_price_chg(); btc_src="coingecko"
+        if btc_pc is None:
+            return {"phase":"unknown","note":"","modifier":0,"btc_chg24":None,"btc_source":"none"}
     up=sum(1 for r in rows if (r.get("price_chg24") or 0)>0); ratio=up/max(len(rows),1)
-    if btc_pc>2 and ratio>0.6: return {"phase":"risk-on","note":"BTC↑ рынок широкий","modifier":+1}
-    if btc_pc>2 and ratio<0.4: return {"phase":"btc-dominance","note":"BTC↑ альты нет","modifier":0}
-    if btc_pc<-2 and ratio<0.3: return {"phase":"risk-off","note":"BTC↓ рынок слабый","modifier":-1}
-    if btc_pc<-2 and ratio>0.5: return {"phase":"rotation","note":"BTC↓ альты держатся","modifier":0}
-    return {"phase":"neutral","note":"","modifier":0}
+    if btc_pc>2 and ratio>0.6:    ph,note,mod="risk-on","BTC↑ рынок широкий",+1
+    elif btc_pc>2 and ratio<0.4:  ph,note,mod="btc-dominance","BTC↑ альты нет",0
+    elif btc_pc<-2 and ratio<0.3: ph,note,mod="risk-off","BTC↓ рынок слабый",-1
+    elif btc_pc<-2 and ratio>0.5: ph,note,mod="rotation","BTC↓ альты держатся",0
+    else:                         ph,note,mod="neutral","",0
+    return {"phase":ph,"note":note,
+            "modifier":mod if MARKET_PHASE_MODIFIER_ENABLED else 0,
+            "modifier_raw":mod,"btc_chg24":round(btc_pc,3),
+            "btc_source":btc_src,"breadth_ratio":round(ratio,3)}
 
 ACTIONS={"NEUTRAL":"IGNORE","ACCUMULATION":"WATCH","EARLY_MOVE":"WATCH_LONG","CONFIRMED_TREND":"POSSIBLE_ENTRY","ACCELERATION":"LONG_SETUP","EXHAUSTION":"NO_NEW_ENTRY","DISTRIBUTION":"EXIT_AVOID","INVALIDATED":"REMOVE"}
 STATE_EMOJI={"NEUTRAL":"⚪","ACCUMULATION":"🔍","EARLY_MOVE":"🌱","CONFIRMED_TREND":"🟢","ACCELERATION":"🚀","EXHAUSTION":"🟠","DISTRIBUTION":"🔴","INVALIDATED":"❌"}
@@ -727,20 +869,29 @@ def _fill_horizons(ot,sym,as_of_ts,price_full):
                 ot[key]=round((ph-ep)/ep*100,3)
                 ot[f"{key}_available"]=True
 
-def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,snapshots,price):
+def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,snapshots,price,history_len=None,window=None,strength=None,shadow=None):
+    """[FIX И5] Пропуски больше не превращаются в 0.0.
+    Было: safe(r.get("oi_mktcap_ratio")) при 28.9% отсутствующих значений
+    писало в журнал 0.0, неотличимый от настоящего нуля — из-за этого анализ
+    порога OI/MarketCap был невозможен.
+
+    [FIX A2] Добавлены абсолютные volume24 / oi / mktcap / price_chg24.
+    Пороги discovery-фильтра заданы по ним, но в журнал они не попадали,
+    а market_history.jsonl живёт всего 2 дня — данные терялись безвозвратно."""
     if state=="CONFIRMED_TREND": trigger=f"confirmed_trend_{path}_path"
     elif state=="ACCELERATION": trigger="acceleration_confirmation"
     else: trigger=state.lower()
     entry_snapshot={
         "timestamp":ts,"price":price,"symbol":r.get("symbol"),
         "features":{
-            "price_chg24":safe(r.get("price_chg24")),"oi_chg24":safe(r.get("oi_chg24_pct")),
-            "oi_chg4h":safe(r.get("oi_chg4h_pct")),"funding":safe(r.get("fr_avg")),
-            "funding_oiw":safe(r.get("fr_oiw")),"cvd24":safe(r.get("cvd24")),
-            "lls24":safe(r.get("lls24")),"oi_vol_ratio":safe(r.get("oi_vol_ratio")),
-            "oi_mcap_ratio":safe(r.get("oi_mktcap_ratio")),"ls_accounts":r.get("ls_accounts"),
-            "volume24":r.get("volume24"),"liq_short24":safe(r.get("liq_short24")),
-            "liq_long24":safe(r.get("liq_long24")),"btc_corr7d":r.get("btc_corr7d"),
+            "price_chg24":r.get("price_chg24"),"oi_chg24":r.get("oi_chg24_pct"),
+            "oi_chg4h":r.get("oi_chg4h_pct"),"funding":r.get("fr_avg"),
+            "funding_oiw":r.get("fr_oiw"),"cvd24":r.get("cvd24"),
+            "lls24":r.get("lls24"),"oi_vol_ratio":r.get("oi_vol_ratio"),
+            "oi_mcap_ratio":r.get("oi_mktcap_ratio"),"ls_accounts":r.get("ls_accounts"),
+            "volume24":r.get("volume24"),"oi_abs":r.get("oi"),"mktcap":r.get("mktcap"),
+            "liq_short24":r.get("liq_short24"),
+            "liq_long24":r.get("liq_long24"),"btc_corr7d":r.get("btc_corr7d"),
             "cvd_momentum":round(derived["cvd_momentum"],2),"oi_accel":round(derived["oi_accel"],3),
             "price_accel":round(derived["price_accel"],3),"funding_pressure":round(derived["funding_pressure"],5),
             "oi_trend":derived["oi_trend"],"cvd_trend":derived["cvd_trend"],
@@ -750,6 +901,8 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "decision":{"state":state,"score":score,"momentum":momentum,"path":path,
                     "pattern":pattern,"market_phase":market.get("phase","unknown"),
                     "entry_reason":{"state":state,"path":path,"trigger":trigger}},
+        # какая вселенная породила эту сделку (COINALYZE_URL задан извне)
+        "discovery":dict(DISCOVERY),
     }
     ot={
         "entry_ts":ts,"entry_price":price,"entry_state":state,"entry_path":path,
@@ -760,7 +913,17 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "idea_first_seen_ts":idea_first_seen_ts,
         "idea_age_minutes":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
         "signal_age_min":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
+        # [FIX 6.3] snapshot_count_before_entry измеряет срок в watchlist, а не
+        # длину истории решения — из-за этого 39 сделок из 97 записали «2» при
+        # требовании 5 снимков. Оставлено для совместимости, рядом добавлено
+        # честное значение и явное имя.
         "snapshot_count_before_entry":snapshots,
+        "watchlist_tenure_runs":snapshots,
+        "history_len_before_entry":history_len,
+        "entry_window":window,
+        "entry_signal_strength":strength,
+        # теневые вердикты предиката на момент входа (И1/И3/И2 — не влияли на решение)
+        "entry_shadow_predicates":({k:shadow[k] for k,_ in SHADOW_VARIANTS} if shadow else None),
         "asset_class":classify_asset_class(r),"name":r.get("name",r.get("symbol","")),
         "engine_versions":dict(ENGINE_VERSIONS),
         "entry_snapshot":entry_snapshot,
@@ -775,14 +938,26 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "entry_pattern":pattern,
         "entry_oi_trend":derived["oi_trend"],"entry_cvd_trend":derived["cvd_trend"],
         "entry_price_trend":derived["price_trend"],"entry_divergence":derived["divergence"],
-        "entry_price_chg24":safe(r.get("price_chg24")),"entry_oi_chg24":safe(r.get("oi_chg24_pct")),
-        "entry_oi_chg4h":safe(r.get("oi_chg4h_pct")),"entry_cvd24":safe(r.get("cvd24")),
-        "entry_lls24":safe(r.get("lls24")),"entry_fr_oiw":safe(r.get("fr_oiw")),
-        "entry_oi_vol_ratio":safe(r.get("oi_vol_ratio")),"entry_oi_mktcap_ratio":safe(r.get("oi_mktcap_ratio")),
-        "entry_liq_short24":safe(r.get("liq_short24")),"entry_liq_long24":safe(r.get("liq_long24")),
+        # [FIX И5] None сохраняется как None, а не как 0.0
+        "entry_price_chg24":r.get("price_chg24"),"entry_oi_chg24":r.get("oi_chg24_pct"),
+        "entry_oi_chg4h":r.get("oi_chg4h_pct"),"entry_cvd24":r.get("cvd24"),
+        "entry_lls24":r.get("lls24"),"entry_fr_oiw":r.get("fr_oiw"),
+        "entry_oi_vol_ratio":r.get("oi_vol_ratio"),"entry_oi_mktcap_ratio":r.get("oi_mktcap_ratio"),
+        "entry_liq_short24":r.get("liq_short24"),"entry_liq_long24":r.get("liq_long24"),
         "entry_ls_accounts":r.get("ls_accounts"),"entry_btc_corr7d":r.get("btc_corr7d"),
+        # [FIX A2] абсолютные величины — раньше терялись вместе с market_history
+        "entry_volume24":r.get("volume24"),"entry_oi_abs":r.get("oi"),"entry_mktcap":r.get("mktcap"),
         "entry_market_phase":market.get("phase","unknown"),
-        "data_quality":{"entry_price_source":"live","exit_price_source":None,"missing_snapshots":0,"max_price_age_min":0,"price_unknown":False},
+        "entry_market_breadth":market.get("breadth_ratio"),
+        "entry_btc_chg24":market.get("btc_chg24"),
+        "data_quality":{"entry_price_source":"live","exit_price_source":None,"missing_snapshots":0,
+                        "max_price_age_min":0,"price_unknown":False,"exit_price_age_min":0.0},
+        # П3: теневые стопы. Пишем «сработал бы на уровне X», решения не меняем,
+        # пока не накопится 300–400 сделок с честным MAE (см. блок ДВИЖОК v3).
+        "shadow_stops":{str(lvl):None for lvl in SHADOW_STOP_LEVELS},
+        # И4: теневой триггер Шмитта — считаем состояние, но не действуем по нему
+        "shadow_schmitt_on":True,
+        "shadow_schmitt_exit_ts":None,
     }
     for h in TRADE_HORIZONS:
         ot[f"return_{h}m"]=None
@@ -793,21 +968,40 @@ def _exit_meta(source,exit_ts,last_price_ts):
     if source=="live" or last_price_ts is None: return source,0.0
     return source,round(max(0,exit_ts-last_price_ts)/60,1)
 
-def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live",exit_candidates=None,lifecycle_complete=True):
+def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live",exit_candidates=None,lifecycle_complete=True,skip_exchange=False):
     ep=ot.get("entry_price")
+    if skip_exchange:
+        # позиции на бирже уже нет (установлено сверкой) — закрывать нечего
+        ot=dict(ot); ot.pop("bingx",None)
      # >>> BINGX: закрытие позиции на бирже перед закрытием журнала <<<
+    # [FIX 6.6] Было: close_long вызывался ТОЛЬКО при
+    # status in ("opened","already_open"). Если открытие вернуло ошибку, а ордер
+    # фактически исполнился (типичный случай — таймаут ответа API), позиция
+    # оставалась на бирже навсегда и не попадала ни в один журнал.
+    # Теперь закрытие пробуется при любом известном qty, а неопределённое
+    # состояние поднимает критический алерт вместо тихого игнорирования.
     bx = ot.get("bingx") or {}
-    if ENABLE_BINGX and bx.get("status") in ("opened", "already_open") and bx.get("qty"):
-        try:
-            import bingx_client
-            res = bingx_client.close_long(symbol, bx["qty"])
-            ot["bingx_close"] = res
-            if res.get("status") == "closed":
-                log.info(f"[{symbol}] BingX CLOSE ok orderId={res.get('order_id')}")
-            else:
-                log.error(f"[{symbol}] BingX CLOSE failed: {res.get('error')}")
-        except Exception as e:
-            log.error(f"[{symbol}] BingX CLOSE exception: {e}")
+    if ENABLE_BINGX and bx:
+        status = bx.get("status"); qty = bx.get("qty")
+        if qty:
+            try:
+                import bingx_client
+                res = bingx_client.close_long(symbol, qty)
+                ot["bingx_close"] = res
+                if res.get("status") == "closed":
+                    log.info(f"[{symbol}] BingX CLOSE ok orderId={res.get('order_id')}")
+                else:
+                    log.error(f"[{symbol}] BingX CLOSE failed: {res.get('error')}")
+                    send_tg(f"⚠️ <b>BingX CLOSE FAILED</b>\n{esc(symbol)} qty={esc(qty)}\n"
+                            f"{esc(str(res.get('error'))[:200])}\n<i>Проверить позицию вручную.</i>")
+            except Exception as e:
+                log.error(f"[{symbol}] BingX CLOSE exception: {e}")
+                send_tg(f"⚠️ <b>BingX CLOSE EXCEPTION</b>\n{esc(symbol)}\n{esc(str(e)[:200])}\n"
+                        f"<i>Проверить позицию вручную.</i>")
+        elif status not in ("skipped","rejected",None):
+            log.error(f"[{symbol}] BingX: закрытие невозможно, qty неизвестен (status={status})")
+            send_tg(f"⚠️ <b>BingX: НЕОПРЕДЕЛЁННАЯ ПОЗИЦИЯ</b>\n{esc(symbol)} status={esc(status)}\n"
+                    f"<i>qty неизвестен — проверить позицию на бирже вручную.</i>")
     # <<< BINGX >>>
     _fill_horizons(ot,symbol,exit_ts,price_full)
     gross=round((exit_price-ep)/ep*100,3) if (exit_price and ep) else None
@@ -859,7 +1053,30 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
         "idea_age_minutes":ot.get("idea_age_minutes"),
         "signal_age_min":ot.get("signal_age_min"),
         "snapshot_count_before_entry":ot.get("snapshot_count_before_entry"),
+        # [FIX] новые поля движка v3 — без этого они терялись при закрытии
+        "watchlist_tenure_runs":ot.get("watchlist_tenure_runs"),
+        "history_len_before_entry":ot.get("history_len_before_entry"),
+        "entry_window":ot.get("entry_window"),
+        "entry_signal_strength":ot.get("entry_signal_strength"),
+        "entry_shadow_predicates":ot.get("entry_shadow_predicates"),
+        "last_signal_strength":ot.get("last_signal_strength"),
+        "shadow_stops":ot.get("shadow_stops"),
+        "shadow_schmitt_exit_ts":ot.get("shadow_schmitt_exit_ts"),
+        "shadow_schmitt_exit_min":ot.get("shadow_schmitt_exit_min"),
+        "entry_volume24":ot.get("entry_volume24"),
+        "entry_oi_abs":ot.get("entry_oi_abs"),
+        "entry_mktcap":ot.get("entry_mktcap"),
+        "entry_market_breadth":ot.get("entry_market_breadth"),
+        "entry_btc_chg24":ot.get("entry_btc_chg24"),
+        "exit_price_age_min":ot.get("data_quality",{}).get("exit_price_age_min"),
         "engine_versions":ot.get("engine_versions",dict(ENGINE_VERSIONS)),
+        # отпечаток discovery-фильтра: без него нельзя сказать, сопоставимы ли
+        # две сделки между собой (вселенная задаётся переменной окружения)
+        "discovery":ot.get("entry_snapshot",{}).get("discovery"),
+        "discovery_sha256":(ot.get("entry_snapshot",{}).get("discovery") or {}).get("url_sha256"),
+        # плоские версии — trades_report.py и make_dashboard.py читают их напрямую
+        "signal_logic_version":ot.get("engine_versions",{}).get("signal",SIGNAL_LOGIC_VERSION),
+        "lifecycle_engine_version":ot.get("engine_versions",{}).get("lifecycle",LIFECYCLE_ENGINE_VERSION),
         "max_state":ot.get("max_state"),
         "state_history":ot.get("state_history",[]),
         "time_in_states":time_in_states,
@@ -940,6 +1157,216 @@ ACTIVE_STATES={"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"}
 ENTRY_STATES={"CONFIRMED_TREND","ACCELERATION"}
 CLOSE_STATES={"EXHAUSTION","DISTRIBUTION"}
 
+# ═══════════════════════════════════════════════════════════════════════════
+# СЛОЙ 2 — МЕНЕДЖЕР ПОЗИЦИИ
+#
+# [FIX П1] Раньше этот код жил внутри ветки `if ot is not None:` уже ПОСЛЕ
+# `if state=="NEUTRAL": ... continue`. Поэтому при NEUTRAL не выполнялось
+# ничего: ни стоп, ни таймаут, ни обновление цены, ни заполнение горизонтов.
+#
+# Контракт нового слоя: функция вызывается КАЖДЫЙ прогон для КАЖДОЙ открытой
+# сделки, вне зависимости от состояния сигнала и вне зависимости от того,
+# присутствует ли символ в текущей выборке discovery-фильтра.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# СВЕРКА ЖУРНАЛА С БИРЖЕЙ
+# Выполняется до менеджера позиций: если биржа говорит, что позиции нет,
+# журнальную сделку нужно закрыть в этом же прогоне, а не вести дальше.
+# ═══════════════════════════════════════════════════════════════════════════
+def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
+    if not ENABLE_BINGX:
+        return {"status":"skipped","reason":"ENABLE_BINGX=false"}
+    try:
+        import bingx_client
+    except Exception as e:
+        log.error(f"reconcile: bingx_client недоступен: {e}")
+        return {"status":"error","error":str(e)[:200]}
+    res=bingx_client.list_positions()
+    if res.get("status")!="ok":
+        log.error(f"reconcile: запрос позиций не удался: {res.get('error')}")
+        send_tg(f"⚠️ <b>Сверка с биржей не выполнена</b>\n{esc(str(res.get('error'))[:200])}\n"
+                f"<i>Расхождения журнала и биржи в этом прогоне не проверены.</i>")
+        return {"status":"error","error":res.get("error")}
+    exch=res["positions"]                       # {bx_symbol: qty}
+    # журнал: символы с открытой сделкой, у которых есть подтверждённый объём
+    journal={}
+    for sym,entry in wl_all.items():
+        ot=entry.get("open_trade")
+        if not ot: continue
+        bx=ot.get("bingx") or {}
+        journal[sym]={"qty":bx.get("qty"),"bx_symbol":bingx_client.to_bx_symbol(sym),
+                      "status":bx.get("status"),"trade_id":entry.get("trade_id")}
+    ours={v["bx_symbol"]:sym for sym,v in journal.items()}
+    orphans=[]; missing=[]; mismatch=[]
+    for bx_sym,amt in exch.items():
+        sym=ours.get(bx_sym)
+        if sym is None:
+            orphans.append({"bx_symbol":bx_sym,"qty":amt,"our_symbol":None})
+            continue
+        jq=journal[sym]["qty"]
+        if jq:
+            rel=abs(amt-float(jq))/max(float(jq),1e-9)
+            if rel>RECONCILE_QTY_TOLERANCE:
+                mismatch.append({"symbol":sym,"bx_symbol":bx_sym,"journal_qty":jq,
+                                 "exchange_qty":amt,"rel_diff":round(rel,4)})
+    for sym,v in journal.items():
+        if v["bx_symbol"] not in exch and v["qty"]:
+            missing.append({"symbol":sym,"bx_symbol":v["bx_symbol"],
+                            "journal_qty":v["qty"],"bingx_status":v["status"],
+                            "trade_id":v["trade_id"]})
+    rec={"ts":ts,"exchange_positions":len(exch),"journal_positions":len(journal),
+         "orphans":orphans,"missing":missing,"mismatch":mismatch,
+         "autoclose":RECONCILE_AUTOCLOSE}
+
+    # ── сироты: биржа держит позицию, которой нет в журнале ──────────────
+    for o in orphans:
+        log.error(f"RECONCILE ORPHAN {o['bx_symbol']} qty={o['qty']} — нет в журнале")
+        if RECONCILE_AUTOCLOSE:
+            try:
+                r=bingx_client._close_position(o["bx_symbol"],float(o["qty"]))
+                o["autoclose_result"]=r
+                log.info(f"RECONCILE ORPHAN {o['bx_symbol']} автозакрытие: {r.get('status')}")
+            except Exception as e:
+                o["autoclose_result"]={"status":"error","error":str(e)[:200]}
+    if orphans:
+        lines="\n".join(f"· {esc(o['bx_symbol'])} qty={esc(o['qty'])}"
+                        +(f" → {esc(o.get('autoclose_result',{}).get('status'))}" if RECONCILE_AUTOCLOSE else "")
+                        for o in orphans[:12])
+        send_tg(f"🔺 <b>Сверка: позиции на бирже без учёта в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"{len(orphans)} шт.\n{lines}\n"
+                +("<i>Автозакрытие включено.</i>" if RECONCILE_AUTOCLOSE
+                  else "<i>Автозакрытие выключено — закрыть вручную или включить "
+                       "BINGX_RECONCILE_AUTOCLOSE=true.</i>"))
+
+    # ── пропавшие: журнал считает, что позиция есть, а биржи — нет ───────
+    for m in missing:
+        sym=m["symbol"]; entry=wl_all.get(sym)
+        ot=(entry or {}).get("open_trade")
+        if not ot: continue
+        cur=ot.get("last_price")
+        log.error(f"RECONCILE MISSING {sym} — на бирже позиции нет, закрываем журнальную сделку")
+        close_trade(ot,sym,ts,cur or ot.get("entry_price"),"EXCHANGE_CLOSED",
+                    entry.get("state","UNKNOWN"),price_full,
+                    exit_price_source="last_seen" if cur else "unknown",
+                    exit_candidates=["EXCHANGE_CLOSED"],lifecycle_complete=False,
+                    skip_exchange=True)
+        entry.pop("open_trade",None); entry.pop("trade_id",None)
+    if missing:
+        send_tg(f"🔻 <b>Сверка: позиции нет на бирже, но она была в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"{len(missing)} шт.: {esc(', '.join(m['symbol'] for m in missing[:12]))}\n"
+                f"<i>Закрыты как EXCHANGE_CLOSED. Возможна ликвидация или ручное закрытие.</i>")
+    if mismatch:
+        log.error(f"RECONCILE QTY MISMATCH: {mismatch}")
+        send_tg(f"⚠️ <b>Сверка: расхождение объёмов</b>\n"
+                +"\n".join(f"· {esc(m['symbol'])} журнал={esc(m['journal_qty'])} биржа={esc(m['exchange_qty'])}"
+                           for m in mismatch[:10]))
+    if orphans or missing or mismatch:
+        append_jsonl(RECONCILE_FILE,rec)
+    log.info(f"reconcile: биржа={len(exch)} журнал={len(journal)} "
+             f"сирот={len(orphans)} пропавших={len(missing)} расхождений={len(mismatch)}")
+    rec["status"]="ok"
+    return rec
+
+def _touch_state(ot,state,ts,score,reason):
+    """Учёт времени в состояниях. [FIX] Раньше NEUTRAL никогда не попадал в
+    time_in_states, потому что до перехода исполнение не доходило: суммарно
+    14 625 минут были отнесены к CONFIRMED_TREND."""
+    if state==ot.get("current_state"):
+        return
+    prev=ot.get("current_state","UNKNOWN")
+    dur=round((ts-ot.get("current_state_start_ts",ts))/60,1)
+    ot.setdefault("time_in_states",{})
+    ot["time_in_states"][prev]=round(ot["time_in_states"].get(prev,0)+dur,1)
+    ot["current_state"]=state
+    ot["current_state_start_ts"]=ts
+    ot.setdefault("state_history",[]).append({"ts":ts,"state":state,"score":score,"reason":reason})
+    if STATE_RANK.get(state,0)>STATE_RANK.get(ot.get("max_state"),0):
+        ot["max_state"]=state
+
+def _update_shadows(ot,ts,pnl_pct,strength):
+    """Теневые правила: пишем, что сработало бы, но решений не меняем.
+    П3 — уровни стопа; И4 — триггер Шмитта."""
+    sh=ot.setdefault("shadow_stops",{str(l):None for l in SHADOW_STOP_LEVELS})
+    if pnl_pct is not None:
+        for lvl in SHADOW_STOP_LEVELS:
+            key=str(lvl)
+            if sh.get(key) is None and pnl_pct<=-lvl:
+                sh[key]={"ts":ts,"pnl_at_trigger":round(pnl_pct,3),
+                         "minutes":round((ts-ot["entry_ts"])/60,1)}
+    if strength is not None:
+        on=ot.get("shadow_schmitt_on",True)
+        on=(strength>=SCHMITT_ENTER) if not on else (strength>=SCHMITT_EXIT)
+        if ot.get("shadow_schmitt_on") and not on and ot.get("shadow_schmitt_exit_ts") is None:
+            ot["shadow_schmitt_exit_ts"]=ts
+            ot["shadow_schmitt_exit_min"]=round((ts-ot["entry_ts"])/60,1)
+        ot["shadow_schmitt_on"]=on
+        ot["last_signal_strength"]=strength
+
+def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
+    """Возвращает (close_reason|None, all_triggered, exit_price, exit_price_source).
+
+    signal=None означает, что символа нет в текущей выборке — позиция всё равно
+    управляется, просто без сигнальных причин выхода.
+    """
+    state=(signal or {}).get("state")
+    score=(signal or {}).get("score",0)
+    strength=(signal or {}).get("strength")
+
+    # ── Слой 1: цена. Обновляем ВСЕГДА, если она есть. ────────────────────
+    if cur_price:
+        ot["last_price"]=cur_price
+        ot["last_price_ts"]=ts
+        ep=ot.get("entry_price")
+        if ep:
+            pnl_now=(cur_price-ep)/ep*100
+            if pnl_now>ot.get("max_pnl_pct",0.0): ot["max_pnl_pct"]=pnl_now; ot["peak_ts"]=ts
+            if pnl_now<ot.get("min_pnl_pct",0.0): ot["min_pnl_pct"]=pnl_now
+    else:
+        dq=ot.setdefault("data_quality",{})
+        dq["missing_snapshots"]=dq.get("missing_snapshots",0)+1
+
+    price_age_min=round((ts-ot.get("last_price_ts",ts))/60,1)
+    dq=ot.setdefault("data_quality",{})
+    dq["max_price_age_min"]=max(dq.get("max_price_age_min",0),price_age_min)
+    dq["exit_price_age_min"]=price_age_min
+
+    # состояние: NEUTRAL тоже фиксируется
+    _touch_state(ot,state or "NO_DATA",ts,score,
+                 "state_transition" if state else "out_of_universe")
+
+    # ── Горизонты: заполняем ВСЕГДА ──────────────────────────────────────
+    _fill_horizons(ot,sym,ts,price_full)
+
+    ep=ot.get("entry_price")
+    pnl_pct=((cur_price-ep)/ep*100) if (cur_price and ep) else None
+    _update_shadows(ot,ts,pnl_pct,strength)
+
+    # ── Затухание сигнала: счётчик тикает независимо от состояния ────────
+    if state in ("CONFIRMED_TREND","ACCELERATION") or (state and score>=5):
+        ot["last_signal_ts"]=ts
+    last_signal_ts=ot.get("last_signal_ts",ot["entry_ts"])
+
+    # ── Причины выхода ───────────────────────────────────────────────────
+    cand={
+        "INVALIDATED": state=="INVALIDATED",
+        "EXHAUSTION":  state=="EXHAUSTION",
+        "DISTRIBUTION":state=="DISTRIBUTION",
+        "STOP_LOSS":   pnl_pct is not None and pnl_pct<=-STOP_LOSS_PCT,
+        "SIGNAL_DECAY":ts-last_signal_ts>=SIGNAL_DECAY_MIN*60,
+        "TIMEOUT":     ts-ot["entry_ts"]>=TRADE_TIMEOUT_MIN*60,
+        # [FIX П2] явный выход по возрасту цены вместо аварийного MISSED
+        "DATA_STALE":  price_age_min>=PRICE_STALE_EXIT_MIN,
+        "MISSED":      missed_runs>=MISS_REMOVE_RUNS,
+        "NEUTRAL":     False,
+    }
+    close_reason,all_triggered=resolve_exit_reason(cand)
+    if not close_reason:
+        return None,[],None,None
+    exit_price=cur_price or ot.get("last_price")
+    src="live" if cur_price else "last_seen"
+    return close_reason,all_triggered,exit_price,src
+
 def run():
     log.info("═══ Прогон ═══")
     wl_all=load_watchlist()
@@ -947,10 +1374,16 @@ def run():
     PENDING=load_pending()
     existing_trade_ids=load_existing_trade_ids()
     lifecycle_state=load_lifecycle_state()
+    global DISCOVERY
+    DISCOVERY=discovery_fingerprint()
+    log.info(f"Discovery: sha={DISCOVERY['url_sha256']} filter={str(DISCOVERY.get('filter'))[:120]}")
+    log_discovery_change(DISCOVERY,now_ts())
     rows=fetch_data()
     log.info(f"Монет после discovery-фильтра: {len(rows)}")
     market=detect_market_phase(rows)
-    log.info(f"Market: {market['phase']} {market['note']}")
+    log.info(f"Market: {market['phase']} btc={market.get('btc_chg24')} "
+             f"src={market.get('btc_source')} breadth={market.get('breadth_ratio')} "
+             f"mod={market['modifier']} (raw={market.get('modifier_raw')})")
     current_symbols={r["symbol"] for r in rows}
     ts=now_ts()
     for r in rows:
@@ -959,10 +1392,22 @@ def run():
         append_jsonl(MARKET_HISTORY_FILE,{**r,"lifecycle_state":wl_all.get(sym,{}).get("state")})
     history_all=load_market_history()
     price_full=load_price_full()
+
+    # ═══ СЛОЙ 0 — СВЕРКА С БИРЖЕЙ ══════════════════════════════════════════
+    # До менеджера позиций: если биржа говорит, что позиции нет, сделку нужно
+    # закрыть сейчас, а не вести её ещё один прогон.
+    try:
+        reconcile_exchange(wl_all,ts,price_full,existing_trade_ids)
+    except Exception as e:
+        log.exception(f"reconcile упал: {e}")
+        send_tg(f"⚠️ <b>Сверка с биржей упала</b>\n{esc(str(e)[:200])}")
+
+    # ═══ СЛОЙ 3a — вычислить сигнал для всех символов выборки ═══════════════
+    # Никаких ветвлений и никаких побочных эффектов: только расчёт.
+    signals={}
     for sym,hist in history_all.items():
         if not hist or sym not in current_symbols: continue
         r=hist[-1]
-        cur_price=r.get("price") if valid_price(r.get("price")) else None
         raw_score,pros,cons=calculate_score(r)
         score=clamp(raw_score+market["modifier"],0,10)
         derived=calc_derived(hist)
@@ -970,154 +1415,176 @@ def run():
         pattern=detect_pattern(r,derived,momentum)
         prev_state=wl_all.get(sym,{}).get("state","NEUTRAL")
         state,reasons,warnings,path=detect_lifecycle(sym,hist,score,derived,prev_state)
-        if state=="NEUTRAL":
-            if sym in wl_all:
-                old=wl_all[sym]["state"]
-                ot=wl_all[sym].get("open_trade")
-                if old in ACTIVE_STATES:
-                    nr=wl_all[sym].get("neutral_runs",0)+1
-                    wl_all[sym]["neutral_runs"]=nr
-                    wl_all[sym]["last_seen"]=ts
-                    if ot:
-                        ot["state_history"].append({"ts":ts,"state":"NEUTRAL","score":score,"reason":"signal_pause"})
-                    if nr>=NEUTRAL_HYSTERESIS:
-                        if ot:
-                            log.info(f"[{sym}] {old} → NEUTRAL (×{nr}), сделка открыта — держим")
-                        else:
-                            send_tg(f"⚪ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n{esc(old)} → NEUTRAL\n<i>Снята: условия тренда не выполняются {nr} прогона подряд</i>\n")
-                            log.info(f"[{sym}] {old} → NEUTRAL (×{nr}), remove")
-                            if sym in lifecycle_state: del lifecycle_state[sym]
-                            del wl_all[sym]
-                    else:
-                        log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}")
-                else:
-                    if ot:
-                        ot["state_history"].append({"ts":ts,"state":"NEUTRAL","score":score,"reason":"signal_pause"})
-                    log.info(f"[{sym}] {old} → NEUTRAL, remove")
-                    if sym in lifecycle_state: del lifecycle_state[sym]
-                    del wl_all[sym]
-            continue
-        if state=="INVALIDATED":
-            if sym in wl_all:
-                old=wl_all[sym]["state"]
-                ot=wl_all[sym].get("open_trade")
-                if ot:
-                    exit_price=cur_price or ot.get("last_price")
-                    src="live" if cur_price else "last_seen"
-                    close_trade(ot,sym,ts,exit_price,"INVALIDATED",state,price_full,exit_price_source=src,exit_candidates=["INVALIDATED"],lifecycle_complete=True)
-                send_tg(f"❌ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n{esc(old)} → INVALIDATED\n<i>Сценарий сломан: {esc(' · '.join(reasons[:2]))}</i>\n")
-                log.info(f"[{sym}] INVALIDATED → remove")
-                if sym in lifecycle_state: del lifecycle_state[sym]
-                del wl_all[sym]
-            continue
         conf=calc_confidence(state,hist,score,derived,market["modifier"])
         early_val,early_label=entry_earliness(r)
-        existing=wl_all.get(sym,{})
-        ot=existing.get("open_trade")
-        tid=existing.get("trade_id")
-        new_ot,new_tid=None,None
-        if ot is not None:
-            ot=dict(ot)
-            if state!=ot.get("current_state"):
-                duration_min=round((ts-ot.get("current_state_start_ts",ts))/60,1)
-                old_state=ot.get("current_state","UNKNOWN")
-                ot["time_in_states"][old_state]=ot["time_in_states"].get(old_state,0)+duration_min
-                ot["current_state"]=state
-                ot["current_state_start_ts"]=ts
-                ot["state_history"].append({"ts":ts,"state":state,"score":score,"reason":"state_transition"})
-                if STATE_RANK.get(state,0)>STATE_RANK.get(ot.get("max_state"),0):
-                    ot["max_state"]=state
-            exit_candidates={
-                "INVALIDATED":state=="INVALIDATED",
-                "EXHAUSTION":state=="EXHAUSTION",
-                "DISTRIBUTION":state=="DISTRIBUTION",
-                "STOP_LOSS":False,
-                "SIGNAL_DECAY":False,
-                "TIMEOUT":ts-ot["entry_ts"]>=TRADE_TIMEOUT_MIN*60,
-                "MISSED":False,
-                "NEUTRAL":False,
-            }
-            if cur_price and ot.get("entry_price"):
-                pnl_pct=(cur_price-ot["entry_price"])/ot["entry_price"]*100
-                if pnl_pct<=-STOP_LOSS_PCT: exit_candidates["STOP_LOSS"]=True
-            last_signal_ts=ot.get("last_signal_ts",ot["entry_ts"])
-            if ts-last_signal_ts>=SIGNAL_DECAY_MIN*60: exit_candidates["SIGNAL_DECAY"]=True
-            if score>=5 or state in("CONFIRMED_TREND","ACCELERATION"): ot["last_signal_ts"]=ts
-            close_reason,all_triggered=resolve_exit_reason(exit_candidates)
-            if close_reason:
-                exit_price=cur_price or ot.get("last_price")
-                src="live" if cur_price else "last_seen"
-                close_trade(ot,sym,ts,exit_price,close_reason,state,price_full,exit_price_source=src,exit_candidates=all_triggered,lifecycle_complete=True)
-                cooldown_min=COOLDOWN_BY_EXIT_REASON.get(close_reason,0)
-                if cooldown_min>0: lifecycle_state[sym]={"cooldown_until":ts+cooldown_min*60,"idea_first_seen_ts":lifecycle_state.get(sym,{}).get("idea_first_seen_ts")}
-            else:
-                if cur_price:
-                    ot["last_price"]=cur_price
-                    ot["last_price_ts"]=ts
-                    ep=ot.get("entry_price")
-                    if ep:
-                        pnl_now=(cur_price-ep)/ep*100
-                        if pnl_now>ot.get("max_pnl_pct",0.0): ot["max_pnl_pct"]=pnl_now; ot["peak_ts"]=ts
-                        if pnl_now<ot.get("min_pnl_pct",0.0): ot["min_pnl_pct"]=pnl_now
-                    ot["data_quality"]["max_price_age_min"]=max(ot["data_quality"]["max_price_age_min"],0)
-                else:
-                    ot["data_quality"]["missing_snapshots"]+=1
-                    age=round((ts-ot.get("last_price_ts",ts))/60,1)
-                    ot["data_quality"]["max_price_age_min"]=max(ot["data_quality"]["max_price_age_min"],age)
-                _fill_horizons(ot,sym,ts,price_full)
-                new_ot,new_tid=ot,tid
+        recent=hist[-MIN_SNAPS_LIFECYCLE:] if len(hist)>=MIN_SNAPS_LIFECYCLE else hist
+        signals[sym]={
+            "row":r,"hist":hist,"state":state,"prev_state":prev_state,
+            "reasons":reasons,"warnings":warnings,"path":path,
+            "score":score,"pros":pros,"cons":cons,"derived":derived,
+            "momentum":momentum,"mom_tags":mom_tags,"pattern":pattern,"conf":conf,
+            "early_val":early_val,"early_label":early_label,
+            "price":r.get("price") if valid_price(r.get("price")) else None,
+            "strength":signal_strength(hist,derived["cvd_momentum"]),
+            "window":window_quality(recent),"history_len":len(hist),
+            # Теневой эксперимент: вердикты И1/И3/И2 рядом с боевым.
+            "shadow":shadow_variants(hist,derived["cvd_momentum"]),
+        }
+
+    # ═══ Теневой лог предиката входа ═══════════════════════════════════════
+    # Пишем только строки, где хотя бы один вариант расходится с боевым — иначе
+    # файл вырастет до ~11 тыс. строк в сутки без новой информации.
+    for sym,sig in signals.items():
+        sh=sig["shadow"]
+        if not sh.get("disagrees"): continue
+        append_jsonl(SHADOW_SIGNALS_FILE,{
+            "ts":ts,"symbol":sym,"price":sig["price"],
+            "live_state":sig["state"],"prev_state":sig["prev_state"],
+            "allowed_confirmed":sig["prev_state"] in ALLOWED_FROM.get("CONFIRMED_TREND",set()),
+            "score":sig["score"],"momentum":sig["momentum"],
+            "strength":sh["strength"],"window":sh["window"],
+            "history_len":sig["history_len"],
+            "variants":{k:sh[k] for k,_ in SHADOW_VARIANTS},
+            "signal_logic_version":SIGNAL_LOGIC_VERSION,
+            "conditions_version":CONDITIONS_CONFIG["conditions_version"],
+        })
+
+    # ═══ Учёт присутствия символа в выборке ════════════════════════════════
+    # Делается ДО менеджера позиций, чтобы он видел актуальный missed_runs.
+    for sym,entry in wl_all.items():
+        if sym in current_symbols:
+            entry["missed_runs"]=0
+            entry["last_seen"]=ts
         else:
-            if state in ENTRY_STATES and cur_price:
-                cooldown_info=lifecycle_state.get(sym,{})
-                if cooldown_info.get("cooldown_until",0)>ts:
-                    log.info(f"[{sym}] COOLDOWN активен, пропускаем вход")
+            entry["missed_runs"]=entry.get("missed_runs",0)+1
+            entry["last_seen"]=entry.get("last_seen",ts)
+            if entry["state"] in ACTIVE_STATES and entry["missed_runs"]==MISS_EXIT_RUNS:
+                log.info(f"[{sym}] выпала из фильтра {entry['missed_runs']} прогона → пауза")
+                send_tg(f"⏸ <b>{esc(entry.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
+                        f"Наблюдение на паузе ({esc(entry['state'])})\n"
+                        f"Выпала из discovery-фильтра {entry['missed_runs']} прогона подряд\n"
+                        f"<i>Стадия сохранена — при возврате пересчитается.</i>\n")
+
+    # ═══ СЛОЙ 2 — МЕНЕДЖЕР ПОЗИЦИЙ ════════════════════════════════════════
+    # [FIX П1] Выполняется БЕЗУСЛОВНО для каждой открытой сделки: до всех
+    # проверок состояния и вне зависимости от наличия символа в выборке.
+    for sym in list(wl_all.keys()):
+        entry=wl_all[sym]
+        ot=entry.get("open_trade")
+        if not ot: continue
+        ot=dict(ot)
+        sig=signals.get(sym)
+        cur_price=sig["price"] if sig else None
+        reason,triggered,xprice,xsrc=manage_open_trade(
+            sym,ot,ts,cur_price,sig,price_full,missed_runs=entry.get("missed_runs",0))
+        if reason:
+            if not xprice:
+                log.error(f"[{sym}] нет цены для закрытия — используем entry_price")
+                xprice=ot.get("entry_price"); xsrc="unknown"
+            complete=reason not in ("DATA_STALE","MISSED")
+            exit_state=(sig or {}).get("state") or entry.get("state","UNKNOWN")
+            close_trade(ot,sym,ts,xprice,reason,exit_state,price_full,
+                        exit_price_source=xsrc,exit_candidates=triggered,
+                        lifecycle_complete=complete)
+            # [FIX П4/6.1] cooldown хранится в реестре, который НЕ удаляется
+            # вместе с записью watchlist, и ненулевой для DATA_STALE/MISSED/TIMEOUT.
+            cd=COOLDOWN_BY_EXIT_REASON.get(reason,0)
+            rec=lifecycle_state.setdefault(sym,{})
+            if cd>0: rec["cooldown_until"]=ts+cd*60
+            rec["last_exit_reason"]=reason; rec["last_exit_ts"]=ts
+            rec.setdefault("idea_first_seen_ts",ot.get("idea_first_seen_ts") or ts)
+            entry.pop("open_trade",None); entry.pop("trade_id",None)
+            log.info(f"[{sym}] CLOSE {reason} triggered={triggered} cooldown={cd}м")
+        else:
+            entry["open_trade"]=ot
+
+    # ═══ СЛОЙ 3b — состояние watchlist и НОВЫЕ входы ══════════════════════
+    for sym,sig in signals.items():
+        r=sig["row"]; hist=sig["hist"]; state=sig["state"]; prev_state=sig["prev_state"]
+        score=sig["score"]; derived=sig["derived"]; conf=sig["conf"]
+        existing=wl_all.get(sym,{})
+        has_trade=existing.get("open_trade") is not None
+        # [FIX] запись с открытой сделкой не удаляется никогда — иначе теряется
+        # сама сделка. Раньше это было гарантировано лишь косвенно.
+        if state=="NEUTRAL":
+            if sym in wl_all and not has_trade:
+                old=existing.get("state","NEUTRAL")
+                nr=existing.get("neutral_runs",0)+1
+                existing["neutral_runs"]=nr; existing["last_seen"]=ts
+                if old in ACTIVE_STATES and nr<NEUTRAL_HYSTERESIS:
+                    log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}")
                 else:
-                    idea_first_seen_ts=cooldown_info.get("idea_first_seen_ts")
-                    if idea_first_seen_ts is None and state in("ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION"):
-                        idea_first_seen_ts=ts
-                    new_tid=f"{sym}_{ts}"
-                    new_ot=open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,existing.get("snapshots",0)+1,cur_price)
-                    # >>> BINGX: строго ПОСЛЕ open_trade_record, защищено от None <<<
-                    if ENABLE_BINGX and new_ot is not None:
-                        try:
-                            import bingx_client
-                            bx=bingx_client.open_long(sym,cur_price)
-                            new_ot["bingx"]=bx
-                            if bx.get("status") in ("opened","already_open"):
-                                log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
-                            else:
-                                log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
-                        except Exception as e:
-                            log.error(f"[{sym}] BingX OPEN exception: {e}")
-                            try:
-                                new_ot["bingx"]={"status":"error","error":str(e)}
-                            except Exception:
-                                pass
-                    # <<< BINGX >>>
-                    log.info(f"[{sym}] TRADE OPEN {state} path={path} @ {cur_price}")
-        # [FIX] setdefault не перезаписывает cooldown_until
-        idea_first_seen=lifecycle_state.get(sym,{}).get("idea_first_seen_ts")
-        if idea_first_seen is None and state in("ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION"):
-            idea_first_seen=ts
-            lifecycle_state.setdefault(sym,{})["idea_first_seen_ts"]=idea_first_seen
+                    if old in ACTIVE_STATES:
+                        send_tg(f"⚪ <b>{esc(existing.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
+                                f"{esc(old)} → NEUTRAL\n<i>Снята: условия тренда не выполняются {nr} прогона подряд</i>\n")
+                    log.info(f"[{sym}] {old} → NEUTRAL, remove")
+                    del wl_all[sym]
+            elif has_trade:
+                existing["neutral_runs"]=existing.get("neutral_runs",0)+1
+                existing["last_seen"]=ts
+                existing["state_signal"]="NEUTRAL"
+            continue
+        if state=="INVALIDATED":
+            # сделку уже закрыл слой 2 (INVALIDATED — высший приоритет выхода)
+            if sym in wl_all and not wl_all[sym].get("open_trade"):
+                send_tg(f"❌ <b>{esc(existing.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
+                        f"{esc(existing.get('state','?'))} → INVALIDATED\n"
+                        f"<i>Сценарий сломан: {esc(' · '.join(sig['reasons'][:2]))}</i>\n")
+                log.info(f"[{sym}] INVALIDATED → remove")
+                del wl_all[sym]
+            continue
+        # ── новый вход ─────────────────────────────────────────────────────
+        new_ot=existing.get("open_trade"); new_tid=existing.get("trade_id")
+        if new_ot is None and state in ENTRY_STATES and sig["price"]:
+            info=lifecycle_state.get(sym,{})
+            if info.get("cooldown_until",0)>ts:
+                left=round((info["cooldown_until"]-ts)/60,1)
+                log.info(f"[{sym}] COOLDOWN {left}м (после {info.get('last_exit_reason')}), вход пропущен")
+            else:
+                idea_ts=info.get("idea_first_seen_ts") or ts
+                new_tid=f"{sym}_{ts}"
+                new_ot=open_trade_record(r,ts,state,sig["path"],score,sig["momentum"],conf,
+                                         sig["early_val"],sig["early_label"],sig["pattern"],
+                                         derived,market,idea_ts,existing.get("snapshots",0)+1,
+                                         sig["price"],history_len=sig["history_len"],
+                                         window=sig["window"],strength=sig["strength"],
+                                         shadow=sig["shadow"])
+                if ENABLE_BINGX and new_ot is not None:
+                    try:
+                        import bingx_client
+                        bx=bingx_client.open_long(sym,sig["price"])
+                        new_ot["bingx"]=bx
+                        if bx.get("status") in ("opened","already_open"):
+                            log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={bx.get('qty')}")
+                        else:
+                            log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
+                    except Exception as e:
+                        log.error(f"[{sym}] BingX OPEN exception: {e}")
+                        new_ot["bingx"]={"status":"error","error":str(e)}
+                log.info(f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
+                         f"strength={sig['strength']} window={sig['window']['span_min']}м")
+        # [FIX 6.2] idea_first_seen_ts живёт в реестре и НЕ удаляется вместе с
+        # записью watchlist — иначе «возраст идеи» всегда равен возрасту
+        # последнего появления (медиана была 10.1 мин при TTL реестра 30 дней).
+        rec=lifecycle_state.setdefault(sym,{})
+        rec.setdefault("idea_first_seen_ts",ts)
         entry={
             "state":state,"previous_state":prev_state,
             "action":ACTIONS.get(state,""),
-            "confidence":conf,"score":score,"momentum":momentum,
-            "pattern":pattern,"name":r.get("name",sym),
+            "confidence":conf,"score":score,"momentum":sig["momentum"],
+            "pattern":sig["pattern"],"name":r.get("name",sym),
             "first_seen":existing.get("first_seen",ts),"last_seen":ts,
             "snapshots":existing.get("snapshots",0)+1,
             "missed_runs":0,"neutral_runs":0,
-            "entry_earliness":round(early_val,2),
-            "reasons":reasons,"warnings":warnings,"mom_tags":mom_tags,
+            "entry_earliness":round(sig["early_val"],2),
+            "signal_strength":sig["strength"],"window":sig["window"],
+            "reasons":sig["reasons"],"warnings":sig["warnings"],"mom_tags":sig["mom_tags"],
         }
         if new_ot is not None:
-            entry["open_trade"]=new_ot
-            entry["trade_id"]=new_tid
+            entry["open_trade"]=new_ot; entry["trade_id"]=new_tid
         wl_all[sym]=entry
-        cur={**r,"score":score,"pros":pros,"cons":cons,"derived":derived,"momentum":momentum,"pattern":pattern}
         if state!=prev_state:
-            log.info(f"[{sym}] {prev_state} → {state} | {reasons}")
+            log.info(f"[{sym}] {prev_state} → {state} | {sig['reasons']}")
             if state in TG_STATES:
                 append_jsonl(CALIBRATION_FILE,{
                     "ts":ts,"symbol":sym,"state":state,
@@ -1126,32 +1593,29 @@ def run():
                     "price_accel":round(derived["price_accel"],3),
                     "funding_pressure":round(derived["funding_pressure"],5),
                     "oi_trend":derived["oi_trend"],"cvd_trend":derived["cvd_trend"],
-                    "score":score,"momentum":momentum,"confidence":conf,
+                    "score":score,"momentum":sig["momentum"],"confidence":conf,
+                    "signal_strength":sig["strength"],
+                    "window_span_min":sig["window"]["span_min"],
+                    "window_dense":sig["window"]["dense"],
                     "signal_logic_version":SIGNAL_LOGIC_VERSION,
+                    "lifecycle_engine_version":LIFECYCLE_ENGINE_VERSION,
                 })
+                cur={**r,"score":score,"pros":sig["pros"],"cons":sig["cons"],
+                     "derived":derived,"momentum":sig["momentum"],"pattern":sig["pattern"]}
                 llm_res=llm_verify(sym,wl_all[sym],cur,hist)
-                msg=format_signal(sym,wl_all[sym],cur,hist,reasons,warnings,market)
+                msg=format_signal(sym,wl_all[sym],cur,hist,sig["reasons"],sig["warnings"],market)
                 if llm_res:
                     agree="✅" if llm_res.get("agree") is True else "❌"
-                    risk=llm_res.get("risk","?")
-                    reason=llm_res.get("reason","")
-                    msg+=f"\n🤖 {agree} {esc(risk)} · {esc(reason)}"
+                    msg+=f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
                 send_tg(msg)
+
+    # ═══ Уборка watchlist: символы, которых давно нет в выборке ═══════════
     for sym in list(wl_all.keys()):
+        entry=wl_all[sym]
         if sym in current_symbols: continue
-        missed=wl_all[sym].get("missed_runs",0)+1
-        wl_all[sym]["missed_runs"]=missed
-        wl_all[sym]["last_seen"]=ts
-        stage=wl_all[sym]["state"]
-        if stage in ACTIVE_STATES and missed==MISS_EXIT_RUNS:
-            log.info(f"[{sym}] выпала из фильтра {missed} прогона → пауза")
-            send_tg(f"⏸ <b>{esc(wl_all[sym].get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\nНаблюдение на паузе ({esc(stage)})\nВыпала из discovery-фильтра {missed} прогона подряд\n<i>Стадия сохранена — при возврате пересчитается.</i>\n")
-        if missed>=MISS_REMOVE_RUNS:
-            ot=wl_all[sym].get("open_trade")
-            if ot:
-                close_trade(ot,sym,ts,ot.get("last_price"),"MISSED",stage,price_full,exit_price_source="last_seen",exit_candidates=["MISSED"],lifecycle_complete=False)
-            log.info(f"[{sym}] нет в данных {missed} прогонов → remove")
-            if sym in lifecycle_state: del lifecycle_state[sym]
+        if entry.get("open_trade"): continue      # сделку ведёт слой 2
+        if entry.get("missed_runs",0)>=MISS_REMOVE_RUNS:
+            log.info(f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove")
             del wl_all[sym]
     flush_pending(price_full,ts,existing_trade_ids)
     save_pending(PENDING)
@@ -1165,6 +1629,7 @@ def run():
     cleanup_jsonl(SNAPSHOTS_FILE,SNAPSHOTS_TTL_DAYS)
     cleanup_jsonl(HEARTBEAT_FILE,HEARTBEAT_TTL_DAYS)
     cleanup_jsonl(CALIBRATION_FILE,SNAPSHOTS_TTL_DAYS)
+    cleanup_jsonl(SHADOW_SIGNALS_FILE,SHADOW_SIGNALS_TTL_DAYS)
     open_n=sum(1 for v in wl_all.values() if v.get("open_trade"))
     log.info(f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} · pending: {len(PENDING)} ═══")
 
