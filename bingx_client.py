@@ -28,15 +28,6 @@ ORDER_PATH     = "/openApi/swap/v2/trade/order"
 POSITION_PATH  = os.environ.get("BINGX_POSITIONS_PATH","/openApi/swap/v2/user/positions")
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 LEVERAGE_PATH  = "/openApi/swap/v2/trade/leverage"
-
-ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
-PARTIAL_TP_LEVELS = [
-    {"leg": "tp1", "min_pnl_pct": 1.5, "close_fraction": 0.15},
-    {"leg": "tp2", "min_pnl_pct": 3.0, "close_fraction": 0.25},
-]
-PARTIAL_MIN_QTY = 0.001
-PARTIAL_MIN_NOTIONAL = 5.0
-
 ORDERS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bingx_orders.jsonl")
 
 try:
