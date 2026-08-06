@@ -47,6 +47,14 @@ MAX_PAGES = 5  # Максимум страниц пагинации (защит�
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
 
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
+ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
+PARTIAL_TP_LEVELS = [
+    {"leg": "tp1", "min_pnl_pct": 1.5, "close_fraction": 0.15},
+    {"leg": "tp2", "min_pnl_pct": 3.0, "close_fraction": 0.25},
+]
+PARTIAL_MIN_QTY = 0.001
+PARTIAL_MIN_NOTIONAL = 5.0
+
 MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
 MISS_EXIT_RUNS=2; MISS_REMOVE_RUNS=4; NEUTRAL_HYSTERESIS=2
