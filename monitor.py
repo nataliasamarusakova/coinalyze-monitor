@@ -1130,6 +1130,102 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
     log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} hold={hold_min}m")
     send_tg(format_trade_close(rec))
 
+def maybe_close_partial_take_profit(ot, symbol, cur_price):
+    """
+    Execution-only partial TP через BingX.
+    Не меняет trades.jsonl, EXIT_PRIORITY, strategy_pnl_pct.
+    """
+    if not (ENABLE_BINGX and ENABLE_PARTIAL_BINGX):
+        return False
+
+    if not cur_price:
+        return False
+
+    bx = ot.get("bingx") or {}
+    if bx.get("status") not in ("opened", "already_open"):
+        return False
+
+    qty_initial = safe(bx.get("qty_initial"), 0.0)
+    qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
+
+    if qty_initial <= 0 or qty_remaining <= 0:
+        return False
+
+    entry_price = ot.get("entry_price")
+    if not entry_price:
+        return False
+
+    pnl_pct = (cur_price - entry_price) / entry_price * 100
+    legs_done = set(bx.get("partial_legs_done", []))
+
+    for level in PARTIAL_TP_LEVELS:
+        leg_name = level.get("leg")
+        if not leg_name or leg_name in legs_done:
+            continue
+
+        min_pnl_pct = level.get("min_pnl_pct")
+        close_fraction = level.get("close_fraction", 0.0)
+
+        if min_pnl_pct is None or close_fraction <= 0 or pnl_pct < min_pnl_pct:
+            continue
+
+        qty_to_close = qty_initial * close_fraction
+        qty_to_close = min(qty_to_close, qty_remaining)
+
+        if qty_to_close <= 0 or qty_to_close < PARTIAL_MIN_QTY:
+            continue
+
+        if qty_to_close * cur_price < PARTIAL_MIN_NOTIONAL:
+            continue
+
+        # Проверяем реальную позицию на бирже перед закрытием
+        try:
+            import bingx_client
+            real_amt = bingx_client.position_amt(symbol)
+            if real_amt < qty_to_close:
+                log.warning(
+                    f"[{symbol}] PARTIAL_TP {leg_name} skipped: "
+                    f"real_amt={real_amt:.8f} < qty_to_close={qty_to_close:.8f}"
+                )
+                continue
+
+            res = bingx_client.close_long(symbol, qty_to_close)
+
+        except Exception as e:
+            log.error(f"[{symbol}] PARTIAL_TP {leg_name} exception: {e}")
+            continue
+
+        if res.get("status") == "closed":
+            qty_remaining -= qty_to_close
+            legs_done.add(leg_name)
+
+            bx["qty_remaining"] = qty_remaining
+            bx["partial_legs_done"] = sorted(legs_done)
+            ot["bingx"] = bx
+
+            remaining_pct = qty_remaining / qty_initial * 100 if qty_initial else 0.0
+
+            log.info(
+                f"[{symbol}] PARTIAL_TP {leg_name}: "
+                f"closed {qty_to_close:.8f} @ {cur_price} "
+                f"pnl={pnl_pct:+.2f}% remaining={qty_remaining:.8f}"
+            )
+
+            send_tg(
+                f"💰 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — частичная фиксация\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"Leg: <b>{esc(leg_name)}</b>\n"
+                f"Закрыто: {qty_to_close:.8f} @ {fmt_price(cur_price)}\n"
+                f"PnL: <b>{pnl_pct:+.2f}%</b>\n"
+                f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n"
+            )
+
+            return True
+        else:
+            log.error(f"[{symbol}] PARTIAL_TP {leg_name} failed: {res.get('error')}")
+
+    return False
+
 def flush_pending(price_full,now,existing_trade_ids):
     global PENDING
     grace=PENDING_GRACE_MIN*60; wait_max=(max(TRADE_HORIZONS)+PENDING_WAIT_MAX_MIN)*60; still=[]
