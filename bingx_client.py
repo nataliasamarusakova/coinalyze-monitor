@@ -120,6 +120,38 @@ def _position_amt(bx_symbol: str) -> float:
     return total
 
 
+def list_positions() -> dict:
+    """Все открытые LONG-позиции счёта: {bx_symbol: qty}.
+
+    Нужно для сверки журнала с биржей. Раньше монитор вызывал только
+    open_long/close_long и никогда не спрашивал, что реально открыто, — поэтому
+    неудачное закрытие оставляло позицию на бирже навсегда без учёта.
+
+    Возвращает {"status": "ok", "positions": {...}} либо {"status": "error"}.
+    """
+    resp = _request("GET", POSITION_PATH)          # без symbol → все позиции
+    if resp.get("code") != 0:
+        return {"status": "error", "error": f"code={resp.get('code')} msg={resp.get('msg')}"}
+    out = {}
+    for p in resp.get("data", []) or []:
+        if p.get("positionSide") not in ("LONG", "BOTH"):
+            continue
+        try:
+            amt = float(p.get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt > 0:
+            sym = p.get("symbol")
+            if sym:
+                out[sym] = out.get(sym, 0.0) + amt
+    return {"status": "ok", "positions": out}
+
+
+def position_amt(symbol: str) -> float:
+    """Публичная обёртка над _position_amt: объём LONG по нашему тикеру."""
+    return _position_amt(to_bx_symbol(symbol))
+
+
 def _set_leverage(bx_symbol: str, leverage: int) -> bool:
     resp = _request("POST", LEVERAGE_PATH, {"symbol": bx_symbol, "side": "LONG", "leverage": str(leverage)})
     if resp.get("code") == 0:
