@@ -25,7 +25,10 @@ LEVERAGE    = int(os.environ.get("BINGX_LEVERAGE", "10"))
 MAX_LEVERAGE = int(os.environ.get("BINGX_MAX_LEVERAGE", "50"))
 
 ORDER_PATH     = "/openApi/swap/v2/trade/order"
-POSITION_PATH  = "/openApi/swap/v2/trade/position"
+POSITION_PATH  = os.environ.get(
+    "BINGX_POSITIONS_PATH",
+    "/openApi/swap/v2/user/positions"
+)
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 LEVERAGE_PATH  = "/openApi/swap/v2/trade/leverage"
 
