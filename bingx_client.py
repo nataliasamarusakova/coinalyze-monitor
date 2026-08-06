@@ -79,6 +79,10 @@ def to_bx_symbol(symbol: str) -> str:
         return symbol
     return f"{s}-USDT"
 
+def contract_exists(symbol: str) -> bool:
+    """Проверяет, что контракт для символа существует в /quote/contracts."""
+    bx_symbol = to_bx_symbol(symbol)
+    return bx_symbol in _contracts()
 
 def _log_event(event: dict):
     event["ts"] = int(time.time())
