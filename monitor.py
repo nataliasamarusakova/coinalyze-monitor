@@ -1166,6 +1166,23 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
     if not entry_price:
         return False
 
+    try:
+        import bingx_client
+    except Exception as e:
+        log.error(f"[{symbol}] PARTIAL_TP: bingx_client недоступен: {e}")
+        return False
+
+    # Лимиты берём с биржи по конкретному контракту, а не из глобальных
+    # PARTIAL_MIN_QTY/PARTIAL_MIN_NOTIONAL — для разных монет точность
+    # и минимальный объём сильно отличаются.
+    limits = bingx_client.contract_limits(symbol)
+    if not limits.get("found"):
+        log.warning(f"[{symbol}] PARTIAL_TP: контракт не найден, пропуск")
+        return False
+    prec = limits["quantity_precision"]
+    min_qty = max(limits["min_qty"], PARTIAL_MIN_QTY)
+    min_notional = max(limits["min_notional"], PARTIAL_MIN_NOTIONAL)
+
     pnl_pct = (cur_price - entry_price) / entry_price * 100
     legs_done = set(bx.get("partial_legs_done", []))
 
@@ -1182,16 +1199,16 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
 
         qty_to_close = qty_initial * close_fraction
         qty_to_close = min(qty_to_close, qty_remaining)
+        qty_to_close = bingx_client._round_qty(qty_to_close, prec)
 
-        if qty_to_close <= 0 or qty_to_close < PARTIAL_MIN_QTY:
+        if qty_to_close <= 0 or qty_to_close < min_qty:
             continue
 
-        if qty_to_close * cur_price < PARTIAL_MIN_NOTIONAL:
+        if qty_to_close * cur_price < min_notional:
             continue
 
         # Проверяем реальную позицию на бирже перед закрытием
         try:
-            import bingx_client
             real_amt = bingx_client.position_amt(symbol)
             if real_amt < qty_to_close:
                 log.warning(
@@ -1207,7 +1224,8 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
             continue
 
         if res.get("status") == "closed":
-            qty_remaining -= qty_to_close
+            closed_qty = safe(res.get("qty"), qty_to_close)  # биржа могла ещё раз округлить
+            qty_remaining -= closed_qty
             legs_done.add(leg_name)
 
             bx["qty_remaining"] = qty_remaining
@@ -1218,7 +1236,7 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
 
             log.info(
                 f"[{symbol}] PARTIAL_TP {leg_name}: "
-                f"closed {qty_to_close:.8f} @ {cur_price} "
+                f"closed {closed_qty:.8f} @ {cur_price} "
                 f"pnl={pnl_pct:+.2f}% remaining={qty_remaining:.8f}"
             )
 
@@ -1226,12 +1244,14 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
                 f"💰 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — частичная фиксация\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"Leg: <b>{esc(leg_name)}</b>\n"
-                f"Закрыто: {qty_to_close:.8f} @ {fmt_price(cur_price)}\n"
+                f"Закрыто: {closed_qty:.8f} @ {fmt_price(cur_price)}\n"
                 f"PnL: <b>{pnl_pct:+.2f}%</b>\n"
                 f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n"
             )
 
             return True
+        elif res.get("status") == "skipped":
+            log.info(f"[{symbol}] PARTIAL_TP {leg_name} skipped by exchange: {res.get('error')}")
         else:
             log.error(f"[{symbol}] PARTIAL_TP {leg_name} failed: {res.get('error')}")
 
