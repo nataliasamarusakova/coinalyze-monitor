@@ -94,17 +94,17 @@ def _contracts() -> dict:
     if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
         return _CONTRACT_CACHE["data"]
     resp = _request("GET", CONTRACTS_PATH, signed=False)
-    data = {}
     if resp.get("code") == 0:
+        data = {}
         for c in resp.get("data", []) or []:
             sym = c.get("symbol")
             if sym:
                 data[sym] = c
         _CONTRACT_CACHE.update({"ts": now, "data": data})
+        return data
     else:
         log.error(f"contracts fetch failed: {resp.get('code')} {resp.get('msg')}")
-    return data
-
+        return _CONTRACT_CACHE["data"]
 
 def _position_amt(bx_symbol: str) -> float:
     """Открытый объём LONG (защита от дублей при перезапуске Actions)."""
@@ -267,30 +267,30 @@ def close_long(symbol: str, qty: float, client_order_id: str = None) -> dict:
         return {"status": "error", "error": "qty <= 0"}
     return _close_position(to_bx_symbol(symbol), float(qty), client_order_id)
 
-
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> dict:
-    # Получаем реальную позицию на бирже
     real_amt = _position_amt(bx_symbol)
-
-    # Защита: не закрываем больше, чем есть
     if qty > real_amt:
         if real_amt <= 0:
             return {"status": "skipped", "error": f"нет LONG позиции для {bx_symbol}"}
         log.warning(f"[{bx_symbol}] qty={qty} > real_amt={real_amt} — ограничиваем до {real_amt}")
         qty = real_amt
 
-    # Округление вниз до шага точности контракта — без этого биржа может
-    # отклонить ордер с "некруглым" qty (особенно частичные закрытия,
-    # где qty = qty_initial * close_fraction почти всегда даёт лишние знаки).
-    c = _contracts().get(bx_symbol) or {}
-    prec = int(c.get("quantityPrecision") or 0)
-    min_qty = float(c.get("minQty") or 0)
-    qty = _round_qty(qty, prec)
+    c = _contracts().get(bx_symbol)
+    if c:
+        prec = int(c.get("quantityPrecision") or 0)
+        min_qty = float(c.get("minQty") or 0)
+        rounded = _round_qty(qty, prec)
+        if rounded <= 0:
+            log.warning(f"[{bx_symbol}] округление {qty}→0 (precision={prec}) — отправляем исходный qty без округления")
+        elif min_qty and rounded < min_qty:
+            log.warning(f"[{bx_symbol}] qty={rounded}<minQty={min_qty} после округления — отправляем исходный qty без округления")
+        else:
+            qty = rounded
+    else:
+        log.warning(f"[{bx_symbol}] данные контракта недоступны — закрываем без округления qty={qty}")
 
     if qty <= 0:
-        return {"status": "skipped", "error": f"qty=0 после округления (precision={prec})"}
-    if min_qty and qty < min_qty:
-        return {"status": "skipped", "error": f"qty={qty} < minQty={min_qty} после округления"}
+        return {"status": "skipped", "error": f"qty<=0 ({qty})"}
 
     # Hedge mode: встречный SELL + positionSide=LONG.
     params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "LONG",
