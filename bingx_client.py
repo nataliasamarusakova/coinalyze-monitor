@@ -267,14 +267,27 @@ def close_long(symbol: str, qty: float, client_order_id: str = None) -> dict:
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> dict:
     # Получаем реальную позицию на бирже
     real_amt = _position_amt(bx_symbol)
-    
+
     # Защита: не закрываем больше, чем есть
     if qty > real_amt:
         if real_amt <= 0:
             return {"status": "skipped", "error": f"нет LONG позиции для {bx_symbol}"}
         log.warning(f"[{bx_symbol}] qty={qty} > real_amt={real_amt} — ограничиваем до {real_amt}")
         qty = real_amt
-    
+
+    # Округление вниз до шага точности контракта — без этого биржа может
+    # отклонить ордер с "некруглым" qty (особенно частичные закрытия,
+    # где qty = qty_initial * close_fraction почти всегда даёт лишние знаки).
+    c = _contracts().get(bx_symbol) or {}
+    prec = int(c.get("quantityPrecision") or 0)
+    min_qty = float(c.get("minQty") or 0)
+    qty = _round_qty(qty, prec)
+
+    if qty <= 0:
+        return {"status": "skipped", "error": f"qty=0 после округления (precision={prec})"}
+    if min_qty and qty < min_qty:
+        return {"status": "skipped", "error": f"qty={qty} < minQty={min_qty} после округления"}
+
     # Hedge mode: встречный SELL + positionSide=LONG.
     params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "LONG",
               "type": "MARKET", "quantity": str(qty)}
