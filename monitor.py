@@ -1,7 +1,3 @@
-"""
-monitor.py — event-driven research engine для оценки качества сигналов.
-LIFECYCLE_ENGINE_VERSION = 2 — FREEZE. Любые изменения только через новый эксперимент.
-"""
 import os, sys, time, json, shutil, hashlib
 import html as html_mod
 import logging
@@ -15,11 +11,9 @@ try:
     from playwright_stealth import stealth_sync
 except ImportError:
     def stealth_sync(page): pass
-
 from conditions import (check_confirmed_path_a, check_confirmed_path_b,
                         signal_strength, window_quality, shadow_variants,
                         SHADOW_VARIANTS, CONFIG as CONDITIONS_CONFIG)
-
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY_FILE  = BASE / "market_history.jsonl"
 SNAPSHOTS_FILE       = BASE / "snapshots.jsonl"
@@ -33,7 +27,6 @@ SHADOW_SIGNALS_FILE  = BASE / "shadow_signals.jsonl"
 DISCOVERY_HISTORY_FILE = BASE / "discovery_history.jsonl"
 RECONCILE_FILE       = BASE / "reconciliation.jsonl"
 DEBUG_HTML_FILE      = BASE / "debug_page.html"
-
 COINALYZE_P_SID    = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN       = os.environ.get("TG_BOT_TOKEN", "")
@@ -42,24 +35,10 @@ ENABLE_LLM    = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY  = os.environ.get("QWEN_API_KEY", "")
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
-
-MAX_PAGES = 5  # Максимум страниц пагинации (защита от аномалий)
+MAX_PAGES = 5  
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# EXECUTION LAYER — конфигурация.
-# Все ENABLE_* флаги по умолчанию False: поведение системы идентично
-# текущему, пока флаг явно не включён через ENV. Execution Layer не влияет
-# на research-схему: не пишет в trades.jsonl, не создаёт trade_id, не решает
-# состояние lifecycle. Управляет только open_trade["bingx"]/["execution"].
-# ═══════════════════════════════════════════════════════════════════════════
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
-
-# Единый предохранитель: ни один execution-механизм не может уменьшить
-# remaining ниже этой доли от qty_initial. Полное закрытие исследовательской
-# сделки — всегда прерогатива lifecycle через close_trade().
 EXECUTION_MIN_REMAINING_FRACTION = 0.05
-
 ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
 PARTIAL_TP_LEVELS = [
     {"leg": "tp1", "min_pnl_pct": 1.5, "close_fraction": 0.15},
@@ -67,30 +46,24 @@ PARTIAL_TP_LEVELS = [
 ]
 PARTIAL_MIN_QTY = 0.001
 PARTIAL_MIN_NOTIONAL = 5.0
-
 ENABLE_BREAK_EVEN = os.environ.get("ENABLE_BREAK_EVEN", "false").lower() == "true"
 BREAK_EVEN_TRIGGER_PCT = float(os.environ.get("BREAK_EVEN_TRIGGER_PCT", "2.0"))
 BREAK_EVEN_BUFFER_PCT = float(os.environ.get("BREAK_EVEN_BUFFER_PCT", "0.1"))
 BREAK_EVEN_REDUCE_TO_FRACTION = float(os.environ.get("BREAK_EVEN_REDUCE_TO_FRACTION", "0.3"))
-
 ENABLE_TRAILING = os.environ.get("ENABLE_TRAILING", "false").lower() == "true"
 TRAILING_ACTIVATE_PCT = float(os.environ.get("TRAILING_ACTIVATE_PCT", "3.0"))
 TRAILING_DRAWDOWN_PCT = float(os.environ.get("TRAILING_DRAWDOWN_PCT", "1.5"))
 TRAILING_REDUCE_STEP_FRACTION = float(os.environ.get("TRAILING_REDUCE_STEP_FRACTION", "0.2"))
-
 ENABLE_REDUCE_EXPOSURE_TIME = os.environ.get("ENABLE_REDUCE_EXPOSURE_TIME", "false").lower() == "true"
 REDUCE_EXPOSURE_TIME_LEVELS = [
     {"after_min": 120, "reduce_to_fraction": 0.5},
     {"after_min": 200, "reduce_to_fraction": 0.25},
 ]
-
 ENABLE_POSITION_HEALTH = os.environ.get("ENABLE_POSITION_HEALTH", "false").lower() == "true"
 POSITION_HEALTH_CHECK_MIN = int(os.environ.get("POSITION_HEALTH_CHECK_MIN", "60"))
-
 MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
 MISS_EXIT_RUNS=2; MISS_REMOVE_RUNS=4; NEUTRAL_HYSTERESIS=2
-
 TRADE_SCHEMA_VERSION=3; SIGNAL_LOGIC_VERSION=2; LIFECYCLE_ENGINE_VERSION=3
 ENGINE_VERSIONS={"schema":TRADE_SCHEMA_VERSION,"signal":SIGNAL_LOGIC_VERSION,
                  "lifecycle":LIFECYCLE_ENGINE_VERSION,"created":"2026-08-05",
@@ -103,66 +76,22 @@ IDEA_REGISTRY_TTL_DAYS=30
 TRADE_HORIZONS=[30,60,120,240]; TRADE_WIN_PCT=1.0
 PENDING_GRACE_MIN=10; PENDING_WAIT_MAX_MIN=60; HORIZON_MAX_LAG_MIN=15
 PENDING=[]
-DISCOVERY={}          # отпечаток discovery-конфигурации текущего прогона
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ДВИЖОК v3 — исправления по аудиту логики от 2026-08-05.
-#
-# П1  Менеджер позиции вынесен из-под ветки NEUTRAL (manage_open_trade).
-#     Было: `if state=="NEUTRAL": ... continue` прерывал обработку ДО блока
-#     управления, поэтому стоп-лосс, таймаут, затухание сигнала, обновление
-#     last_price и _fill_horizons не выполнялись. Медианная сделка проводила
-#     в этом состоянии 17 прогонов (85 мин) — 66% своей жизни.
-#     Замер: 0 стоп-лоссов на 97 сделок, 13 сделок дольше лимита 240 мин
-#     (максимум 505), 65% выходов по цене медианной давностью 70 мин.
-#
-# П2  Явный выход DATA_STALE вместо аварийного MISSED через 4 прогона.
-#     Было: устарелость цены выхода до 380 мин при том, что у 89% сделок
-#     свежая цена лежала в market_history.jsonl.
-#
-# П4  Cooldown для DATA_STALE / MISSED / TIMEOUT сделан ненулевым и вынесен
-#     в отдельный реестр, который не удаляется вместе с записью watchlist.
-#
-# П3  Порог стоп-лосса НЕ меняется. Наблюдаемый MAE занижен тем же дефектом
-#     П1, поэтому калибровать его можно только на данных, собранных ПОСЛЕ
-#     внедрения П1. До тех пор пишем теневые уровни (SHADOW_STOP_LEVELS).
-# ═══════════════════════════════════════════════════════════════════════════
-
-# П2: возраст цены, после которого позиция закрывается явно
+DISCOVERY={}          
 PRICE_STALE_EXIT_MIN=15
-# Теневой эксперимент по предикату входа (И1/И3/И2). Пишем расхождения вариантов,
-# решения не меняем. TTL как у snapshots.
 SHADOW_SIGNALS_TTL_DAYS=7
-
-# ─── Сверка журнала с биржей ────────────────────────────────────────────────
-# Клиент умеет спрашивать позиции (_position_amt), но монитор никогда этого не
-# делал: вызывались только open_long/close_long. В bingx_orders.jsonl это дало
-# 50 открытий против 21 успешного закрытия — 29 позиций остались на бирже с
-# плечом 10x, а из журнала исчезли. Причина отказов была детерминированной:
-# code=109400 «In the Hedge mode, the ReduceOnly field can not be filled».
-#
-# Автозакрытие расхождений по умолчанию ВЫКЛЮЧЕНО: это необратимая операция с
-# реальными деньгами. По умолчанию — журнал + алерт.
 RECONCILE_AUTOCLOSE = os.environ.get("BINGX_RECONCILE_AUTOCLOSE","false").lower()=="true"
-RECONCILE_QTY_TOLERANCE = 0.02      # относительное расхождение объёма, которое игнорируем
-# П3: теневые уровни стопа — только пишем «сработал бы», решения не меняем
+RECONCILE_QTY_TOLERANCE = 0.02      
 SHADOW_STOP_LEVELS=(1.5,2.5)
-# И4: триггер Шмитта на непрерывной силе сигнала. Пока теневой режим.
 USE_SCHMITT=False
 SCHMITT_ENTER=9.5; SCHMITT_EXIT=8.0
-# 6.4: фаза рынка. Символ BTC исправлен, но модификатор пока не включаем —
-# иначе поведение изменится одновременно с исправлением измерений.
 BTC_SYMBOLS=("BTC","BTCUSDT","BTCUSD","XBTUSD")
 MARKET_PHASE_MODIFIER_ENABLED=False
-
 COOLDOWN_BY_EXIT_REASON={"STOP_LOSS":120,"INVALIDATED":60,"DISTRIBUTION":60,"EXHAUSTION":45,
                          "SIGNAL_DECAY":30,"TIMEOUT":15,"DATA_STALE":15,"MISSED":15,"NEUTRAL":15}
 PROTECTION_REASONS={"STOP_LOSS"}
 EXIT_PRIORITY=["EXCHANGE_CLOSED","INVALIDATED","EXHAUSTION","DISTRIBUTION","STOP_LOSS","SIGNAL_DECAY","TIMEOUT","DATA_STALE","MISSED","NEUTRAL"]
 EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL","STOP_LOSS":"PROTECTION",
             "TIMEOUT":"LIFETIME","SIGNAL_DECAY":"LIFETIME","DATA_STALE":"DATA","MISSED":"DATA","NEUTRAL":"LIFETIME",
-            # позиция закрыта вне нашего контура: ликвидация, ручное закрытие
-            # или наш ордер исполнился, но ответ не дошёл
             "EXCHANGE_CLOSED":"EXTERNAL"}
 STATE_RANK={"ACCUMULATION":1,"EARLY_MOVE":2,"CONFIRMED_TREND":3,"ACCELERATION":4,"EXHAUSTION":5,"DISTRIBUTION":6}
 EQUITY_SYMBOLS={ "MSFT", "CRWV", "BE", "AXTI", "META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA", "GOOGL","MSTR","COIN","BZ", "DELL","WDC","SAMSUNG","LLY","RKLB","SPY","SQQQ" }
@@ -170,7 +99,6 @@ EQUITY_HINTS=("Inc","Corp","Technologies","Platforms")
 COMMODITY_SYMBOLS={"CL"}; COMMODITY_HINTS=("Crude","Oil","Gold","Silver")
 logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s",datefmt="%Y-%m-%d %H:%M:%S")
 log=logging.getLogger("monitor")
-
 def parse_number(raw):
     if raw is None: return None
     s=raw.strip().replace("$","").replace("%","").replace(",","").replace("+","")
@@ -180,7 +108,6 @@ def parse_number(raw):
         mult={"k":1e3,"m":1e6,"b":1e9,"t":1e12}[s[-1].lower()]; s=s[:-1]
     try: return float(s)*mult
     except ValueError: return None
-
 def now_ts(): return int(time.time())
 def esc(val): return html_mod.escape(str(val),quote=False)
 def fmt_pct(val):
@@ -216,19 +143,6 @@ def resolve_exit_reason(candidates):
 def compute_snapshot_hash(snapshot):
     snapshot_json=json.dumps(snapshot,sort_keys=True,ensure_ascii=False)
     return {"algorithm":"sha256","version":"v1","value":hashlib.sha256(snapshot_json.encode()).hexdigest()}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ОТПЕЧАТОК DISCOVERY-КОНФИГУРАЦИИ
-#
-# COINALYZE_URL задаётся переменной окружения и содержит base64-параметр
-# filter, который определяет ВСЮ вселенную сигналов. В коде его больше нет,
-# в журнале не было — то есть невозможно сказать, каким фильтром порождена
-# сделка и не менялся ли он между прогонами. Для системы, где выводы делаются
-# по накопленной статистике, это самый важный неверсионированный параметр.
-#
-# Пишем: sha256 полного URL (сам URL целиком не логируем — он приходит извне
-# и может содержать что угодно) + расшифрованные параметры отбора.
-# ═══════════════════════════════════════════════════════════════════════════
 def discovery_fingerprint():
     from urllib.parse import urlparse,parse_qs
     import base64
@@ -250,11 +164,7 @@ def discovery_fingerprint():
     except Exception as e:
         out["parse_error"]=str(e)[:80]
     return out
-
 def log_discovery_change(fp,ts):
-    """Пишет строку в discovery_history.jsonl только при СМЕНЕ отпечатка.
-    Смена фильтра = новая вселенная = новый эксперимент, и это должно быть
-    видно в истории, а не только в настройках репозитория."""
     prev=load_jsonl(DISCOVERY_HISTORY_FILE)
     last=prev[-1] if prev else None
     if last and last.get("url_sha256")==fp["url_sha256"]:
@@ -272,9 +182,7 @@ def log_discovery_change(fp,ts):
     else:
         log.info(f"DISCOVERY baseline {fp['url_sha256']}")
     return True
-
 def _setup_browser_context(p):
-    """Создаёт browser context с cookies. Возвращает (browser, page)."""
     browser = p.chromium.launch(headless=True)
     ctx = browser.new_context(
         user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -296,65 +204,42 @@ def _setup_browser_context(p):
     page = ctx.new_page()
     stealth_sync(page)
     return browser, page
-
-
 def _load_page(page, url):
-    """Загружает одну страницу с полной подгрузкой динамического контента."""
-    # Ждём networkidle — все AJAX-запросы завершены
     page.goto(url, wait_until="networkidle", timeout=60_000)
     page.wait_for_timeout(3000)
-
     if "Attention Required" in page.content():
         log.warning("Cloudflare, waiting...")
         page.wait_for_timeout(10_000)
         page.wait_for_load_state("networkidle", timeout=30_000)
-
-    # Ждём таблицу
     page.wait_for_selector("tbody tr", timeout=25_000)
     initial_count = len(page.query_selector_all("tbody tr"))
     log.info(f"Строк после загрузки: {initial_count}")
-
-    # Скроллим вниз и ждём стабилизации количества строк
     prev_count = initial_count
     for scroll_attempt in range(15):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(700)
-
         cur_count = len(page.query_selector_all("tbody tr"))
         has_pagination = page.query_selector(".pagination") is not None
-
         if has_pagination:
             log.info(f"Пагинация найдена после скролла {scroll_attempt + 1}, строк: {cur_count}")
             break
-
         if cur_count != prev_count:
             log.info(f"Скролл {scroll_attempt + 1}: строк {prev_count} → {cur_count}")
-
         if cur_count == prev_count and scroll_attempt >= 3:
             break
-
         prev_count = cur_count
-
-    # После скролла — ждём networkidle (подгрузка могла триггернуть запросы)
     try:
         page.wait_for_load_state("networkidle", timeout=10_000)
     except Exception:
         pass
-
-    # Скроллим обратно наверх
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
-
     final_count = len(page.query_selector_all("tbody tr"))
     has_pagination = page.query_selector(".pagination") is not None
     log.info(f"Итого: строк={final_count}, пагинация={'есть' if has_pagination else 'нет'}")
-
     html_text = page.content()
-
     return html_text
-
 def click_next_page(page, current_page_num):
-    """Фолбэк: кликаем по номеру страницы в .pagination, если href не найдены."""
     pag = page.query_selector(".pagination")
     if not pag:
         return False
@@ -378,9 +263,7 @@ def click_next_page(page, current_page_num):
             return True
         page.wait_for_timeout(500)
     return False
-
 def get_page_urls(html_text):
-    """Парсит блок .pagination и возвращает список URL всех страниц."""
     soup = BeautifulSoup(html_text, "lxml")
     pagination = soup.select_one(".pagination")
     if not pagination:
@@ -394,7 +277,6 @@ def get_page_urls(html_text):
         if full_url not in urls:
             urls.append(full_url)
     return urls[:MAX_PAGES]
-
 def parse_table(html_text):
     soup=BeautifulSoup(html_text,"lxml"); rows=soup.select("tbody tr")
     log.info(f"Строк: {len(rows)}"); ts=now_ts(); out=[]; range_violations=0
@@ -418,13 +300,9 @@ def parse_table(html_text):
         out.append(rec)
     if range_violations: log.warning(f"parse_table: {range_violations} подозрительных строк")
     return out
-
 def fetch_data() -> list[dict]:
-    """Загружает все страницы пагинации, возвращает список всех монет.
-    Один браузер на все страницы. Дедупликация по symbol."""
     all_rows = []
     seen_symbols = set()
-
     with sync_playwright() as p:
         browser, page = _setup_browser_context(p)
         try:
@@ -435,10 +313,8 @@ def fetch_data() -> list[dict]:
             for r in rows:
                 seen_symbols.add(r.get("symbol"))
             log.info(f"Страница 1: {len(rows)} монет")
-
             page_urls = get_page_urls(html_text)
             log.info(f"Пагинация: найдено {len(page_urls)} страниц")
-
             if len(page_urls) > 1:
                 for i, page_url in enumerate(page_urls[1:], start=2):
                     try:
@@ -484,14 +360,11 @@ def fetch_data() -> list[dict]:
                 pass
         finally:
             browser.close()
-
     if not all_rows:
         send_tg("⚠️ <b>Monitor</b>\nДанные не получены. Проверь debug_page.html")
         sys.exit(1)
-
     log.info(f"Всего монет после пагинации: {len(all_rows)}")
     return all_rows
-
 def append_jsonl(path,rec):
     with open(path,"a",encoding="utf-8") as f: f.write(json.dumps(rec,ensure_ascii=False)+"\n")
 def load_jsonl(path):
@@ -533,9 +406,6 @@ def load_lifecycle_state():
     if not LIFECYCLE_STATE_FILE.exists(): return {}
     try: data=json.loads(LIFECYCLE_STATE_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError: return {}
-    # [FIX 6.2] Было: запись без idea_first_seen_ts давала now-0 → сразу
-    # отбрасывалась. Из-за этого cooldown, записанный без возраста идеи, не
-    # выживал до следующего прогона — механизм существовал, но не действовал.
     now=time.time(); ttl=IDEA_REGISTRY_TTL_DAYS*86400; out={}
     for sym,v in data.items():
         if not isinstance(v,dict): continue
@@ -591,7 +461,6 @@ def load_pending():
 def save_pending(pending):
     with open(PENDING_FILE,"w",encoding="utf-8") as f:
         for item in pending: f.write(json.dumps(item,ensure_ascii=False)+"\n")
-
 def passes_filter(r):
     v=r.get("volume24"); pc=r.get("price_chg24"); oi=r.get("oi_chg24_pct")
     oi4=r.get("oi_chg4h_pct"); cvd=r.get("cvd24"); lls=r.get("lls24")
@@ -606,7 +475,6 @@ def passes_filter(r):
     if oiv is None or oiv<0.1 or oiv>2.5: return False
     if fr is not None and fr>0.05: return False
     return True
-
 def calculate_score(r):
     score=0; pros,cons=[],[]
     cvd=r.get("cvd24")
@@ -635,7 +503,6 @@ def calculate_score(r):
     oim=r.get("oi_mktcap_ratio")
     if oim is not None and oim<0.10: score+=1; pros.append(f"OI/Mc={oim:.3f}")
     return score,pros,cons
-
 def calc_derived(snaps):
     n=len(snaps)
     d={"oi_accel":0.0,"cvd_momentum":0.0,"price_accel":0.0,"funding_pressure":0.0,
@@ -670,7 +537,6 @@ def calc_derived(snaps):
         if lls_vals[-1]>lls_vals[0]+10: d["divergence"]="lls_up_price_up"; d["note"]="LLS ↑ Price ↑ — поздняя стадия"
     elif d["oi_trend"]!="down" and d["cvd_trend"]!="down" and d["price_trend"]=="up": d["note"]="Здоровое движение: Price↑ OI и CVD не падают"
     return d
-
 def calc_momentum(derived):
     m=0; tags=[]
     if derived["oi_accel"]>0: m+=2; tags.append("OI accel↑")
@@ -685,7 +551,6 @@ def calc_momentum(derived):
     else: m-=2; tags.append(f"Div: {derived['divergence']}")
     if derived["oi_trend"]=="up" and derived["cvd_trend"]=="up": m+=1; tags.append("OI+CVD sync↑")
     return clamp(m,0,10),tags
-
 def detect_pattern(r,derived,momentum):
     pc=safe(r.get("price_chg24")); oi24=safe(r.get("oi_chg24_pct")); cvd=safe(r.get("cvd24"))
     lls=safe(r.get("lls24")); fr=safe(r.get("fr_oiw")); ls=r.get("ls_accounts"); div=derived["divergence"]
@@ -698,7 +563,6 @@ def detect_pattern(r,derived,momentum):
     if momentum>=7 and derived["oi_accel"]>2 and derived["cvd_momentum"]>10: return "Momentum Expansion"
     if pc>0 and oi24>5 and cvd>60 and lls<30 and derived["oi_trend"]!="down" and div=="none": return "Healthy Trend"
     return "—"
-
 def fetch_btc_price_chg():
     try:
         r=requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",timeout=8)
@@ -708,14 +572,6 @@ def fetch_btc_price_chg():
     except Exception as e: log.warning(f"CoinGecko: {e}")
     return None
 def detect_market_phase(rows):
-    """[FIX 6.4] Искали символ 'BTCUSDT', которого в данных нет — там 'BTC'.
-    Ветка была мертва, всегда шёл запрос в CoinGecko, у всех 97 сделок фаза
-    записана как neutral. Теперь символ ищется по списку вариантов.
-
-    Модификатор пока принудительно 0 (MARKET_PHASE_MODIFIER_ENABLED=False):
-    фазу нужно сначала накопить в журнале, а уже потом позволять ей менять
-    Score и confidence. Иначе исправление измерения и изменение поведения
-    произойдут одновременно и их нельзя будет разделить."""
     btc=next((r for r in rows if r.get("symbol") in BTC_SYMBOLS),None)
     btc_src="rows"
     if btc: btc_pc=btc.get("price_chg24") or 0
@@ -733,11 +589,9 @@ def detect_market_phase(rows):
             "modifier":mod if MARKET_PHASE_MODIFIER_ENABLED else 0,
             "modifier_raw":mod,"btc_chg24":round(btc_pc,3),
             "btc_source":btc_src,"breadth_ratio":round(ratio,3)}
-
 ACTIONS={"NEUTRAL":"IGNORE","ACCUMULATION":"WATCH","EARLY_MOVE":"WATCH_LONG","CONFIRMED_TREND":"POSSIBLE_ENTRY","ACCELERATION":"LONG_SETUP","EXHAUSTION":"NO_NEW_ENTRY","DISTRIBUTION":"EXIT_AVOID","INVALIDATED":"REMOVE"}
 STATE_EMOJI={"NEUTRAL":"⚪","ACCUMULATION":"🔍","EARLY_MOVE":"🌱","CONFIRMED_TREND":"🟢","ACCELERATION":"🚀","EXHAUSTION":"🟠","DISTRIBUTION":"🔴","INVALIDATED":"❌"}
 ALLOWED_FROM={"ACCUMULATION":{"NEUTRAL","ACCUMULATION"},"EARLY_MOVE":{"NEUTRAL","ACCUMULATION","EARLY_MOVE"},"CONFIRMED_TREND":{"ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND"},"ACCELERATION":{"CONFIRMED_TREND","ACCELERATION"},"EXHAUSTION":{"CONFIRMED_TREND","ACCELERATION","EXHAUSTION"},"DISTRIBUTION":{"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"},"INVALIDATED":{"NEUTRAL","ACCUMULATION","EARLY_MOVE","CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION","INVALIDATED"}}
-
 def detect_lifecycle(symbol,snaps,score,derived,prev_state="NEUTRAL"):
     n=len(snaps); reasons,warnings=[],[]
     if n<2: return "NEUTRAL",["недостаточно данных"],[],None
@@ -801,7 +655,6 @@ def detect_lifecycle(symbol,snaps,score,derived,prev_state="NEUTRAL"):
             reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
             return "ACCUMULATION",reasons,warnings,None
     return "NEUTRAL",["нет подтверждённого движения"],warnings,None
-
 def calc_confidence(state,snaps,score,derived,market_mod):
     base={"NEUTRAL":50,"ACCUMULATION":40,"EARLY_MOVE":55,"CONFIRMED_TREND":70,"ACCELERATION":80,"EXHAUSTION":75,"DISTRIBUTION":70,"INVALIDATED":90}.get(state,50)
     snap_bonus=min(len(snaps),10)*2; penalty=0
@@ -815,7 +668,6 @@ def entry_earliness(r):
     fr_pos=min(max(safe(r.get("fr_oiw"))/0.05,0),1.0)
     avg=(pc_pos+oi_pos+fr_pos)/3
     return avg,("ранняя" if avg<0.35 else "средняя" if avg<0.65 else "поздняя")
-
 def send_tg(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: log.warning("TG не настроен"); return
     url=f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -831,7 +683,6 @@ def send_tg(text):
             if r.status_code!=200: requests.post(url,data={"chat_id":TG_CHAT_ID,"text":ch,"disable_web_page_preview":True},timeout=15)
             time.sleep(0.4)
         except Exception as e: log.error(f"TG: {e}")
-
 def format_signal(symbol,wl,cur,snaps,reasons,warnings,market):
     state=wl["state"]; emoji=STATE_EMOJI.get(state,"⚪"); action=ACTIONS.get(state,"")
     conf=wl.get("confidence",0); score=cur.get("score",0); mom=cur.get("momentum",0)
@@ -854,7 +705,6 @@ def format_signal(symbol,wl,cur,snaps,reasons,warnings,market):
     if reas: msg+=f"{line}\n✅ {esc(reas)}\n"
     if warns: msg+=f"⚠️ {esc(warns)}\n"
     return msg
-
 def format_trade_close(rec):
     pnl=rec.get("strategy_pnl_pct")
     pnl_s="—" if pnl is None else f"{pnl:+.1f}%"
@@ -872,7 +722,6 @@ def format_trade_close(rec):
     r60=rec.get("return_60m")
     if r60 is not None: msg+=f"Signal@60m: {r60:+.1f}%\n"
     return msg
-
 def llm_verify(symbol,wl,cur,snaps):
     if not ENABLE_LLM or not QWEN_API_KEY: return None
     state=wl["state"]; conf=wl.get("confidence",0); action=ACTIONS.get(state,""); derived=cur.get("derived",{})
@@ -892,7 +741,6 @@ def llm_verify(symbol,wl,cur,snaps):
         if resp.status_code==200: return json.loads(resp.json()["choices"][0]["message"]["content"])
     except Exception as e: log.warning(f"LLM: {e}")
     return None
-
 def _fill_horizons(ot,sym,as_of_ts,price_full):
     ep=ot.get("entry_price")
     if not ep: return
@@ -904,16 +752,7 @@ def _fill_horizons(ot,sym,as_of_ts,price_full):
             if ph:
                 ot[key]=round((ph-ep)/ep*100,3)
                 ot[f"{key}_available"]=True
-
 def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,pattern,derived,market,idea_first_seen_ts,snapshots,price,history_len=None,window=None,strength=None,shadow=None):
-    """[FIX И5] Пропуски больше не превращаются в 0.0.
-    Было: safe(r.get("oi_mktcap_ratio")) при 28.9% отсутствующих значений
-    писало в журнал 0.0, неотличимый от настоящего нуля — из-за этого анализ
-    порога OI/MarketCap был невозможен.
-
-    [FIX A2] Добавлены абсолютные volume24 / oi / mktcap / price_chg24.
-    Пороги discovery-фильтра заданы по ним, но в журнал они не попадали,
-    а market_history.jsonl живёт всего 2 дня — данные терялись безвозвратно."""
     if state=="CONFIRMED_TREND": trigger=f"confirmed_trend_{path}_path"
     elif state=="ACCELERATION": trigger="acceleration_confirmation"
     else: trigger=state.lower()
@@ -937,7 +776,6 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "decision":{"state":state,"score":score,"momentum":momentum,"path":path,
                     "pattern":pattern,"market_phase":market.get("phase","unknown"),
                     "entry_reason":{"state":state,"path":path,"trigger":trigger}},
-        # какая вселенная породила эту сделку (COINALYZE_URL задан извне)
         "discovery":dict(DISCOVERY),
     }
     ot={
@@ -949,16 +787,11 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "idea_first_seen_ts":idea_first_seen_ts,
         "idea_age_minutes":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
         "signal_age_min":round((ts-idea_first_seen_ts)/60,1) if idea_first_seen_ts else None,
-        # [FIX 6.3] snapshot_count_before_entry измеряет срок в watchlist, а не
-        # длину истории решения — из-за этого 39 сделок из 97 записали «2» при
-        # требовании 5 снимков. Оставлено для совместимости, рядом добавлено
-        # честное значение и явное имя.
         "snapshot_count_before_entry":snapshots,
         "watchlist_tenure_runs":snapshots,
         "history_len_before_entry":history_len,
         "entry_window":window,
         "entry_signal_strength":strength,
-        # теневые вердикты предиката на момент входа (И1/И3/И2 — не влияли на решение)
         "entry_shadow_predicates":({k:shadow[k] for k,_ in SHADOW_VARIANTS} if shadow else None),
         "asset_class":classify_asset_class(r),"name":r.get("name",r.get("symbol","")),
         "engine_versions":dict(ENGINE_VERSIONS),
@@ -974,24 +807,19 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         "entry_pattern":pattern,
         "entry_oi_trend":derived["oi_trend"],"entry_cvd_trend":derived["cvd_trend"],
         "entry_price_trend":derived["price_trend"],"entry_divergence":derived["divergence"],
-        # [FIX И5] None сохраняется как None, а не как 0.0
         "entry_price_chg24":r.get("price_chg24"),"entry_oi_chg24":r.get("oi_chg24_pct"),
         "entry_oi_chg4h":r.get("oi_chg4h_pct"),"entry_cvd24":r.get("cvd24"),
         "entry_lls24":r.get("lls24"),"entry_fr_oiw":r.get("fr_oiw"),
         "entry_oi_vol_ratio":r.get("oi_vol_ratio"),"entry_oi_mktcap_ratio":r.get("oi_mktcap_ratio"),
         "entry_liq_short24":r.get("liq_short24"),"entry_liq_long24":r.get("liq_long24"),
         "entry_ls_accounts":r.get("ls_accounts"),"entry_btc_corr7d":r.get("btc_corr7d"),
-        # [FIX A2] абсолютные величины — раньше терялись вместе с market_history
         "entry_volume24":r.get("volume24"),"entry_oi_abs":r.get("oi"),"entry_mktcap":r.get("mktcap"),
         "entry_market_phase":market.get("phase","unknown"),
         "entry_market_breadth":market.get("breadth_ratio"),
         "entry_btc_chg24":market.get("btc_chg24"),
         "data_quality":{"entry_price_source":"live","exit_price_source":None,"missing_snapshots":0,
                         "max_price_age_min":0,"price_unknown":False,"exit_price_age_min":0.0},
-        # П3: теневые стопы. Пишем «сработал бы на уровне X», решения не меняем,
-        # пока не накопится 300–400 сделок с честным MAE (см. блок ДВИЖОК v3).
         "shadow_stops":{str(lvl):None for lvl in SHADOW_STOP_LEVELS},
-        # И4: теневой триггер Шмитта — считаем состояние, но не действуем по нему
         "shadow_schmitt_on":True,
         "shadow_schmitt_exit_ts":None,
     }
@@ -999,30 +827,17 @@ def open_trade_record(r,ts,state,path,score,momentum,conf,early_val,early_label,
         ot[f"return_{h}m"]=None
         ot[f"return_{h}m_available"]=False
     return ot
-
 def _exit_meta(source,exit_ts,last_price_ts):
     if source=="live" or last_price_ts is None: return source,0.0
     return source,round(max(0,exit_ts-last_price_ts)/60,1)
-
 def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,exit_price_source="live",exit_candidates=None,lifecycle_complete=True,skip_exchange=False):
     ep=ot.get("entry_price")
     if skip_exchange:
-        # позиции на бирже уже нет (установлено сверкой) — закрывать нечего
         ot=dict(ot); ot.pop("bingx",None)
-     # >>> BINGX: закрытие позиции на бирже перед закрытием журнала <<<
-    # [FIX 6.6] Было: close_long вызывался ТОЛЬКО при
-    # status in ("opened","already_open"). Если открытие вернуло ошибку, а ордер
-    # фактически исполнился (типичный случай — таймаут ответа API), позиция
-    # оставалась на бирже навсегда и не попадала ни в один журнал.
-    # Теперь закрытие пробуется при любом известном qty, а неопределённое
-    # состояние поднимает критический алерт вместо тихого игнорирования.
     bx = ot.get("bingx") or {}
     if ENABLE_BINGX and bx:
         status = bx.get("status")
-        # >>> PARTIAL BINGX: закрываем только remaining, а не весь qty <<<
         qty_to_close = safe(bx.get("qty_remaining"), safe(bx.get("qty"), 0.0))
-        # <<< PARTIAL BINGX >>>
-
         if qty_to_close and qty_to_close > 0:
             try:
                 import bingx_client
@@ -1042,14 +857,12 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
                         f"<i>Проверить позицию вручную.</i>")
         elif status not in ("skipped","rejected",None):
             if qty_to_close == 0:
-                # позиция уже полностью закрыта partial TP
                 log.info(f"[{symbol}] BingX CLOSE skipped: qty_remaining=0 (all partial TP done)")
                 ot["bingx_close"] = {"status": "skipped", "reason": "qty_remaining_zero"}
             else:
                 log.error(f"[{symbol}] BingX: закрытие невозможно, qty неизвестен (status={status})")
                 send_tg(f"⚠️ <b>BingX: НЕОПРЕДЕЛЁННАЯ ПОЗИЦИЯ</b>\n{esc(symbol)} status={esc(status)}\n"
                         f"<i>qty неизвестен — проверить позицию на бирже вручную.</i>")
-    # <<< BINGX >>>
     _fill_horizons(ot,symbol,exit_ts,price_full)
     gross=round((exit_price-ep)/ep*100,3) if (exit_price and ep) else None
     max_pnl=ot.get("max_pnl_pct",0.0); min_pnl=ot.get("min_pnl_pct",0.0); peak_ts=ot.get("peak_ts",ot["entry_ts"])
@@ -1100,7 +913,6 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
         "idea_age_minutes":ot.get("idea_age_minutes"),
         "signal_age_min":ot.get("signal_age_min"),
         "snapshot_count_before_entry":ot.get("snapshot_count_before_entry"),
-        # [FIX] новые поля движка v3 — без этого они терялись при закрытии
         "watchlist_tenure_runs":ot.get("watchlist_tenure_runs"),
         "history_len_before_entry":ot.get("history_len_before_entry"),
         "entry_window":ot.get("entry_window"),
@@ -1117,11 +929,8 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
         "entry_btc_chg24":ot.get("entry_btc_chg24"),
         "exit_price_age_min":ot.get("data_quality",{}).get("exit_price_age_min"),
         "engine_versions":ot.get("engine_versions",dict(ENGINE_VERSIONS)),
-        # отпечаток discovery-фильтра: без него нельзя сказать, сопоставимы ли
-        # две сделки между собой (вселенная задаётся переменной окружения)
         "discovery":ot.get("entry_snapshot",{}).get("discovery"),
         "discovery_sha256":(ot.get("entry_snapshot",{}).get("discovery") or {}).get("url_sha256"),
-        # плоские версии — trades_report.py и make_dashboard.py читают их напрямую
         "signal_logic_version":ot.get("engine_versions",{}).get("signal",SIGNAL_LOGIC_VERSION),
         "lifecycle_engine_version":ot.get("engine_versions",{}).get("lifecycle",LIFECYCLE_ENGINE_VERSION),
         "max_state":ot.get("max_state"),
@@ -1168,27 +977,7 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
     PENDING.append({"rec":rec,"entry_ts":ot["entry_ts"],"symbol":symbol,"entry_price":ep})
     log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} hold={hold_min}m")
     send_tg(format_trade_close(rec))
-
-# ═══════════════════════════════════════════════════════════════════════════
-# EXECUTION LAYER — реализация.
-#
-# Единственная точка входа для monitor.py — process_execution_policy().
-# Вызывается КАЖДЫЙ прогон для каждой открытой сделки, ТОЛЬКО когда
-# research lifecycle не решил закрыть позицию (close_reason is None,
-# т.е. после resolve_exit_reason() в manage_open_trade()).
-#
-# Контракт:
-#   - читает: ot["entry_price"], ot["entry_ts"], ot["bingx"], cur_price, ts
-#   - пишет:  только ot["bingx"]["qty_remaining"]/["partial_legs_done"]
-#             и ot["execution"][...] (собственное runtime-состояние)
-#   - НИКОГДА не пишет в trades.jsonl, не создаёт trade_id,
-#     не вызывает close_trade(), не трогает exit_reason/strategy_pnl_pct
-#   - НИКОГДА не уменьшает remaining ниже EXECUTION_MIN_REMAINING_FRACTION
-#     от qty_initial — последний остаток закрывает только lifecycle
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction, tag, note):
-    """Общий примитив уменьшения позиции до target_fraction от qty_initial."""
     bx = ot.get("bingx") or {}
     if bx.get("status") not in ("opened", "already_open"):
         return False
@@ -1196,31 +985,26 @@ def _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction, tag, n
     qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
     if qty_initial <= 0 or qty_remaining <= 0:
         return False
-
     floor_fraction = max(target_fraction, EXECUTION_MIN_REMAINING_FRACTION)
     qty_to_close = qty_remaining - qty_initial * floor_fraction
     if qty_to_close <= 0:
         return False
-
     try:
         import bingx_client
     except Exception as e:
         log.error(f"[{symbol}] EXEC_REDUCE({tag}): bingx_client недоступен: {e}")
         return False
-
     limits = bingx_client.contract_limits(symbol)
     if not limits.get("found"):
         return False
     prec = limits["quantity_precision"]
     min_qty = max(limits["min_qty"], PARTIAL_MIN_QTY)
     min_notional = max(limits["min_notional"], PARTIAL_MIN_NOTIONAL)
-
     qty_to_close = bingx_client._round_qty(qty_to_close, prec)
     if qty_to_close <= 0 or qty_to_close < min_qty:
         return False
     if cur_price and qty_to_close * cur_price < min_notional:
         return False
-
     try:
         real_amt = bingx_client.position_amt(symbol)
         if real_amt < qty_to_close:
@@ -1230,28 +1014,21 @@ def _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction, tag, n
     except Exception as e:
         log.error(f"[{symbol}] EXEC_REDUCE({tag}) exception: {e}")
         return False
-
     if res.get("status") != "closed":
         log.error(f"[{symbol}] EXEC_REDUCE({tag}) failed: {res.get('error')}")
         return False
-
     closed_qty = safe(res.get("qty"), qty_to_close)
     qty_remaining -= closed_qty
     bx["qty_remaining"] = qty_remaining
     ot["bingx"] = bx
     remaining_pct = qty_remaining / qty_initial * 100 if qty_initial else 0.0
-
     log.info(f"[{symbol}] EXEC_REDUCE({tag}): closed {closed_qty:.8f} @ {cur_price} remaining={qty_remaining:.8f} ({remaining_pct:.1f}%)")
     send_tg(f"🛡 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — {esc(note)}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Закрыто: {closed_qty:.8f} @ {fmt_price(cur_price)}\n"
             f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n")
     return True
-
-
 def _step_partial_take_profit(ot, symbol, cur_price):
-    """Partial Take Profit: закрывает часть позиции по заранее заданным
-    уровням прибыли PARTIAL_TP_LEVELS. Не пишет в trades.jsonl."""
     bx = ot.get("bingx") or {}
     if bx.get("status") not in ("opened", "already_open") or not cur_price:
         return False
@@ -1260,23 +1037,19 @@ def _step_partial_take_profit(ot, symbol, cur_price):
     entry_price = ot.get("entry_price")
     if qty_initial <= 0 or qty_remaining <= 0 or not entry_price:
         return False
-
     try:
         import bingx_client
     except Exception as e:
         log.error(f"[{symbol}] PARTIAL_TP: bingx_client недоступен: {e}")
         return False
-
     limits = bingx_client.contract_limits(symbol)
     if not limits.get("found"):
         return False
     prec = limits["quantity_precision"]
     min_qty = max(limits["min_qty"], PARTIAL_MIN_QTY)
     min_notional = max(limits["min_notional"], PARTIAL_MIN_NOTIONAL)
-
     pnl_pct = (cur_price - entry_price) / entry_price * 100
     legs_done = set(bx.get("partial_legs_done", []))
-
     for level in PARTIAL_TP_LEVELS:
         leg_name = level.get("leg")
         if not leg_name or leg_name in legs_done:
@@ -1285,14 +1058,12 @@ def _step_partial_take_profit(ot, symbol, cur_price):
         close_fraction = level.get("close_fraction", 0.0)
         if min_pnl_pct is None or close_fraction <= 0 or pnl_pct < min_pnl_pct:
             continue
-
         qty_to_close = min(qty_initial * close_fraction, qty_remaining)
         qty_to_close = bingx_client._round_qty(qty_to_close, prec)
         if qty_to_close <= 0 or qty_to_close < min_qty:
             continue
         if qty_to_close * cur_price < min_notional:
             continue
-
         try:
             real_amt = bingx_client.position_amt(symbol)
             if real_amt < qty_to_close:
@@ -1302,7 +1073,6 @@ def _step_partial_take_profit(ot, symbol, cur_price):
         except Exception as e:
             log.error(f"[{symbol}] PARTIAL_TP {leg_name} exception: {e}")
             continue
-
         if res.get("status") == "closed":
             closed_qty = safe(res.get("qty"), qty_to_close)
             qty_remaining -= closed_qty
@@ -1322,11 +1092,7 @@ def _step_partial_take_profit(ot, symbol, cur_price):
         else:
             log.error(f"[{symbol}] PARTIAL_TP {leg_name} failed: {res.get('error')}")
     return False
-
-
 def _step_break_even(ot, symbol, cur_price):
-    """Break Even: после BREAK_EVEN_TRIGGER_PCT прибыли — armed. При откате
-    цены к entry+buffer уменьшает позицию (не закрывает полностью)."""
     entry_price = ot.get("entry_price")
     if not cur_price or not entry_price:
         return False
@@ -1334,18 +1100,15 @@ def _step_break_even(ot, symbol, cur_price):
     be = ex.setdefault("break_even", {"armed": False, "done": False})
     if be["done"]:
         return False
-
     pnl_pct = (cur_price - entry_price) / entry_price * 100
     if not be["armed"]:
         if pnl_pct >= BREAK_EVEN_TRIGGER_PCT:
             be["armed"] = True
             log.info(f"[{symbol}] BREAK_EVEN armed at pnl={pnl_pct:+.2f}%")
         return False
-
     trigger_price = entry_price * (1 + BREAK_EVEN_BUFFER_PCT / 100)
     if cur_price > trigger_price:
         return False
-
     ok = _execution_reduce_to_fraction(ot, symbol, cur_price, BREAK_EVEN_REDUCE_TO_FRACTION,
                                         tag="break_even", note="Break Even — защита капитала")
     if ok:
@@ -1353,17 +1116,12 @@ def _step_break_even(ot, symbol, cur_price):
         be["triggered_at_price"] = cur_price
         be["triggered_pnl_pct"] = round(pnl_pct, 3)
     return ok
-
-
 def _step_trailing_stop(ot, symbol, cur_price):
-    """Trailing: после активации следим за пиком цены; откат от пика на
-    TRAILING_DRAWDOWN_PCT уменьшает remaining ещё на один шаг."""
     entry_price = ot.get("entry_price")
     if not cur_price or not entry_price:
         return False
     ex = ot.setdefault("execution", {})
     tr = ex.setdefault("trailing", {"active": False, "peak_price": None, "steps_done": 0})
-
     pnl_pct = (cur_price - entry_price) / entry_price * 100
     if not tr["active"]:
         if pnl_pct >= TRAILING_ACTIVATE_PCT:
@@ -1371,16 +1129,13 @@ def _step_trailing_stop(ot, symbol, cur_price):
             tr["peak_price"] = cur_price
             log.info(f"[{symbol}] TRAILING activated at pnl={pnl_pct:+.2f}%")
         return False
-
     if cur_price > (tr["peak_price"] or cur_price):
         tr["peak_price"] = cur_price
         return False
-
     peak = tr["peak_price"]
     drawdown_pct = (peak - cur_price) / peak * 100 if peak else 0.0
     if drawdown_pct < TRAILING_DRAWDOWN_PCT:
         return False
-
     bx = ot.get("bingx") or {}
     qty_initial = safe(bx.get("qty_initial"), 0.0)
     qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
@@ -1388,7 +1143,6 @@ def _step_trailing_stop(ot, symbol, cur_price):
     target_fraction = max(current_fraction - TRAILING_REDUCE_STEP_FRACTION, EXECUTION_MIN_REMAINING_FRACTION)
     if target_fraction >= current_fraction:
         return False
-
     ok = _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction,
                                         tag=f"trailing_step_{tr['steps_done']+1}",
                                         note=f"Trailing Stop — откат {drawdown_pct:.1f}% от пика")
@@ -1396,18 +1150,13 @@ def _step_trailing_stop(ot, symbol, cur_price):
         tr["steps_done"] += 1
         tr["peak_price"] = cur_price
     return ok
-
-
 def _step_reduce_exposure_time(ot, symbol, cur_price, ts):
-    """Reduce Exposure: чем дольше сделка открыта, тем меньше реальная
-    экспозиция на бирже — риск-менеджмент времени удержания."""
     if not cur_price:
         return False
     age_min = (ts - ot["entry_ts"]) / 60
     ex = ot.setdefault("execution", {})
     re_state = ex.setdefault("reduce_exposure_time", {"levels_done": []})
     levels_done = set(re_state["levels_done"])
-
     triggered = False
     for level in REDUCE_EXPOSURE_TIME_LEVELS:
         key = f"after_{level['after_min']}m"
@@ -1420,16 +1169,12 @@ def _step_reduce_exposure_time(ot, symbol, cur_price, ts):
             re_state["levels_done"] = sorted(levels_done)
             triggered = True
     return triggered
-
-
 def _step_position_health(ot, symbol, cur_price, ts):
-    """Position Health: чисто информационный health-check, никаких ордеров."""
     ex = ot.setdefault("execution", {})
     health = ex.setdefault("health", {"last_report_ts": 0})
     if ts - health["last_report_ts"] < POSITION_HEALTH_CHECK_MIN * 60:
         return
     health["last_report_ts"] = ts
-
     entry_price = ot.get("entry_price")
     pnl_pct = ((cur_price - entry_price) / entry_price * 100) if (cur_price and entry_price) else None
     age_min = round((ts - ot["entry_ts"]) / 60, 1)
@@ -1439,18 +1184,13 @@ def _step_position_health(ot, symbol, cur_price, ts):
     qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
     remaining_pct = (qty_remaining / qty_initial * 100) if qty_initial else None
     legs = bx.get("partial_legs_done", [])
-
     log.info(f"[{symbol}] POSITION_HEALTH age={age_min}m pnl={pnl_pct} peak={max_pnl} remaining={remaining_pct}")
     send_tg(f"📊 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — health-check\n"
             f"━━━━━━━━━━━━━━━━━━\nВ сделке: {age_min} мин\n"
             f"PnL сейчас: {fmt_pct(pnl_pct)} · пик {fmt_pct(max_pnl)}\n"
             f"Остаток позиции: {fmt_num(remaining_pct,'%',0)}\n"
             f"Legs: {esc(', '.join(legs) if legs else '—')}\n")
-
-
 def process_execution_policy(ot, symbol, cur_price, ts):
-    """Единственная точка входа Execution Layer, вызываемая из monitor.py.
-    См. заголовок блока выше — контракт и гарантии."""
     if not (ENABLE_BINGX and cur_price):
         return
     if ENABLE_PARTIAL_BINGX:
@@ -1463,7 +1203,6 @@ def process_execution_policy(ot, symbol, cur_price, ts):
         _step_reduce_exposure_time(ot, symbol, cur_price, ts)
     if ENABLE_POSITION_HEALTH:
         _step_position_health(ot, symbol, cur_price, ts)
-
 def flush_pending(price_full,now,existing_trade_ids):
     global PENDING
     grace=PENDING_GRACE_MIN*60; wait_max=(max(TRADE_HORIZONS)+PENDING_WAIT_MAX_MIN)*60; still=[]
@@ -1493,29 +1232,10 @@ def flush_pending(price_full,now,existing_trade_ids):
             log.info(f"[{sym}] TRADE FINALIZED trade_id={rec['trade_id']} reason={rec['pending_finalize_reason']}")
         else: still.append(item)
     PENDING=still
-
 TG_STATES={"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"}
 ACTIVE_STATES={"CONFIRMED_TREND","ACCELERATION","EXHAUSTION","DISTRIBUTION"}
 ENTRY_STATES={"CONFIRMED_TREND","ACCELERATION"}
 CLOSE_STATES={"EXHAUSTION","DISTRIBUTION"}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# СЛОЙ 2 — МЕНЕДЖЕР ПОЗИЦИИ
-#
-# [FIX П1] Раньше этот код жил внутри ветки `if ot is not None:` уже ПОСЛЕ
-# `if state=="NEUTRAL": ... continue`. Поэтому при NEUTRAL не выполнялось
-# ничего: ни стоп, ни таймаут, ни обновление цены, ни заполнение горизонтов.
-#
-# Контракт нового слоя: функция вызывается КАЖДЫЙ прогон для КАЖДОЙ открытой
-# сделки, вне зависимости от состояния сигнала и вне зависимости от того,
-# присутствует ли символ в текущей выборке discovery-фильтра.
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════
-# СВЕРКА ЖУРНАЛА С БИРЖЕЙ
-# Выполняется до менеджера позиций: если биржа говорит, что позиции нет,
-# журнальную сделку нужно закрыть в этом же прогоне, а не вести дальше.
-# ═══════════════════════════════════════════════════════════════════════════
 def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
     if not ENABLE_BINGX:
         return {"status":"skipped","reason":"ENABLE_BINGX=false"}
@@ -1530,8 +1250,7 @@ def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
         send_tg(f"⚠️ <b>Сверка с биржей не выполнена</b>\n{esc(str(res.get('error'))[:200])}\n"
                 f"<i>Расхождения журнала и биржи в этом прогоне не проверены.</i>")
         return {"status":"error","error":res.get("error")}
-    exch=res["positions"]                       # {bx_symbol: qty}
-    # журнал: символы с открытой сделкой, у которых есть подтверждённый объём
+    exch=res["positions"]                       
     journal={}
     for sym,entry in wl_all.items():
         ot=entry.get("open_trade")
@@ -1560,8 +1279,6 @@ def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
     rec={"ts":ts,"exchange_positions":len(exch),"journal_positions":len(journal),
          "orphans":orphans,"missing":missing,"mismatch":mismatch,
          "autoclose":RECONCILE_AUTOCLOSE}
-
-    # ── сироты: биржа держит позицию, которой нет в журнале ──────────────
     for o in orphans:
         log.error(f"RECONCILE ORPHAN {o['bx_symbol']} qty={o['qty']} — нет в журнале")
         if RECONCILE_AUTOCLOSE:
@@ -1580,8 +1297,6 @@ def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
                 +("<i>Автозакрытие включено.</i>" if RECONCILE_AUTOCLOSE
                   else "<i>Автозакрытие выключено — закрыть вручную или включить "
                        "BINGX_RECONCILE_AUTOCLOSE=true.</i>"))
-
-    # ── пропавшие: журнал считает, что позиция есть, а биржи — нет ───────
     for m in missing:
         sym=m["symbol"]; entry=wl_all.get(sym)
         ot=(entry or {}).get("open_trade")
@@ -1609,11 +1324,7 @@ def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids):
              f"сирот={len(orphans)} пропавших={len(missing)} расхождений={len(mismatch)}")
     rec["status"]="ok"
     return rec
-
 def _touch_state(ot,state,ts,score,reason):
-    """Учёт времени в состояниях. [FIX] Раньше NEUTRAL никогда не попадал в
-    time_in_states, потому что до перехода исполнение не доходило: суммарно
-    14 625 минут были отнесены к CONFIRMED_TREND."""
     if state==ot.get("current_state"):
         return
     prev=ot.get("current_state","UNKNOWN")
@@ -1625,10 +1336,7 @@ def _touch_state(ot,state,ts,score,reason):
     ot.setdefault("state_history",[]).append({"ts":ts,"state":state,"score":score,"reason":reason})
     if STATE_RANK.get(state,0)>STATE_RANK.get(ot.get("max_state"),0):
         ot["max_state"]=state
-
 def _update_shadows(ot,ts,pnl_pct,strength):
-    """Теневые правила: пишем, что сработало бы, но решений не меняем.
-    П3 — уровни стопа; И4 — триггер Шмитта."""
     sh=ot.setdefault("shadow_stops",{str(l):None for l in SHADOW_STOP_LEVELS})
     if pnl_pct is not None:
         for lvl in SHADOW_STOP_LEVELS:
@@ -1644,18 +1352,10 @@ def _update_shadows(ot,ts,pnl_pct,strength):
             ot["shadow_schmitt_exit_min"]=round((ts-ot["entry_ts"])/60,1)
         ot["shadow_schmitt_on"]=on
         ot["last_signal_strength"]=strength
-
 def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
-    """Возвращает (close_reason|None, all_triggered, exit_price, exit_price_source).
-
-    signal=None означает, что символа нет в текущей выборке — позиция всё равно
-    управляется, просто без сигнальных причин выхода.
-    """
     state=(signal or {}).get("state")
     score=(signal or {}).get("score",0)
     strength=(signal or {}).get("strength")
-
-    # ── Слой 1: цена. Обновляем ВСЕГДА, если она есть. ────────────────────
     if cur_price:
         ot["last_price"]=cur_price
         ot["last_price_ts"]=ts
@@ -1667,29 +1367,19 @@ def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
     else:
         dq=ot.setdefault("data_quality",{})
         dq["missing_snapshots"]=dq.get("missing_snapshots",0)+1
-
     price_age_min=round((ts-ot.get("last_price_ts",ts))/60,1)
     dq=ot.setdefault("data_quality",{})
     dq["max_price_age_min"]=max(dq.get("max_price_age_min",0),price_age_min)
     dq["exit_price_age_min"]=price_age_min
-
-    # состояние: NEUTRAL тоже фиксируется
     _touch_state(ot,state or "NO_DATA",ts,score,
                  "state_transition" if state else "out_of_universe")
-
-    # ── Горизонты: заполняем ВСЕГДА ──────────────────────────────────────
     _fill_horizons(ot,sym,ts,price_full)
-
     ep=ot.get("entry_price")
     pnl_pct=((cur_price-ep)/ep*100) if (cur_price and ep) else None
     _update_shadows(ot,ts,pnl_pct,strength)
-
-    # ── Затухание сигнала: счётчик тикает независимо от состояния ────────
     if state in ("CONFIRMED_TREND","ACCELERATION") or (state and score>=5):
         ot["last_signal_ts"]=ts
     last_signal_ts=ot.get("last_signal_ts",ot["entry_ts"])
-
-    # ── Причины выхода ───────────────────────────────────────────────────
     cand={
         "INVALIDATED": state=="INVALIDATED",
         "EXHAUSTION":  state=="EXHAUSTION",
@@ -1697,21 +1387,17 @@ def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
         "STOP_LOSS":   pnl_pct is not None and pnl_pct<=-STOP_LOSS_PCT,
         "SIGNAL_DECAY":ts-last_signal_ts>=SIGNAL_DECAY_MIN*60,
         "TIMEOUT":     ts-ot["entry_ts"]>=TRADE_TIMEOUT_MIN*60,
-        # [FIX П2] явный выход по возрасту цены вместо аварийного MISSED
         "DATA_STALE":  price_age_min>=PRICE_STALE_EXIT_MIN,
         "MISSED":      missed_runs>=MISS_REMOVE_RUNS,
         "NEUTRAL":     False,
     }
     close_reason,all_triggered=resolve_exit_reason(cand)
     if not close_reason:
-        # >>> EXECUTION LAYER: единственная точка вызова, см. process_execution_policy() <<<
         process_execution_policy(ot, sym, cur_price, ts)
-        # <<< EXECUTION LAYER >>>
         return None,[],None,None
     exit_price=cur_price or ot.get("last_price")
     src="live" if cur_price else "last_seen"
     return close_reason,all_triggered,exit_price,src
-
 def run():
     log.info("═══ Прогон ═══")
     wl_all=load_watchlist()
@@ -1737,18 +1423,11 @@ def run():
         append_jsonl(MARKET_HISTORY_FILE,{**r,"lifecycle_state":wl_all.get(sym,{}).get("state")})
     history_all=load_market_history()
     price_full=load_price_full()
-
-    # ═══ СЛОЙ 0 — СВЕРКА С БИРЖЕЙ ══════════════════════════════════════════
-    # До менеджера позиций: если биржа говорит, что позиции нет, сделку нужно
-    # закрыть сейчас, а не вести её ещё один прогон.
     try:
         reconcile_exchange(wl_all,ts,price_full,existing_trade_ids)
     except Exception as e:
         log.exception(f"reconcile упал: {e}")
         send_tg(f"⚠️ <b>Сверка с биржей упала</b>\n{esc(str(e)[:200])}")
-
-    # ═══ СЛОЙ 3a — вычислить сигнал для всех символов выборки ═══════════════
-    # Никаких ветвлений и никаких побочных эффектов: только расчёт.
     signals={}
     for sym,hist in history_all.items():
         if not hist or sym not in current_symbols: continue
@@ -1772,13 +1451,8 @@ def run():
             "price":r.get("price") if valid_price(r.get("price")) else None,
             "strength":signal_strength(hist,derived["cvd_momentum"]),
             "window":window_quality(recent),"history_len":len(hist),
-            # Теневой эксперимент: вердикты И1/И3/И2 рядом с боевым.
             "shadow":shadow_variants(hist,derived["cvd_momentum"]),
         }
-
-    # ═══ Теневой лог предиката входа ═══════════════════════════════════════
-    # Пишем только строки, где хотя бы один вариант расходится с боевым — иначе
-    # файл вырастет до ~11 тыс. строк в сутки без новой информации.
     for sym,sig in signals.items():
         sh=sig["shadow"]
         if not sh.get("disagrees"): continue
@@ -1793,9 +1467,6 @@ def run():
             "signal_logic_version":SIGNAL_LOGIC_VERSION,
             "conditions_version":CONDITIONS_CONFIG["conditions_version"],
         })
-
-    # ═══ Учёт присутствия символа в выборке ════════════════════════════════
-    # Делается ДО менеджера позиций, чтобы он видел актуальный missed_runs.
     for sym,entry in wl_all.items():
         if sym in current_symbols:
             entry["missed_runs"]=0
@@ -1809,10 +1480,6 @@ def run():
                         f"Наблюдение на паузе ({esc(entry['state'])})\n"
                         f"Выпала из discovery-фильтра {entry['missed_runs']} прогона подряд\n"
                         f"<i>Стадия сохранена — при возврате пересчитается.</i>\n")
-
-    # ═══ СЛОЙ 2 — МЕНЕДЖЕР ПОЗИЦИЙ ════════════════════════════════════════
-    # [FIX П1] Выполняется БЕЗУСЛОВНО для каждой открытой сделки: до всех
-    # проверок состояния и вне зависимости от наличия символа в выборке.
     for sym in list(wl_all.keys()):
         entry=wl_all[sym]
         ot=entry.get("open_trade")
@@ -1831,8 +1498,6 @@ def run():
             close_trade(ot,sym,ts,xprice,reason,exit_state,price_full,
                         exit_price_source=xsrc,exit_candidates=triggered,
                         lifecycle_complete=complete)
-            # [FIX П4/6.1] cooldown хранится в реестре, который НЕ удаляется
-            # вместе с записью watchlist, и ненулевой для DATA_STALE/MISSED/TIMEOUT.
             cd=COOLDOWN_BY_EXIT_REASON.get(reason,0)
             rec=lifecycle_state.setdefault(sym,{})
             if cd>0: rec["cooldown_until"]=ts+cd*60
@@ -1842,15 +1507,11 @@ def run():
             log.info(f"[{sym}] CLOSE {reason} triggered={triggered} cooldown={cd}м")
         else:
             entry["open_trade"]=ot
-
-    # ═══ СЛОЙ 3b — состояние watchlist и НОВЫЕ входы ══════════════════════
     for sym,sig in signals.items():
         r=sig["row"]; hist=sig["hist"]; state=sig["state"]; prev_state=sig["prev_state"]
         score=sig["score"]; derived=sig["derived"]; conf=sig["conf"]
         existing=wl_all.get(sym,{})
         has_trade=existing.get("open_trade") is not None
-        # [FIX] запись с открытой сделкой не удаляется никогда — иначе теряется
-        # сама сделка. Раньше это было гарантировано лишь косвенно.
         if state=="NEUTRAL":
             if sym in wl_all and not has_trade:
                 old=existing.get("state","NEUTRAL")
@@ -1870,7 +1531,6 @@ def run():
                 existing["state_signal"]="NEUTRAL"
             continue
         if state=="INVALIDATED":
-            # сделку уже закрыл слой 2 (INVALIDATED — высший приоритет выхода)
             if sym in wl_all and not wl_all[sym].get("open_trade"):
                 send_tg(f"❌ <b>{esc(existing.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
                         f"{esc(existing.get('state','?'))} → INVALIDATED\n"
@@ -1878,7 +1538,6 @@ def run():
                 log.info(f"[{sym}] INVALIDATED → remove")
                 del wl_all[sym]
             continue
-        # ── новый вход ─────────────────────────────────────────────────────
         new_ot=existing.get("open_trade"); new_tid=existing.get("trade_id")
         if new_ot is None and state in ENTRY_STATES and sig["price"]:
             info=lifecycle_state.get(sym,{})
@@ -1894,7 +1553,6 @@ def run():
                                          sig["price"],history_len=sig["history_len"],
                                          window=sig["window"],strength=sig["strength"],
                                          shadow=sig["shadow"])
-                                    
                 if ENABLE_BINGX and new_ot is not None:
                     try:
                         import bingx_client
@@ -1911,11 +1569,9 @@ def run():
                             bx = bingx_client.open_long(sym, cur_price_entry)
                             if bx.get("status") in ("opened", "already_open"):
                                 qty_opened = safe(bx.get("qty"), 0.0)
-                                # >>> PARTIAL BINGX: поля для частичных закрытий <<<
                                 bx["qty_initial"] = qty_opened
                                 bx["qty_remaining"] = qty_opened
                                 bx["partial_legs_done"] = []
-                                # <<< PARTIAL BINGX >>>
                                 log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={qty_opened}")
                             else:
                                 log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
@@ -1926,12 +1582,8 @@ def run():
                             new_ot["bingx"] = {"status": "error", "error": str(e)}
                         except Exception:
                             pass
-                     
                 log.info(f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
                          f"strength={sig['strength']} window={sig['window']['span_min']}м")
-        # [FIX 6.2] idea_first_seen_ts живёт в реестре и НЕ удаляется вместе с
-        # записью watchlist — иначе «возраст идеи» всегда равен возрасту
-        # последнего появления (медиана была 10.1 мин при TTL реестра 30 дней).
         rec=lifecycle_state.setdefault(sym,{})
         rec.setdefault("idea_first_seen_ts",ts)
         entry={
@@ -1974,12 +1626,10 @@ def run():
                     agree="✅" if llm_res.get("agree") is True else "❌"
                     msg+=f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
                 send_tg(msg)
-
-    # ═══ Уборка watchlist: символы, которых давно нет в выборке ═══════════
     for sym in list(wl_all.keys()):
         entry=wl_all[sym]
         if sym in current_symbols: continue
-        if entry.get("open_trade"): continue      # сделку ведёт слой 2
+        if entry.get("open_trade"): continue      
         if entry.get("missed_runs",0)>=MISS_REMOVE_RUNS:
             log.info(f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove")
             del wl_all[sym]
@@ -1998,7 +1648,6 @@ def run():
     cleanup_jsonl(SHADOW_SIGNALS_FILE,SHADOW_SIGNALS_TTL_DAYS)
     open_n=sum(1 for v in wl_all.values() if v.get("open_trade"))
     log.info(f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} · pending: {len(PENDING)} ═══")
-
 if __name__=="__main__":
     try: run()
     except Exception as e:
