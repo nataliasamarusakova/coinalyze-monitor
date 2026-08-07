@@ -1668,7 +1668,7 @@ def run():
                                          window=sig["window"],strength=sig["strength"],
                                          shadow=sig["shadow"])
                                     
-                if ENABLE_BINGX and new_ot is not None:
+                 if ENABLE_BINGX and new_ot is not None:
                     try:
                         import bingx_client
                         bx_symbol = bingx_client.to_bx_symbol(sym)
@@ -1680,17 +1680,18 @@ def run():
                             }
                             log.info(f"[{sym}] BingX SKIP: контракт {bx_symbol} не найден")
                         else:
-                           bx = bingx_client.open_long(sym, cur_price)
-                           if bx.get("status") in ("opened", "already_open"):
-                               qty_opened = safe(bx.get("qty"), 0.0)
-                               # >>> PARTIAL BINGX: поля для частичных закрытий <<<
-                               bx["qty_initial"] = qty_opened
-                               bx["qty_remaining"] = qty_opened
-                               bx["partial_legs_done"] = []
-                               # <<< PARTIAL BINGX >>>
-                               log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={qty_opened}")
+                            cur_price_entry = sig["price"]
+                            bx = bingx_client.open_long(sym, cur_price_entry)
+                            if bx.get("status") in ("opened", "already_open"):
+                                qty_opened = safe(bx.get("qty"), 0.0)
+                                # >>> PARTIAL BINGX: поля для частичных закрытий <<<
+                                bx["qty_initial"] = qty_opened
+                                bx["qty_remaining"] = qty_opened
+                                bx["partial_legs_done"] = []
+                                # <<< PARTIAL BINGX >>>
+                                log.info(f"[{sym}] BingX OPEN {bx.get('status')} orderId={bx.get('order_id')} qty={qty_opened}")
                             else:
-                               log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
+                                log.error(f"[{sym}] BingX OPEN failed: {bx.get('error')}")
                             new_ot["bingx"] = bx
                     except Exception as e:
                         log.error(f"[{sym}] BingX OPEN exception: {e}")
