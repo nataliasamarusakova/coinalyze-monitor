@@ -1668,7 +1668,7 @@ def run():
                                          window=sig["window"],strength=sig["strength"],
                                          shadow=sig["shadow"])
                                     
-                 if ENABLE_BINGX and new_ot is not None:
+                if ENABLE_BINGX and new_ot is not None:
                     try:
                         import bingx_client
                         bx_symbol = bingx_client.to_bx_symbol(sym)
