@@ -895,22 +895,22 @@ def format_signal(symbol,wl,cur,snaps,reasons,warnings,market):
 
     research_parts = []
     if regime is not None:
-        research_parts.append(f"Regime: <b>{esc(regime)}</b>")
+        research_parts.append(f"Regime: {esc(regime)}")
     if liq_share is not None:
-        research_parts.append(f"ShortLiq%: <b>{liq_share:.2%}</b>")
+        research_parts.append(f"ShortLiq%: {liq_share:.2%}")
     if liq_imb is not None:
-        research_parts.append(f"LiqImb: <b>{liq_imb:+.3f}</b>")
+        research_parts.append(f"LiqImb: {liq_imb:+.3f}")
     if fund_press is not None:
-        research_parts.append(f"FR·OI pressure: <b>{fund_press:.5f}</b>")
+        research_parts.append(f"FR·OI pressure: {fund_press:.5f}")
     if liq_int is not None:
-        research_parts.append(f"LiqInt: <b>{liq_int:.5f}</b>")
+        research_parts.append(f"LiqInt: {liq_int:.5f}")
     if fr_z is not None:
-        research_parts.append(f"FR z-score: <b>{fr_z:+.2f}</b>")
+        research_parts.append(f"FR z-score: {fr_z:+.2f}")
 
     if research_parts:
         msg += (
             f"{line}\n"
-            f"📊 <b>Research</b> <i>(не влияет на вход)</i>\n"
+            f"📊 Research\n"
             + " · ".join(research_parts) + "\n"
         )
 
