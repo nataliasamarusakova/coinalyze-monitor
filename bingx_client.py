@@ -180,9 +180,10 @@ def _qty_for(c: dict, price: float, leverage: int):
         qty = float(int(raw))
     return qty, prec, min_qty
 
+
 def _round_qty(qty: float, precision: int) -> float:
-    """Округляет qty вниз до шага точности контракта (floor, не round —
-    нельзя закрыть больше, чем реально можно отправить биржей)."""
+    """Округляет qty вниз до шага точности контракта (floor — нельзя
+    отправить больше, чем позволяет precision биржи)."""
     if qty is None or qty <= 0:
         return 0.0
     if precision > 0:
@@ -192,7 +193,8 @@ def _round_qty(qty: float, precision: int) -> float:
 
 
 def contract_limits(symbol: str) -> dict:
-    """Лимиты контракта для округления/проверки перед отправкой ордера.
+    """Лимиты контракта для округления/проверки перед reduce-only ордером.
+
     Раньше monitor.py использовал захардкоженные PARTIAL_MIN_QTY/
     PARTIAL_MIN_NOTIONAL глобально для всех символов — для дорогих монет
     это слишком грубо, для дешёвых — недостаточно строго."""
@@ -205,6 +207,7 @@ def contract_limits(symbol: str) -> dict:
         "multiplier": float(c.get("multiplier") or 1),
         "found": bool(c),
     }
+
 
 def open_long(symbol: str, price: float) -> dict:
     """Открывает LONG на BINGX_MARGIN_USDT маржи. Возвращает статус-словарь."""
@@ -263,6 +266,7 @@ def close_long(symbol: str, qty: float, client_order_id: str = None) -> dict:
     if not qty or float(qty) <= 0:
         return {"status": "error", "error": "qty <= 0"}
     return _close_position(to_bx_symbol(symbol), float(qty), client_order_id)
+
 
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> dict:
     # Получаем реальную позицию на бирже
