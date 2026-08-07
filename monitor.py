@@ -165,7 +165,7 @@ EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL"
             # или наш ордер исполнился, но ответ не дошёл
             "EXCHANGE_CLOSED":"EXTERNAL"}
 STATE_RANK={"ACCUMULATION":1,"EARLY_MOVE":2,"CONFIRMED_TREND":3,"ACCELERATION":4,"EXHAUSTION":5,"DISTRIBUTION":6}
-EQUITY_SYMBOLS={ "MSFT", "BE", "AXTI", "META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA", "GOOGL","MSTR","COIN","BZ", "DELL","WDC","SAMSUNG","LLY","RKLB","SPY","SQQQ" }
+EQUITY_SYMBOLS={ "MSFT", "CRWV", "BE", "AXTI", "META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA", "GOOGL","MSTR","COIN","BZ", "DELL","WDC","SAMSUNG","LLY","RKLB","SPY","SQQQ" }
 EQUITY_HINTS=("Inc","Corp","Technologies","Platforms")
 COMMODITY_SYMBOLS={"CL"}; COMMODITY_HINTS=("Crude","Oil","Gold","Silver")
 logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s",datefmt="%Y-%m-%d %H:%M:%S")
