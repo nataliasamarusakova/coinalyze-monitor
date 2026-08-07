@@ -233,25 +233,37 @@ def open_long(symbol: str, price: float) -> dict:
     return {"status": "error", "error": err}
 
 
-def close_long(symbol: str, qty: float) -> dict:
+def close_long(symbol: str, qty: float, client_order_id: str = None) -> dict:
     """Закрывает LONG рыночным ордером."""
     if not qty or float(qty) <= 0:
         return {"status": "error", "error": "qty <= 0"}
-    return _close_position(to_bx_symbol(symbol), float(qty))
+    return _close_position(to_bx_symbol(symbol), float(qty), client_order_id)
 
-
-def _close_position(bx_symbol: str, qty: float) -> dict:
+def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> dict:
+    # Получаем реальную позицию на бирже
+    real_amt = _position_amt(bx_symbol)
+    
+    # Защита: не закрываем больше, чем есть
+    if qty > real_amt:
+        if real_amt <= 0:
+            return {"status": "skipped", "error": f"нет LONG позиции для {bx_symbol}"}
+        log.warning(f"[{bx_symbol}] qty={qty} > real_amt={real_amt} — ограничиваем до {real_amt}")
+        qty = real_amt
+    
     # Hedge mode: встречный SELL + positionSide=LONG.
-    # ВАЖНО: reduceOnly здесь запрещён (code=109400).
     params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "LONG",
               "type": "MARKET", "quantity": str(qty)}
+    if client_order_id:
+        params["clientOrderID"] = client_order_id
     resp = _request("POST", ORDER_PATH, params)
 
-    # One-way mode fallback: если биржа не принимает positionSide → BOTH + reduceOnly
+    # One-way mode fallback
     msg = str(resp.get("msg", "")).lower()
     if resp.get("code") != 0 and ("positionside" in msg or "position side" in msg):
         params = {"symbol": bx_symbol, "side": "SELL", "positionSide": "BOTH",
                   "type": "MARKET", "quantity": str(qty), "reduceOnly": "true"}
+        if client_order_id:
+            params["clientOrderID"] = client_order_id
         resp = _request("POST", ORDER_PATH, params)
 
     if resp.get("code") == 0:
