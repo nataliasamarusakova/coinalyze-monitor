@@ -15,7 +15,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # Полный fetch — нужен для корректных rebase/push
+          fetch-depth: 0
+          # Явно разрешаем использовать креденшалы (GITHUB_TOKEN)
+          persist-credentials: true
+          # Явно переключаемся на main
+          ref: main
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -80,6 +86,7 @@ jobs:
             debug_screenshot.png
           retention-days: 3
           if-no-files-found: ignore
+
       - name: Commit snapshot log and state
         if: always()
         env:
@@ -89,6 +96,7 @@ jobs:
           set -e
           git config user.name "actions-user"
           git config user.email "actions@github.com"
+
           alert() {
             local msg="$1"
             echo "::error::$msg"
@@ -103,8 +111,7 @@ jobs:
           rm -f debug_page.html debug_screenshot.png pending_trades.json
           rm -f *.corrupt.*
 
-          # Добавляем ВСЕ изменения (git add -A вместо списка файлов).
-          # .gitignore исключает мусор.
+          # Добавляем ВСЕ изменения
           git add -A
 
           if git diff --cached --quiet; then
@@ -116,22 +123,72 @@ jobs:
             fi
           fi
 
-          # Убеждаемся, что рабочее дерево чистое перед pull --rebase
+          # Убедиться что нет unstaged changes
           if [ -n "$(git status --porcelain)" ]; then
             echo "ВНИМАНИЕ: после коммита остались unstaged changes, добавляем их"
             git add -A
             git commit -m "snapshot-extra $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
           fi
 
+          # Переключаемся на локальную main и настраиваем upstream (если нужно)
+          git checkout -B main
+          git branch --set-upstream-to=origin/main main || true
+
+          # Сначала пробуем корректно сделать реbase и запушить в main.
           n=0
-          until git pull --rebase origin main && git push; do
+          max_try_main=3
+          while true; do
             n=$((n+1))
-            if [ "$n" -ge 3 ]; then
-              alert "git push failed после ${n} попыток — коммит с закрытыми сделками/watchlist остался только на раннере и будет потерян при завершении job"
-              exit 1
+            echo "Attempt ${n}: fetch/rebase + push to main"
+            set +e
+            git fetch origin main
+            rebase_ok=0
+            git rebase origin/main
+            if [ $? -eq 0 ]; then
+              git push origin HEAD:main
+              push_exit=$?
+              if [ $push_exit -eq 0 ]; then
+                echo "Pushed to main successfully"
+                set -e
+                break
+              fi
+            else
+              git rebase --abort 2>/dev/null || true
             fi
-            echo "pull --rebase / push попытка ${n} не удалась, retry через 5s..."
-            git rebase --abort 2>/dev/null || true
-            sleep 5
+            set -e
+
+            if [ "$n" -ge "$max_try_main" ]; then
+              echo "Не удалось запушить в main после ${max_try_main} попыток, перейду к fallback-ветке"
+              # Фоллбек: создаём отдельную ветку и пушим туда
+              FALLBACK_BRANCH="ci/save/runner-commit-$(date -u +%Y%m%dT%H%M%SZ)"
+              git checkout -B "$FALLBACK_BRANCH"
+              if git push -u origin HEAD:"$FALLBACK_BRANCH"; then
+                echo "Патч сохранён в ветке ${FALLBACK_BRANCH}"
+                # Можно оповестить в телеграм
+                alert "Snapshot сохранён в ветке ${FALLBACK_BRANCH}"
+                break
+              else
+                # не удалось запушить даже в fallback — сохраняем патч локально и выйдем с ошибкой,
+                # чтобы последующий шаг загрузил артефакт
+                git format-patch -1 HEAD --stdout > /tmp/runner-commit.patch || git diff --binary > /tmp/runner-changes.diff || true
+                alert "git push failed и push fallback-ветки не удался — патч сохранён локально /tmp/runner-commit.patch"
+                exit 1
+              fi
+            fi
+
+            # экспоненциальный бэкофф перед следующей попыткой
+            sleep $((n * 5))
           done
+
           echo "Commit/push OK"
+
+      - name: Upload runner commit as artifact (fallback)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-commit
+          path: |
+            /tmp/runner-commit.patch
+            /tmp/runner-changes.diff
+          if-no-files-found: ignore
+          retention-days: 7
