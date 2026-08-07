@@ -351,10 +351,6 @@ def _load_page(page, url):
 
     html_text = page.content()
 
-    # Сохраняем HTML для отладки
-    DEBUG_HTML_FILE.write_text(html_text, encoding="utf-8")
-    log.info(f"HTML сохранён в {DEBUG_HTML_FILE.name} ({len(html_text)} символов)")
-
     return html_text
 
 def click_next_page(page, current_page_num):
