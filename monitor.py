@@ -46,7 +46,20 @@ QWEN_MODEL    = os.environ.get("QWEN_MODEL", "qwen-plus")
 MAX_PAGES = 5  # Максимум страниц пагинации (защита от аномалий)
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EXECUTION LAYER — конфигурация.
+# Все ENABLE_* флаги по умолчанию False: поведение системы идентично
+# текущему, пока флаг явно не включён через ENV. Execution Layer не влияет
+# на research-схему: не пишет в trades.jsonl, не создаёт trade_id, не решает
+# состояние lifecycle. Управляет только open_trade["bingx"]/["execution"].
+# ═══════════════════════════════════════════════════════════════════════════
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
+
+# Единый предохранитель: ни один execution-механизм не может уменьшить
+# remaining ниже этой доли от qty_initial. Полное закрытие исследовательской
+# сделки — всегда прерогатива lifecycle через close_trade().
+EXECUTION_MIN_REMAINING_FRACTION = 0.05
+
 ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
 PARTIAL_TP_LEVELS = [
     {"leg": "tp1", "min_pnl_pct": 1.5, "close_fraction": 0.15},
@@ -54,6 +67,25 @@ PARTIAL_TP_LEVELS = [
 ]
 PARTIAL_MIN_QTY = 0.001
 PARTIAL_MIN_NOTIONAL = 5.0
+
+ENABLE_BREAK_EVEN = os.environ.get("ENABLE_BREAK_EVEN", "false").lower() == "true"
+BREAK_EVEN_TRIGGER_PCT = float(os.environ.get("BREAK_EVEN_TRIGGER_PCT", "2.0"))
+BREAK_EVEN_BUFFER_PCT = float(os.environ.get("BREAK_EVEN_BUFFER_PCT", "0.1"))
+BREAK_EVEN_REDUCE_TO_FRACTION = float(os.environ.get("BREAK_EVEN_REDUCE_TO_FRACTION", "0.3"))
+
+ENABLE_TRAILING = os.environ.get("ENABLE_TRAILING", "false").lower() == "true"
+TRAILING_ACTIVATE_PCT = float(os.environ.get("TRAILING_ACTIVATE_PCT", "3.0"))
+TRAILING_DRAWDOWN_PCT = float(os.environ.get("TRAILING_DRAWDOWN_PCT", "1.5"))
+TRAILING_REDUCE_STEP_FRACTION = float(os.environ.get("TRAILING_REDUCE_STEP_FRACTION", "0.2"))
+
+ENABLE_REDUCE_EXPOSURE_TIME = os.environ.get("ENABLE_REDUCE_EXPOSURE_TIME", "false").lower() == "true"
+REDUCE_EXPOSURE_TIME_LEVELS = [
+    {"after_min": 120, "reduce_to_fraction": 0.5},
+    {"after_min": 200, "reduce_to_fraction": 0.25},
+]
+
+ENABLE_POSITION_HEALTH = os.environ.get("ENABLE_POSITION_HEALTH", "false").lower() == "true"
+POSITION_HEALTH_CHECK_MIN = int(os.environ.get("POSITION_HEALTH_CHECK_MIN", "60"))
 
 MARKET_TTL_DAYS=2; SNAPSHOTS_TTL_DAYS=7; HEARTBEAT_TTL_DAYS=3
 LIFECYCLE_WINDOW_MIN=90; MIN_SNAPS_LIFECYCLE=5
@@ -133,7 +165,7 @@ EXIT_CLASS={"EXHAUSTION":"SIGNAL","INVALIDATED":"SIGNAL","DISTRIBUTION":"SIGNAL"
             # или наш ордер исполнился, но ответ не дошёл
             "EXCHANGE_CLOSED":"EXTERNAL"}
 STATE_RANK={"ACCUMULATION":1,"EARLY_MOVE":2,"CONFIRMED_TREND":3,"ACCELERATION":4,"EXHAUSTION":5,"DISTRIBUTION":6}
-EQUITY_SYMBOLS={ "MSFT", "XAG", "BE", "AXTI", "META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA", "GOOGL","MSTR","COIN","BZ", "DELL","WDC","SAMSUNG","LLY","RKLB","SPY","SQQQ" }
+EQUITY_SYMBOLS={ "MSFT", "BE", "AXTI", "META","AMZN","NVDA","CRWV","AXTI","PLTR","AVGO","AAPL","TSLA", "GOOGL","MSTR","COIN","BZ", "DELL","WDC","SAMSUNG","LLY","RKLB","SPY","SQQQ" }
 EQUITY_HINTS=("Inc","Corp","Technologies","Platforms")
 COMMODITY_SYMBOLS={"CL"}; COMMODITY_HINTS=("Crude","Oil","Gold","Silver")
 logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s",datefmt="%Y-%m-%d %H:%M:%S")
@@ -1141,29 +1173,96 @@ def close_trade(ot,symbol,exit_ts,exit_price,exit_reason,exit_state,price_full,e
     log.info(f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} hold={hold_min}m")
     send_tg(format_trade_close(rec))
 
-def maybe_close_partial_take_profit(ot, symbol, cur_price):
-    """
-    Execution-only partial TP через BingX.
-    Не меняет trades.jsonl, EXIT_PRIORITY, strategy_pnl_pct.
-    """
-    if not (ENABLE_BINGX and ENABLE_PARTIAL_BINGX):
-        return False
+# ═══════════════════════════════════════════════════════════════════════════
+# EXECUTION LAYER — реализация.
+#
+# Единственная точка входа для monitor.py — process_execution_policy().
+# Вызывается КАЖДЫЙ прогон для каждой открытой сделки, ТОЛЬКО когда
+# research lifecycle не решил закрыть позицию (close_reason is None,
+# т.е. после resolve_exit_reason() в manage_open_trade()).
+#
+# Контракт:
+#   - читает: ot["entry_price"], ot["entry_ts"], ot["bingx"], cur_price, ts
+#   - пишет:  только ot["bingx"]["qty_remaining"]/["partial_legs_done"]
+#             и ot["execution"][...] (собственное runtime-состояние)
+#   - НИКОГДА не пишет в trades.jsonl, не создаёт trade_id,
+#     не вызывает close_trade(), не трогает exit_reason/strategy_pnl_pct
+#   - НИКОГДА не уменьшает remaining ниже EXECUTION_MIN_REMAINING_FRACTION
+#     от qty_initial — последний остаток закрывает только lifecycle
+# ═══════════════════════════════════════════════════════════════════════════
 
-    if not cur_price:
-        return False
-
+def _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction, tag, note):
+    """Общий примитив уменьшения позиции до target_fraction от qty_initial."""
     bx = ot.get("bingx") or {}
     if bx.get("status") not in ("opened", "already_open"):
         return False
-
     qty_initial = safe(bx.get("qty_initial"), 0.0)
     qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
-
     if qty_initial <= 0 or qty_remaining <= 0:
         return False
 
+    floor_fraction = max(target_fraction, EXECUTION_MIN_REMAINING_FRACTION)
+    qty_to_close = qty_remaining - qty_initial * floor_fraction
+    if qty_to_close <= 0:
+        return False
+
+    try:
+        import bingx_client
+    except Exception as e:
+        log.error(f"[{symbol}] EXEC_REDUCE({tag}): bingx_client недоступен: {e}")
+        return False
+
+    limits = bingx_client.contract_limits(symbol)
+    if not limits.get("found"):
+        return False
+    prec = limits["quantity_precision"]
+    min_qty = max(limits["min_qty"], PARTIAL_MIN_QTY)
+    min_notional = max(limits["min_notional"], PARTIAL_MIN_NOTIONAL)
+
+    qty_to_close = bingx_client._round_qty(qty_to_close, prec)
+    if qty_to_close <= 0 or qty_to_close < min_qty:
+        return False
+    if cur_price and qty_to_close * cur_price < min_notional:
+        return False
+
+    try:
+        real_amt = bingx_client.position_amt(symbol)
+        if real_amt < qty_to_close:
+            log.warning(f"[{symbol}] EXEC_REDUCE({tag}) skipped: real_amt={real_amt:.8f} < qty_to_close={qty_to_close:.8f}")
+            return False
+        res = bingx_client.close_long(symbol, qty_to_close)
+    except Exception as e:
+        log.error(f"[{symbol}] EXEC_REDUCE({tag}) exception: {e}")
+        return False
+
+    if res.get("status") != "closed":
+        log.error(f"[{symbol}] EXEC_REDUCE({tag}) failed: {res.get('error')}")
+        return False
+
+    closed_qty = safe(res.get("qty"), qty_to_close)
+    qty_remaining -= closed_qty
+    bx["qty_remaining"] = qty_remaining
+    ot["bingx"] = bx
+    remaining_pct = qty_remaining / qty_initial * 100 if qty_initial else 0.0
+
+    log.info(f"[{symbol}] EXEC_REDUCE({tag}): closed {closed_qty:.8f} @ {cur_price} remaining={qty_remaining:.8f} ({remaining_pct:.1f}%)")
+    send_tg(f"🛡 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — {esc(note)}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Закрыто: {closed_qty:.8f} @ {fmt_price(cur_price)}\n"
+            f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n")
+    return True
+
+
+def _step_partial_take_profit(ot, symbol, cur_price):
+    """Partial Take Profit: закрывает часть позиции по заранее заданным
+    уровням прибыли PARTIAL_TP_LEVELS. Не пишет в trades.jsonl."""
+    bx = ot.get("bingx") or {}
+    if bx.get("status") not in ("opened", "already_open") or not cur_price:
+        return False
+    qty_initial = safe(bx.get("qty_initial"), 0.0)
+    qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
     entry_price = ot.get("entry_price")
-    if not entry_price:
+    if qty_initial <= 0 or qty_remaining <= 0 or not entry_price:
         return False
 
     try:
@@ -1172,12 +1271,8 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
         log.error(f"[{symbol}] PARTIAL_TP: bingx_client недоступен: {e}")
         return False
 
-    # Лимиты берём с биржи по конкретному контракту, а не из глобальных
-    # PARTIAL_MIN_QTY/PARTIAL_MIN_NOTIONAL — для разных монет точность
-    # и минимальный объём сильно отличаются.
     limits = bingx_client.contract_limits(symbol)
     if not limits.get("found"):
-        log.warning(f"[{symbol}] PARTIAL_TP: контракт не найден, пропуск")
         return False
     prec = limits["quantity_precision"]
     min_qty = max(limits["min_qty"], PARTIAL_MIN_QTY)
@@ -1190,72 +1285,188 @@ def maybe_close_partial_take_profit(ot, symbol, cur_price):
         leg_name = level.get("leg")
         if not leg_name or leg_name in legs_done:
             continue
-
         min_pnl_pct = level.get("min_pnl_pct")
         close_fraction = level.get("close_fraction", 0.0)
-
         if min_pnl_pct is None or close_fraction <= 0 or pnl_pct < min_pnl_pct:
             continue
 
-        qty_to_close = qty_initial * close_fraction
-        qty_to_close = min(qty_to_close, qty_remaining)
+        qty_to_close = min(qty_initial * close_fraction, qty_remaining)
         qty_to_close = bingx_client._round_qty(qty_to_close, prec)
-
         if qty_to_close <= 0 or qty_to_close < min_qty:
             continue
-
         if qty_to_close * cur_price < min_notional:
             continue
 
-        # Проверяем реальную позицию на бирже перед закрытием
         try:
             real_amt = bingx_client.position_amt(symbol)
             if real_amt < qty_to_close:
-                log.warning(
-                    f"[{symbol}] PARTIAL_TP {leg_name} skipped: "
-                    f"real_amt={real_amt:.8f} < qty_to_close={qty_to_close:.8f}"
-                )
+                log.warning(f"[{symbol}] PARTIAL_TP {leg_name} skipped: real_amt={real_amt:.8f} < qty_to_close={qty_to_close:.8f}")
                 continue
-
             res = bingx_client.close_long(symbol, qty_to_close)
-
         except Exception as e:
             log.error(f"[{symbol}] PARTIAL_TP {leg_name} exception: {e}")
             continue
 
         if res.get("status") == "closed":
-            closed_qty = safe(res.get("qty"), qty_to_close)  # биржа могла ещё раз округлить
+            closed_qty = safe(res.get("qty"), qty_to_close)
             qty_remaining -= closed_qty
             legs_done.add(leg_name)
-
             bx["qty_remaining"] = qty_remaining
             bx["partial_legs_done"] = sorted(legs_done)
             ot["bingx"] = bx
-
             remaining_pct = qty_remaining / qty_initial * 100 if qty_initial else 0.0
-
-            log.info(
-                f"[{symbol}] PARTIAL_TP {leg_name}: "
-                f"closed {closed_qty:.8f} @ {cur_price} "
-                f"pnl={pnl_pct:+.2f}% remaining={qty_remaining:.8f}"
-            )
-
-            send_tg(
-                f"💰 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — частичная фиксация\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"Leg: <b>{esc(leg_name)}</b>\n"
-                f"Закрыто: {closed_qty:.8f} @ {fmt_price(cur_price)}\n"
-                f"PnL: <b>{pnl_pct:+.2f}%</b>\n"
-                f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n"
-            )
-
+            log.info(f"[{symbol}] PARTIAL_TP {leg_name}: closed {closed_qty:.8f} @ {cur_price} pnl={pnl_pct:+.2f}% remaining={qty_remaining:.8f}")
+            send_tg(f"💰 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — частичная фиксация\n"
+                    f"━━━━━━━━━━━━━━━━━━\nLeg: <b>{esc(leg_name)}</b>\n"
+                    f"Закрыто: {closed_qty:.8f} @ {fmt_price(cur_price)}\nPnL: <b>{pnl_pct:+.2f}%</b>\n"
+                    f"Осталось: {qty_remaining:.8f} ({remaining_pct:.1f}%)\n")
             return True
         elif res.get("status") == "skipped":
             log.info(f"[{symbol}] PARTIAL_TP {leg_name} skipped by exchange: {res.get('error')}")
         else:
             log.error(f"[{symbol}] PARTIAL_TP {leg_name} failed: {res.get('error')}")
-
     return False
+
+
+def _step_break_even(ot, symbol, cur_price):
+    """Break Even: после BREAK_EVEN_TRIGGER_PCT прибыли — armed. При откате
+    цены к entry+buffer уменьшает позицию (не закрывает полностью)."""
+    entry_price = ot.get("entry_price")
+    if not cur_price or not entry_price:
+        return False
+    ex = ot.setdefault("execution", {})
+    be = ex.setdefault("break_even", {"armed": False, "done": False})
+    if be["done"]:
+        return False
+
+    pnl_pct = (cur_price - entry_price) / entry_price * 100
+    if not be["armed"]:
+        if pnl_pct >= BREAK_EVEN_TRIGGER_PCT:
+            be["armed"] = True
+            log.info(f"[{symbol}] BREAK_EVEN armed at pnl={pnl_pct:+.2f}%")
+        return False
+
+    trigger_price = entry_price * (1 + BREAK_EVEN_BUFFER_PCT / 100)
+    if cur_price > trigger_price:
+        return False
+
+    ok = _execution_reduce_to_fraction(ot, symbol, cur_price, BREAK_EVEN_REDUCE_TO_FRACTION,
+                                        tag="break_even", note="Break Even — защита капитала")
+    if ok:
+        be["done"] = True
+        be["triggered_at_price"] = cur_price
+        be["triggered_pnl_pct"] = round(pnl_pct, 3)
+    return ok
+
+
+def _step_trailing_stop(ot, symbol, cur_price):
+    """Trailing: после активации следим за пиком цены; откат от пика на
+    TRAILING_DRAWDOWN_PCT уменьшает remaining ещё на один шаг."""
+    entry_price = ot.get("entry_price")
+    if not cur_price or not entry_price:
+        return False
+    ex = ot.setdefault("execution", {})
+    tr = ex.setdefault("trailing", {"active": False, "peak_price": None, "steps_done": 0})
+
+    pnl_pct = (cur_price - entry_price) / entry_price * 100
+    if not tr["active"]:
+        if pnl_pct >= TRAILING_ACTIVATE_PCT:
+            tr["active"] = True
+            tr["peak_price"] = cur_price
+            log.info(f"[{symbol}] TRAILING activated at pnl={pnl_pct:+.2f}%")
+        return False
+
+    if cur_price > (tr["peak_price"] or cur_price):
+        tr["peak_price"] = cur_price
+        return False
+
+    peak = tr["peak_price"]
+    drawdown_pct = (peak - cur_price) / peak * 100 if peak else 0.0
+    if drawdown_pct < TRAILING_DRAWDOWN_PCT:
+        return False
+
+    bx = ot.get("bingx") or {}
+    qty_initial = safe(bx.get("qty_initial"), 0.0)
+    qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
+    current_fraction = (qty_remaining / qty_initial) if qty_initial else 0.0
+    target_fraction = max(current_fraction - TRAILING_REDUCE_STEP_FRACTION, EXECUTION_MIN_REMAINING_FRACTION)
+    if target_fraction >= current_fraction:
+        return False
+
+    ok = _execution_reduce_to_fraction(ot, symbol, cur_price, target_fraction,
+                                        tag=f"trailing_step_{tr['steps_done']+1}",
+                                        note=f"Trailing Stop — откат {drawdown_pct:.1f}% от пика")
+    if ok:
+        tr["steps_done"] += 1
+        tr["peak_price"] = cur_price
+    return ok
+
+
+def _step_reduce_exposure_time(ot, symbol, cur_price, ts):
+    """Reduce Exposure: чем дольше сделка открыта, тем меньше реальная
+    экспозиция на бирже — риск-менеджмент времени удержания."""
+    if not cur_price:
+        return False
+    age_min = (ts - ot["entry_ts"]) / 60
+    ex = ot.setdefault("execution", {})
+    re_state = ex.setdefault("reduce_exposure_time", {"levels_done": []})
+    levels_done = set(re_state["levels_done"])
+
+    triggered = False
+    for level in REDUCE_EXPOSURE_TIME_LEVELS:
+        key = f"after_{level['after_min']}m"
+        if key in levels_done or age_min < level["after_min"]:
+            continue
+        ok = _execution_reduce_to_fraction(ot, symbol, cur_price, level["reduce_to_fraction"],
+                                            tag=key, note=f"Reduce Exposure — {level['after_min']} мин в сделке")
+        if ok:
+            levels_done.add(key)
+            re_state["levels_done"] = sorted(levels_done)
+            triggered = True
+    return triggered
+
+
+def _step_position_health(ot, symbol, cur_price, ts):
+    """Position Health: чисто информационный health-check, никаких ордеров."""
+    ex = ot.setdefault("execution", {})
+    health = ex.setdefault("health", {"last_report_ts": 0})
+    if ts - health["last_report_ts"] < POSITION_HEALTH_CHECK_MIN * 60:
+        return
+    health["last_report_ts"] = ts
+
+    entry_price = ot.get("entry_price")
+    pnl_pct = ((cur_price - entry_price) / entry_price * 100) if (cur_price and entry_price) else None
+    age_min = round((ts - ot["entry_ts"]) / 60, 1)
+    max_pnl = ot.get("max_pnl_pct")
+    bx = ot.get("bingx") or {}
+    qty_initial = safe(bx.get("qty_initial"), 0.0)
+    qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
+    remaining_pct = (qty_remaining / qty_initial * 100) if qty_initial else None
+    legs = bx.get("partial_legs_done", [])
+
+    log.info(f"[{symbol}] POSITION_HEALTH age={age_min}m pnl={pnl_pct} peak={max_pnl} remaining={remaining_pct}")
+    send_tg(f"📊 <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b> — health-check\n"
+            f"━━━━━━━━━━━━━━━━━━\nВ сделке: {age_min} мин\n"
+            f"PnL сейчас: {fmt_pct(pnl_pct)} · пик {fmt_pct(max_pnl)}\n"
+            f"Остаток позиции: {fmt_num(remaining_pct,'%',0)}\n"
+            f"Legs: {esc(', '.join(legs) if legs else '—')}\n")
+
+
+def process_execution_policy(ot, symbol, cur_price, ts):
+    """Единственная точка входа Execution Layer, вызываемая из monitor.py.
+    См. заголовок блока выше — контракт и гарантии."""
+    if not (ENABLE_BINGX and cur_price):
+        return
+    if ENABLE_PARTIAL_BINGX:
+        _step_partial_take_profit(ot, symbol, cur_price)
+    if ENABLE_BREAK_EVEN:
+        _step_break_even(ot, symbol, cur_price)
+    if ENABLE_TRAILING:
+        _step_trailing_stop(ot, symbol, cur_price)
+    if ENABLE_REDUCE_EXPOSURE_TIME:
+        _step_reduce_exposure_time(ot, symbol, cur_price, ts)
+    if ENABLE_POSITION_HEALTH:
+        _step_position_health(ot, symbol, cur_price, ts)
 
 def flush_pending(price_full,now,existing_trade_ids):
     global PENDING
@@ -1497,9 +1708,9 @@ def manage_open_trade(sym,ot,ts,cur_price,signal,price_full,missed_runs=0):
     }
     close_reason,all_triggered=resolve_exit_reason(cand)
     if not close_reason:
-        # >>> PARTIAL BINGX: частичная фиксация только если нет close_reason <<<
-        maybe_close_partial_take_profit(ot, sym, cur_price)
-        # <<< PARTIAL BINGX >>>
+        # >>> EXECUTION LAYER: единственная точка вызова, см. process_execution_policy() <<<
+        process_execution_policy(ot, sym, cur_price, ts)
+        # <<< EXECUTION LAYER >>>
         return None,[],None,None
     exit_price=cur_price or ot.get("last_price")
     src="live" if cur_price else "last_seen"
