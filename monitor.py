@@ -409,8 +409,12 @@ def load_watchlist():
         msg=f"⚠️ <b>Monitor CRITICAL</b>\nwatchlist.json повреждён: {e}\nПрогон остановлен."
         log.error(msg.replace("<b>","").replace("</b>","")); send_tg(msg); sys.exit(1)
     for sym,rec in data.items():
-        if rec.get("trade_id") and not rec.get("open_trade"): log.error(f"CORRUPTION: {sym} trade_id без open_trade")
-        if rec.get("open_trade") and not rec.get("trade_id"): log.error(f"CORRUPTION: {sym} open_trade без trade_id")
+    if rec.get("trade_id") and not rec.get("open_trade"):
+        log.error(f"CORRUPTION: {sym} trade_id без open_trade — очищаю trade_id")
+        rec.pop("trade_id", None)
+    if rec.get("open_trade") and not rec.get("trade_id"):
+        log.error(f"CORRUPTION: {sym} open_trade без trade_id — восстанавливаю из open_trade")
+        rec["trade_id"] = rec["open_trade"].get("trade_id_full") or _new_trade_id(sym, rec["open_trade"].get("entry_ts", now_ts()))
     return data
 
 def save_watchlist(wl):
