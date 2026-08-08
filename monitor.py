@@ -1720,8 +1720,7 @@ def reconcile_exchange(wl_all,ts,price_full,existing_trade_ids,lifecycle_state):
         ot=entry.get("open_trade")
         if not ot: continue
         bx=ot.get("bingx") or {}
-        journal[sym]={"qty":bx.get("qty"),"bx_symbol":bingx_client.to_bx_symbol(sym),
-                      "status":bx.get("status"),"trade_id":entry.get("trade_id")}
+        journal[sym]={"qty":bx.get("qty_remaining",bx.get("qty")),"bx_symbol":bingx_client.to_bx_symbol(sym),"status":bx.get("status"),"trade_id":entry.get("trade_id")}
     ours={v["bx_symbol"]:sym for sym,v in journal.items()}
     orphans=[]; missing=[]; mismatch=[]
     for bx_sym,amt in exch.items():
