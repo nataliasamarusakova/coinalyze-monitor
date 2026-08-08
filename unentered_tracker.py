@@ -1,9 +1,9 @@
-```python
 """unentered_tracker.py — детектор упущенных движений."""
 import json, time
 from bisect import bisect_left
 from pathlib import Path
 from typing import Optional
+
 from conditions import (
     check_confirmed_path_a,
     check_confirmed_path_b,
@@ -18,6 +18,7 @@ try:
 except Exception:
     SIGNAL_LOGIC_VERSION = 1
     TRADE_WIN_PCT = 1.0
+
     def classify_asset_class(r):
         return "crypto"
 
@@ -53,6 +54,7 @@ def load_jsonl(path):
             out.append(json.loads(ln))
         except json.JSONDecodeError:
             continue
+
     return out
 
 
@@ -74,6 +76,7 @@ def cleanup_jsonl(path, ttl_days, ts_field="detect_ts"):
         with open(path, "w", encoding="utf-8") as f:
             for r in fresh:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
         print(f"cleanup {path.name}: -{removed}")
 
 
@@ -85,6 +88,7 @@ def load_market_history_snaps():
         sym = r.get("symbol")
         if not sym:
             continue
+
         grouped.setdefault(sym, []).append(r)
 
     for sym in grouped:
@@ -101,9 +105,11 @@ def get_active_symbols():
     if WATCHLIST.exists():
         try:
             wl = json.loads(WATCHLIST.read_text(encoding="utf-8"))
+
             for sym, rec in wl.items():
                 if rec.get("open_trade"):
                     active.add(sym)
+
         except json.JSONDecodeError:
             pass
 
@@ -121,6 +127,7 @@ def compute_forward_returns(snaps, detect_ts, entry_price):
         for h in FORWARD_HORIZONS:
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
+
         return result
 
     try:
@@ -130,48 +137,66 @@ def compute_forward_returns(snaps, detect_ts, entry_price):
         for h in FORWARD_HORIZONS:
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
+
         return result
 
-    # Та же семантика, что и в monitor.py:
-    # берём первый snapshot с ts >= target_ts.
-    # Допустимая задержка после target — максимум 15 минут.
+    # Forward horizon:
+    # берём первый snapshot НЕ РАНЬШЕ target_ts.
+    #
+    # Допустимое запаздывание:
+    # target_ts <= found_ts <= target_ts + 15 минут.
     max_lag_sec = 15 * 60
 
-    ts_list = [s.get("ts", 0) for s in snaps]
+    # load_market_history_snaps() уже сортирует snapshots по ts.
+    ts_list = []
+
+    for s in snaps:
+        ts = s.get("ts")
+
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            ts = 0
+
+        ts_list.append(ts)
 
     for h in FORWARD_HORIZONS:
         target_ts = detect_ts + h * 60
 
-        i = bisect_left(ts_list, target_ts)
+        # Первый snapshot с ts >= target_ts.
+        idx = bisect_left(ts_list, target_ts)
 
-        if i >= len(snaps):
+        if idx >= len(snaps):
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
             continue
 
-        found_ts = ts_list[i]
+        found_ts = ts_list[idx]
 
+        # Если первый доступный snapshot появился
+        # более чем через 15 минут после target,
+        # горизонт считается недоступным.
         if found_ts - target_ts > max_lag_sec:
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
             continue
 
-        best_price = snaps[i].get("price")
+        found_price = snaps[idx].get("price")
 
-        if best_price is None:
+        if found_price is None:
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
             continue
 
         try:
-            best_price = float(best_price)
+            found_price = float(found_price)
         except (TypeError, ValueError):
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
             continue
 
         result[f"forward_{h}m"] = round(
-            (best_price - entry_price) / entry_price * 100,
+            (found_price - entry_price) / entry_price * 100,
             3,
         )
         result[f"forward_{h}m_available"] = True
@@ -184,12 +209,21 @@ def classify_quality(forward_returns, movement_snaps):
     f120 = forward_returns.get("forward_120m")
 
     if f60 is None and f120 is None:
-        return {"label": "undetermined", "reason": "нет форвардных данных"}
+        return {
+            "label": "undetermined",
+            "reason": "нет форвардных данных",
+        }
 
-    best_forward = max([v for v in [f60, f120] if v is not None], default=None)
+    best_forward = max(
+        [v for v in [f60, f120] if v is not None],
+        default=None,
+    )
 
     if best_forward is None:
-        return {"label": "undetermined", "reason": "нет форвардных данных"}
+        return {
+            "label": "undetermined",
+            "reason": "нет форвардных данных",
+        }
 
     if len(movement_snaps) >= 3:
         oi_start = safe(movement_snaps[0].get("oi_chg24_pct"))
@@ -205,27 +239,52 @@ def classify_quality(forward_returns, movement_snaps):
 
     # [FIX] TRADE_WIN_PCT вместо хардкода 2.0
     if best_forward >= TRADE_WIN_PCT and oi_rising and cvd_rising:
-        return {"label": "good", "reason": "форвардный рост + OI↑ + CVD↑"}
+        return {
+            "label": "good",
+            "reason": "форвардный рост + OI↑ + CVD↑",
+        }
 
     elif best_forward >= TRADE_WIN_PCT:
-        return {"label": "good", "reason": "форвардный рост (OI/CVD не подтверждены)"}
+        return {
+            "label": "good",
+            "reason": "форвардный рост (OI/CVD не подтверждены)",
+        }
 
     elif best_forward < 0:
-        return {"label": "noise", "reason": "форвардный исход отрицательный"}
+        return {
+            "label": "noise",
+            "reason": "форвардный исход отрицательный",
+        }
 
-    elif f60 is not None and f60 > 0 and f120 is not None and f120 < f60 - 2:
-        return {"label": "late", "reason": "рост затухает (f120 < f60)"}
+    elif (
+        f60 is not None
+        and f60 > 0
+        and f120 is not None
+        and f120 < f60 - 2
+    ):
+        return {
+            "label": "late",
+            "reason": "рост затухает (f120 < f60)",
+        }
 
     else:
-        return {"label": "undetermined", "reason": "смешанные сигналы"}
+        return {
+            "label": "undetermined",
+            "reason": "смешанные сигналы",
+        }
 
 
 def determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_momentum):
     confidence = (
-        "observed" if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE") else "estimated"
+        "observed"
+        if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE")
+        else "estimated"
     )
 
-    cm = closest_miss_for_confirmed(movement_snaps, cvd_momentum)
+    cm = closest_miss_for_confirmed(
+        movement_snaps,
+        cvd_momentum,
+    )
 
     if lifecycle_state in ("ACCUMULATION", "EARLY_MOVE"):
         stage = lifecycle_state
@@ -280,10 +339,16 @@ def determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_momentum):
 
 def compute_cvd_momentum(snaps):
     if len(snaps) >= 4:
-        return safe(snaps[-1].get("cvd24")) - safe(snaps[-4].get("cvd24"))
+        return (
+            safe(snaps[-1].get("cvd24"))
+            - safe(snaps[-4].get("cvd24"))
+        )
 
     elif len(snaps) >= 2:
-        return safe(snaps[-1].get("cvd24")) - safe(snaps[0].get("cvd24"))
+        return (
+            safe(snaps[-1].get("cvd24"))
+            - safe(snaps[0].get("cvd24"))
+        )
 
     return 0.0
 
@@ -298,7 +363,10 @@ def run():
     existing_candidates = load_jsonl(CANDIDATES_FILE)
 
     # Берём ВСЕХ кандидатов, не только за 24ч.
-    existing_candidate_syms = {c.get("symbol") for c in existing_candidates}
+    existing_candidate_syms = {
+        c.get("symbol")
+        for c in existing_candidates
+    }
 
     new_candidates = 0
 
@@ -321,12 +389,13 @@ def run():
         last = snaps[-1]
 
         chg = last.get("price_chg24")
+
         if chg is None or chg <= MISSED_THRESHOLD_PCT:
             continue
 
         lifecycle_state = last.get("lifecycle_state")
 
-        # ВАЖНО:
+        # FIX:
         # detect_ts и price_at_detect должны относиться
         # к одному и тому же market snapshot.
         detect_ts = last.get("ts")
@@ -392,13 +461,24 @@ def run():
             )
 
             movement_snaps = [
-                s for s in snaps if s.get("ts", 0) >= detect_ts - 4 * 3600
+                s
+                for s in snaps
+                if s.get("ts", 0) >= detect_ts - 4 * 3600
             ]
 
-            quality = classify_quality(forward_returns, movement_snaps)
+            quality = classify_quality(
+                forward_returns,
+                movement_snaps,
+            )
 
-            cvd_mom = cand.get("cvd_momentum_at_detect", 0)
-            lifecycle_state = cand.get("lifecycle_state_at_detect")
+            cvd_mom = cand.get(
+                "cvd_momentum_at_detect",
+                0,
+            )
+
+            lifecycle_state = cand.get(
+                "lifecycle_state_at_detect"
+            )
 
             fail_point = determine_fail_point(
                 sym,
@@ -408,7 +488,10 @@ def run():
             )
 
             asset_class = classify_asset_class(
-                {"symbol": sym, "name": cand.get("name", "")}
+                {
+                    "symbol": sym,
+                    "name": cand.get("name", ""),
+                }
             )
 
             analysis_rec = {
@@ -416,7 +499,9 @@ def run():
                 "finalize_ts": now,
                 "symbol": sym,
                 "name": cand.get("name", sym),
-                "price_chg24_at_detect": cand.get("price_chg24_at_detect"),
+                "price_chg24_at_detect": cand.get(
+                    "price_chg24_at_detect"
+                ),
                 "price_at_detect": entry_price,
                 "lifecycle_state_at_detect": lifecycle_state,
                 "cvd_momentum_at_detect": cvd_mom,
@@ -431,12 +516,17 @@ def run():
                 "fail_point": fail_point,
             }
 
-            append_jsonl(ANALYSIS_FILE, analysis_rec)
+            append_jsonl(
+                ANALYSIS_FILE,
+                analysis_rec,
+            )
 
             finalized += 1
 
         except Exception as e:
-            print(f"ERROR: финализация {sym} упала: {e}")
+            print(
+                f"ERROR: финализация {sym} упала: {e}"
+            )
             remaining.append(cand)
 
     # FIX:
@@ -446,11 +536,24 @@ def run():
     # 3. кандидаты, финализация которых завершилась ошибкой.
     with open(CANDIDATES_FILE, "w", encoding="utf-8") as f:
         for cand in remaining:
-            f.write(json.dumps(cand, ensure_ascii=False) + "\n")
+            f.write(
+                json.dumps(
+                    cand,
+                    ensure_ascii=False,
+                ) + "\n"
+            )
 
-    cleanup_jsonl(CANDIDATES_FILE, CANDIDATES_TTL_DAYS, "detect_ts")
+    cleanup_jsonl(
+        CANDIDATES_FILE,
+        CANDIDATES_TTL_DAYS,
+        "detect_ts",
+    )
 
-    cleanup_jsonl(ANALYSIS_FILE, ANALYSIS_TTL_DAYS, "detect_ts")
+    cleanup_jsonl(
+        ANALYSIS_FILE,
+        ANALYSIS_TTL_DAYS,
+        "detect_ts",
+    )
 
     pending_count = len(
         [
@@ -471,4 +574,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-```
