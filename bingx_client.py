@@ -212,8 +212,12 @@ def contract_limits(symbol: str) -> dict:
     }
 
 
-def open_long(symbol: str, price: float) -> dict:
-    """Открывает LONG на BINGX_MARGIN_USDT маржи. Возвращает статус-словарь."""
+def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
+    """Открывает LONG на BINGX_MARGIN_USDT маржи. Возвращает статус-словарь.
+
+    trade_id (опционально) — id локальной сделки из monitor.py, пишется в
+    bingx_orders.jsonl для последующей корреляции ордера со сделкой.
+    """
     bx_symbol = to_bx_symbol(symbol)
 
     amt = _position_amt(bx_symbol)
@@ -255,22 +259,28 @@ def open_long(symbol: str, price: float) -> dict:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
         _log_event({"event": "open", "symbol": symbol, "bx_symbol": bx_symbol, "order_id": oid,
-                    "qty": qty, "price": price, "leverage": leverage, "margin_usdt": MARGIN_USDT})
+                    "qty": qty, "price": price, "leverage": leverage, "margin_usdt": MARGIN_USDT,
+                    "trade_id": trade_id})
         return {"status": "opened", "order_id": oid, "qty": qty, "symbol": bx_symbol,
                 "leverage": leverage, "margin_usdt": MARGIN_USDT}
 
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
-    _log_event({"event": "open_failed", "symbol": symbol, "bx_symbol": bx_symbol, "error": err})
+    _log_event({"event": "open_failed", "symbol": symbol, "bx_symbol": bx_symbol, "error": err,
+                "trade_id": trade_id})
     return {"status": "error", "error": err}
 
 
-def close_long(symbol: str, qty: float, client_order_id: str = None) -> dict:
-    """Закрывает LONG рыночным ордером."""
+def close_long(symbol: str, qty: float, client_order_id: str = None, trade_id: str = None) -> dict:
+    """Закрывает LONG рыночным ордером.
+
+    trade_id (опционально) — id локальной сделки из monitor.py, пишется в
+    bingx_orders.jsonl для последующей корреляции ордера со сделкой.
+    """
     if not qty or float(qty) <= 0:
         return {"status": "error", "error": "qty <= 0"}
-    return _close_position(to_bx_symbol(symbol), float(qty), client_order_id)
+    return _close_position(to_bx_symbol(symbol), float(qty), client_order_id, trade_id)
 
-def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> dict:
+def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, trade_id: str = None) -> dict:
     real_amt = _position_amt(bx_symbol)
     if qty > real_amt:
         if real_amt <= 0:
@@ -314,9 +324,11 @@ def _close_position(bx_symbol: str, qty: float, client_order_id: str = None) -> 
     if resp.get("code") == 0:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
-        _log_event({"event": "close", "bx_symbol": bx_symbol, "order_id": oid, "qty": qty})
+        _log_event({"event": "close", "bx_symbol": bx_symbol, "order_id": oid, "qty": qty,
+                    "trade_id": trade_id})
         return {"status": "closed", "order_id": oid, "qty": qty, "symbol": bx_symbol}
 
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
-    _log_event({"event": "close_failed", "bx_symbol": bx_symbol, "qty": qty, "error": err})
+    _log_event({"event": "close_failed", "bx_symbol": bx_symbol, "qty": qty, "error": err,
+                "trade_id": trade_id})
     return {"status": "error", "error": err}
