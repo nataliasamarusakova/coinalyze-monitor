@@ -1,5 +1,7 @@
+```python
 """unentered_tracker.py — детектор упущенных движений."""
 import json, time
+from bisect import bisect_left
 from pathlib import Path
 from typing import Optional
 from conditions import (
@@ -16,7 +18,6 @@ try:
 except Exception:
     SIGNAL_LOGIC_VERSION = 1
     TRADE_WIN_PCT = 1.0
-
     def classify_asset_class(r):
         return "crypto"
 
@@ -116,27 +117,64 @@ def get_active_symbols():
 def compute_forward_returns(snaps, detect_ts, entry_price):
     result = {}
 
-    for h in FORWARD_HORIZONS:
-        target_ts = detect_ts + h * 60
-        best_price = None
-        best_lag = float("inf")
-
-        for s in snaps:
-            ts = s.get("ts", 0)
-            lag = abs(ts - target_ts)
-
-            if lag < best_lag:
-                best_lag = lag
-                best_price = s.get("price")
-
-        if best_price is not None and best_lag <= 15 * 60 and entry_price:
-            result[f"forward_{h}m"] = round(
-                (best_price - entry_price) / entry_price * 100, 3
-            )
-            result[f"forward_{h}m_available"] = True
-        else:
+    if detect_ts is None or entry_price in (None, 0):
+        for h in FORWARD_HORIZONS:
             result[f"forward_{h}m"] = None
             result[f"forward_{h}m_available"] = False
+        return result
+
+    try:
+        detect_ts = int(detect_ts)
+        entry_price = float(entry_price)
+    except (TypeError, ValueError):
+        for h in FORWARD_HORIZONS:
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+        return result
+
+    # Та же семантика, что и в monitor.py:
+    # берём первый snapshot с ts >= target_ts.
+    # Допустимая задержка после target — максимум 15 минут.
+    max_lag_sec = 15 * 60
+
+    ts_list = [s.get("ts", 0) for s in snaps]
+
+    for h in FORWARD_HORIZONS:
+        target_ts = detect_ts + h * 60
+
+        i = bisect_left(ts_list, target_ts)
+
+        if i >= len(snaps):
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+            continue
+
+        found_ts = ts_list[i]
+
+        if found_ts - target_ts > max_lag_sec:
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+            continue
+
+        best_price = snaps[i].get("price")
+
+        if best_price is None:
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+            continue
+
+        try:
+            best_price = float(best_price)
+        except (TypeError, ValueError):
+            result[f"forward_{h}m"] = None
+            result[f"forward_{h}m_available"] = False
+            continue
+
+        result[f"forward_{h}m"] = round(
+            (best_price - entry_price) / entry_price * 100,
+            3,
+        )
+        result[f"forward_{h}m_available"] = True
 
     return result
 
@@ -219,10 +257,13 @@ def determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_momentum):
 
     if result_a.get("passed") or result_a.get("insufficient_data"):
         stage_note = "estimated: условия CONFIRMED выполнены или мало данных"
+
     elif result_em.get("passed"):
         stage_note = "estimated: прошла EARLY_MOVE, не дошла до CONFIRMED"
+
     elif result_acc.get("passed"):
         stage_note = "estimated: прошла ACCUMULATION, не дошла до EARLY_MOVE"
+
     else:
         stage_note = "estimated: не прошла даже ACCUMULATION"
 
@@ -278,17 +319,26 @@ def run():
             continue
 
         last = snaps[-1]
-        chg = last.get("price_chg24")
 
+        chg = last.get("price_chg24")
         if chg is None or chg <= MISSED_THRESHOLD_PCT:
             continue
 
         lifecycle_state = last.get("lifecycle_state")
+
+        # ВАЖНО:
+        # detect_ts и price_at_detect должны относиться
+        # к одному и тому же market snapshot.
+        detect_ts = last.get("ts")
         entry_price = last.get("price")
+
+        if detect_ts is None or entry_price is None:
+            continue
+
         cvd_mom = compute_cvd_momentum(snaps)
 
         candidate = {
-            "detect_ts": now,
+            "detect_ts": detect_ts,
             "symbol": sym,
             "name": last.get("name", sym),
             "price_chg24_at_detect": chg,
@@ -335,7 +385,11 @@ def run():
             snaps = market_snaps.get(sym, [])
             entry_price = cand.get("price_at_detect")
 
-            forward_returns = compute_forward_returns(snaps, detect_ts, entry_price)
+            forward_returns = compute_forward_returns(
+                snaps,
+                detect_ts,
+                entry_price,
+            )
 
             movement_snaps = [
                 s for s in snaps if s.get("ts", 0) >= detect_ts - 4 * 3600
@@ -344,11 +398,13 @@ def run():
             quality = classify_quality(forward_returns, movement_snaps)
 
             cvd_mom = cand.get("cvd_momentum_at_detect", 0)
-
             lifecycle_state = cand.get("lifecycle_state_at_detect")
 
             fail_point = determine_fail_point(
-                sym, movement_snaps, lifecycle_state, cvd_mom
+                sym,
+                movement_snaps,
+                lifecycle_state,
+                cvd_mom,
             )
 
             asset_class = classify_asset_class(
@@ -365,7 +421,8 @@ def run():
                 "lifecycle_state_at_detect": lifecycle_state,
                 "cvd_momentum_at_detect": cvd_mom,
                 "signal_logic_version": cand.get(
-                    "signal_logic_version", SIGNAL_LOGIC_VERSION
+                    "signal_logic_version",
+                    SIGNAL_LOGIC_VERSION,
                 ),
                 "movement_snaps_count": len(movement_snaps),
                 "asset_class": asset_class,
@@ -396,7 +453,11 @@ def run():
     cleanup_jsonl(ANALYSIS_FILE, ANALYSIS_TTL_DAYS, "detect_ts")
 
     pending_count = len(
-        [c for c in load_jsonl(CANDIDATES_FILE) if c.get("status") != "finalized"]
+        [
+            c
+            for c in load_jsonl(CANDIDATES_FILE)
+            if c.get("status") != "finalized"
+        ]
     )
 
     print(
@@ -410,3 +471,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+```
