@@ -12,6 +12,7 @@ bingx_client.py — BingX USDT-M Perpetual Swap, демо-счёт (VST).
   BINGX_SYMBOL_MAP    опциональный JSON-маппинг тикеров, напр. {"PEPEUSDT":"1000PEPE-USDT"}
 """
 import os, json, time, hmac, hashlib, math, logging
+from decimal import Decimal,ROUND_DOWN
 from urllib.parse import urlencode
 import requests
 
@@ -181,15 +182,17 @@ def _qty_for(c: dict, price: float, leverage: int):
     return qty, prec, min_qty
 
 
-def _round_qty(qty: float, precision: int) -> float:
-    """Округляет qty вниз до шага точности контракта (floor — нельзя
-    отправить больше, чем позволяет precision биржи)."""
-    if qty is None or qty <= 0:
+def _round_qty(qty:float,precision:int)->float:
+    if qty is None or qty<=0:
         return 0.0
-    if precision > 0:
-        step = 10 ** -precision
-        return round(math.floor(qty / step) * step, precision)
-    return float(int(qty))
+    try:
+        q=Decimal(str(qty))
+        if precision<=0:
+            return float(q.quantize(Decimal("1"),rounding=ROUND_DOWN))
+        step=Decimal("1").scaleb(-precision)
+        return float(q.quantize(step,rounding=ROUND_DOWN))
+    except (TypeError,ValueError,ArithmeticError):
+        return 0.0
 
 
 def contract_limits(symbol: str) -> dict:
