@@ -59,13 +59,15 @@ QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
 MAX_PAGES = 5
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
+
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
 EXECUTION_MIN_REMAINING_FRACTION = 0.05
-ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
+ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "true").lower() == "true"
 PARTIAL_TP_LEVELS = [
     {"leg": "tp1", "min_pnl_pct": 3.0, "close_fraction": 0.15},
     {"leg": "tp2", "min_pnl_pct": 5.0, "close_fraction": 0.25},
 ]
+
 PARTIAL_MIN_QTY = 0.001
 PARTIAL_MIN_NOTIONAL = 5.0
 ENABLE_BREAK_EVEN = os.environ.get("ENABLE_BREAK_EVEN", "false").lower() == "true"
