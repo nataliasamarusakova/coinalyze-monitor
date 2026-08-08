@@ -365,13 +365,15 @@ def append_jsonl(path,rec):
 
 def load_jsonl(path):
     if not path.exists(): return []
-    out=[]
+    out=[]; bad=0
     with open(path,"r",encoding="utf-8") as f:
         for line in f:
             line=line.strip()
             if line:
                 try: out.append(json.loads(line))
-                except json.JSONDecodeError: continue
+                except json.JSONDecodeError: bad+=1
+    if bad:
+        log.warning(f"{path.name}: {bad} битых строк пропущено при загрузке")
     return out
 
 def cleanup_jsonl(path,ttl_days):
