@@ -1909,7 +1909,9 @@ def run():
     for _sym, _entry in wl_all.items():
     _ot = _entry.get("open_trade")
     if _ot and _sym not in lifecycle_state:
-        lifecycle_state[_sym] = {"idea_first_seen_ts": _ot.get("idea_first_seen_ts") or now_ts()}
+        lifecycle_state[_sym] = {
+            "idea_first_seen_ts": _ot.get("idea_first_seen_ts") or now_ts()
+        }
 
     global DISCOVERY
     DISCOVERY=discovery_fingerprint()
