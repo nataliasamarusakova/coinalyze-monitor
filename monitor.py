@@ -55,9 +55,7 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = os.environ.get(
-    "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-)
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
 MAX_PAGES = 5
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
@@ -65,37 +63,27 @@ ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
 EXECUTION_MIN_REMAINING_FRACTION = 0.05
 ENABLE_PARTIAL_BINGX = os.environ.get("ENABLE_PARTIAL_BINGX", "false").lower() == "true"
 PARTIAL_TP_LEVELS = [
-    {"leg": "tp1", "min_pnl_pct": 1.5, "close_fraction": 0.15},
-    {"leg": "tp2", "min_pnl_pct": 3.0, "close_fraction": 0.25},
+    {"leg": "tp1", "min_pnl_pct": 3.0, "close_fraction": 0.15},
+    {"leg": "tp2", "min_pnl_pct": 5.0, "close_fraction": 0.25},
 ]
 PARTIAL_MIN_QTY = 0.001
 PARTIAL_MIN_NOTIONAL = 5.0
 ENABLE_BREAK_EVEN = os.environ.get("ENABLE_BREAK_EVEN", "false").lower() == "true"
 BREAK_EVEN_TRIGGER_PCT = float(os.environ.get("BREAK_EVEN_TRIGGER_PCT", "2.0"))
 BREAK_EVEN_BUFFER_PCT = float(os.environ.get("BREAK_EVEN_BUFFER_PCT", "0.1"))
-BREAK_EVEN_REDUCE_TO_FRACTION = float(
-    os.environ.get("BREAK_EVEN_REDUCE_TO_FRACTION", "0.3")
-)
+BREAK_EVEN_REDUCE_TO_FRACTION = float(os.environ.get("BREAK_EVEN_REDUCE_TO_FRACTION", "0.3"))
 ENABLE_TRAILING = os.environ.get("ENABLE_TRAILING", "false").lower() == "true"
 TRAILING_ACTIVATE_PCT = float(os.environ.get("TRAILING_ACTIVATE_PCT", "3.0"))
 TRAILING_DRAWDOWN_PCT = float(os.environ.get("TRAILING_DRAWDOWN_PCT", "1.5"))
-TRAILING_REDUCE_STEP_FRACTION = float(
-    os.environ.get("TRAILING_REDUCE_STEP_FRACTION", "0.2")
-)
-ENABLE_REDUCE_EXPOSURE_TIME = (
-    os.environ.get("ENABLE_REDUCE_EXPOSURE_TIME", "false").lower() == "true"
-)
+TRAILING_REDUCE_STEP_FRACTION = float(os.environ.get("TRAILING_REDUCE_STEP_FRACTION", "0.2"))
+ENABLE_REDUCE_EXPOSURE_TIME = (os.environ.get("ENABLE_REDUCE_EXPOSURE_TIME", "false").lower() == "true")
 REDUCE_EXPOSURE_TIME_LEVELS = [
     {"after_min": 120, "reduce_to_fraction": 0.5},
     {"after_min": 200, "reduce_to_fraction": 0.25},
 ]
-ENABLE_POSITION_HEALTH = (
-    os.environ.get("ENABLE_POSITION_HEALTH", "false").lower() == "true"
-)
+ENABLE_POSITION_HEALTH = (os.environ.get("ENABLE_POSITION_HEALTH", "false").lower() == "true")
 POSITION_HEALTH_CHECK_MIN = int(os.environ.get("POSITION_HEALTH_CHECK_MIN", "60"))
-ALLOW_NO_STEALTH = (
-    os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true"
-)  # ФИКС-8
+ALLOW_NO_STEALTH = (os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true")
 
 MARKET_TTL_DAYS = 2
 SNAPSHOTS_TTL_DAYS = 7
