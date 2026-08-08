@@ -3078,14 +3078,9 @@ def run():
                 and entry["missed_runs"] == MISS_EXIT_RUNS
             ):
                 log.info(
-                    f"[{sym}] выпала из фильтра {entry['missed_runs']} прогона → пауза"
-                )
-                send_tg(
-                    f"⏸ <b>{esc(entry.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
-                    f"Наблюдение на паузе ({esc(entry['state'])})\n"
-                    f"Выпала из discovery-фильтра {entry['missed_runs']} прогона подряд\n"
-                    f"<i>Стадия сохранена — при возврате пересчитается.</i>\n"
-                )
+                f"[{sym}] выпала из фильтра {entry['missed_runs']} прогона → пауза "
+                f"(state={entry['state']})"
+            )
         else:
             log.info(
                 f"[{sym}] отсутствует в частичном scrape — missed_runs не меняем"
