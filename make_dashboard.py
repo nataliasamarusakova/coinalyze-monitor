@@ -96,6 +96,7 @@ def load_unentered():
     if not UNENTERED_ANALYSIS.exists():
         return []
     out = []
+    bad = 0
     for ln in UNENTERED_ANALYSIS.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
@@ -103,13 +104,16 @@ def load_unentered():
         try:
             out.append(json.loads(ln))
         except json.JSONDecodeError:
-            continue
+            bad += 1
+    if bad:
+        print(f"WARNING: unentered_analysis.jsonl — {bad} битых строк пропущено")
     return out
 
 def load_pending_unentered():
     if not UNENTERED_CANDIDATES.exists():
         return 0
     count = 0
+    bad = 0
     for ln in UNENTERED_CANDIDATES.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
@@ -119,7 +123,9 @@ def load_pending_unentered():
             if rec.get("status") != "finalized":
                 count += 1
         except json.JSONDecodeError:
-            continue
+            bad += 1
+    if bad:
+        print(f"WARNING: unentered_candidates.jsonl — {bad} битых строк пропущено")
     return count
 
 def compute_capture_rate(trades, unentered, cutoff_h=24):

@@ -49,6 +49,12 @@ RECONCILE_FILE = BASE / "reconciliation.jsonl"
 DEBUG_HTML_FILE = BASE / "debug_page.html"
 EXECUTION_EVENTS_FILE = BASE / "execution_events.jsonl"  # ФИКС-4 (durable trail)
 
+# Техническое качество последнего scrape. Важно: это не торговый сигнал и не
+# часть lifecycle-логики. Флаг нужен только чтобы не трактовать частично
+# загруженный universe как реальное исчезновение символов из discovery.
+LAST_SCRAPE_COMPLETE = True
+LAST_SCRAPE_PAGE_ERRORS = []
+
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
@@ -629,9 +635,10 @@ def save_watchlist(wl):
 
 def load_lifecycle_state():
     # ФИКС-6: раньше порча файла тонула молча в {} без лога и без TG.
-    # Теперь: карантин + алерт, но прогон продолжается (в отличие от
-    # watchlist.json тут нет данных об открытых позициях, поэтому
-    # hard-stop не требуется — но потеря видна оператору).
+    # ФИКС-11: corruption больше не сбрасывается в {}, потому что здесь живут
+    # cooldown и idea_first_seen_ts. Продолжение после reset может привести к
+    # преждевременному повторному входу; безопаснее остановить прогон после
+    # quarantine/alert и потребовать явного восстановления оператором.
     if not LIFECYCLE_STATE_FILE.exists():
         return {}
     try:
@@ -639,14 +646,14 @@ def load_lifecycle_state():
     except json.JSONDecodeError as e:
         backup = _quarantine_corrupt_file(LIFECYCLE_STATE_FILE)
         msg = (
-            f"⚠️ <b>Monitor WARNING</b>\nlifecycle_state.json повреждён: {esc(str(e))}\n"
+            f"⚠️ <b>Monitor CRITICAL</b>\nlifecycle_state.json повреждён: {esc(str(e))}\n"
             f"Файл в карантине{f' ({esc(backup.name)})' if backup else ''}.\n"
-            f"<i>Все активные cooldown и idea_first_seen_ts сброшены — "
-            f"возможен преждевременный повторный вход по ранее закрытым символам.</i>"
+            f"<i>Прогон остановлен: автоматический reset cooldown/idea_first_seen_ts "
+            f"запрещён, чтобы не создать преждевременный повторный вход.</i>"
         )
         log.error(f"lifecycle_state.json повреждён: {e}")
         send_tg(msg)
-        return {}
+        sys.exit(1)
     now = time.time()
     ttl = IDEA_REGISTRY_TTL_DAYS * 86400
     out = {}
@@ -968,6 +975,9 @@ def parse_table(html_text):
 
 
 def fetch_data() -> list[dict]:
+    global LAST_SCRAPE_COMPLETE, LAST_SCRAPE_PAGE_ERRORS
+    LAST_SCRAPE_COMPLETE = True
+    LAST_SCRAPE_PAGE_ERRORS = []
     all_rows = []
     seen_symbols = set()
     with sync_playwright() as p:
@@ -997,6 +1007,10 @@ def fetch_data() -> list[dict]:
                         log.info(f"Страница {i}: +{new_count} новых монет")
                     except Exception as e:
                         log.error(f"Ошибка страницы {i} ({page_url}): {e}")
+                        LAST_SCRAPE_COMPLETE = False
+                        LAST_SCRAPE_PAGE_ERRORS.append(
+                            {"page": i, "url": page_url, "error": str(e)[:200]}
+                        )
                         continue
             else:
                 soup = BeautifulSoup(html_text, "lxml")
@@ -1032,6 +1046,16 @@ def fetch_data() -> list[dict]:
     if not all_rows:
         send_tg("⚠️ <b>Monitor</b>\nДанные не получены. Проверь debug_page.html")
         sys.exit(1)
+    if not LAST_SCRAPE_COMPLETE:
+        log.error(
+            f"Scrape incomplete: {len(LAST_SCRAPE_PAGE_ERRORS)} page errors; "
+            "disappearance/missed/remove logic will be skipped for this run"
+        )
+        send_tg(
+            "⚠️ <b>Monitor</b>\n"
+            "Coinalyze scrape неполный: часть страниц не загрузилась.\n"
+            "<i>Этот прогон не будет трактовать отсутствующие монеты как исчезнувшие.</i>"
+        )
     log.info(f"Всего монет после пагинации: {len(all_rows)}")
     return all_rows
 
@@ -3046,7 +3070,7 @@ def run():
         if sym in current_symbols:
             entry["missed_runs"] = 0
             entry["last_seen"] = ts
-        else:
+        elif LAST_SCRAPE_COMPLETE:
             entry["missed_runs"] = entry.get("missed_runs", 0) + 1
             entry["last_seen"] = entry.get("last_seen", ts)
             if (
@@ -3062,6 +3086,10 @@ def run():
                     f"Выпала из discovery-фильтра {entry['missed_runs']} прогона подряд\n"
                     f"<i>Стадия сохранена — при возврате пересчитается.</i>\n"
                 )
+        else:
+            log.info(
+                f"[{sym}] отсутствует в частичном scrape — missed_runs не меняем"
+            )
     for sym in list(wl_all.keys()):
         entry = wl_all[sym]
         ot = entry.get("open_trade")
@@ -3379,15 +3407,21 @@ def run():
                     agree = "✅" if llm_res.get("agree") is True else "❌"
                     msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
                 send_tg(msg)
-    for sym in list(wl_all.keys()):
-        entry = wl_all[sym]
-        if sym in current_symbols:
-            continue
-        if entry.get("open_trade"):
-            continue
-        if entry.get("missed_runs", 0) >= MISS_REMOVE_RUNS:
-            log.info(f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove")
-            del wl_all[sym]
+    if LAST_SCRAPE_COMPLETE:
+        for sym in list(wl_all.keys()):
+            entry = wl_all[sym]
+            if sym in current_symbols:
+                continue
+            if entry.get("open_trade"):
+                continue
+            if entry.get("missed_runs", 0) >= MISS_REMOVE_RUNS:
+                log.info(f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove")
+                del wl_all[sym]
+    else:
+        log.warning(
+            "Scrape incomplete: удаление watchlist entries по отсутствию в universe "
+            "пропущено в этом прогоне"
+        )
     flush_pending(price_full, ts, existing_trade_ids)
     save_pending(PENDING)
     save_watchlist(wl_all)
