@@ -3187,10 +3187,7 @@ def run():
                     log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}")
                 else:
                     if old in ACTIVE_STATES:
-                        send_tg(
-                            f"⚪ <b>{esc(existing.get('name',sym))} ({esc(sym)})</b>\n━━━━━━━━━━━━━━━━━━\n"
-                            f"{esc(old)} → NEUTRAL\n<i>Снята: условия тренда не выполняются {nr} прогона подряд</i>\n"
-                        )
+                        log.info( f"[{sym}] {old} → NEUTRAL " f"(снята: условия тренда не выполняются {nr} прогонов подряд)")
                     log.info(f"[{sym}] {old} → NEUTRAL, remove")
                     del wl_all[sym]
             elif has_trade:
