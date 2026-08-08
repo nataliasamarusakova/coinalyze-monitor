@@ -635,9 +635,10 @@ def save_watchlist(wl):
 
 def load_lifecycle_state():
     # ФИКС-6: раньше порча файла тонула молча в {} без лога и без TG.
-    # Теперь: карантин + алерт, но прогон продолжается (в отличие от
-    # watchlist.json тут нет данных об открытых позициях, поэтому
-    # hard-stop не требуется — но потеря видна оператору).
+    # ФИКС-11: corruption больше не сбрасывается в {}, потому что здесь живут
+    # cooldown и idea_first_seen_ts. Продолжение после reset может привести к
+    # преждевременному повторному входу; безопаснее остановить прогон после
+    # quarantine/alert и потребовать явного восстановления оператором.
     if not LIFECYCLE_STATE_FILE.exists():
         return {}
     try:
@@ -645,14 +646,14 @@ def load_lifecycle_state():
     except json.JSONDecodeError as e:
         backup = _quarantine_corrupt_file(LIFECYCLE_STATE_FILE)
         msg = (
-            f"⚠️ <b>Monitor WARNING</b>\nlifecycle_state.json повреждён: {esc(str(e))}\n"
+            f"⚠️ <b>Monitor CRITICAL</b>\nlifecycle_state.json повреждён: {esc(str(e))}\n"
             f"Файл в карантине{f' ({esc(backup.name)})' if backup else ''}.\n"
-            f"<i>Все активные cooldown и idea_first_seen_ts сброшены — "
-            f"возможен преждевременный повторный вход по ранее закрытым символам.</i>"
+            f"<i>Прогон остановлен: автоматический reset cooldown/idea_first_seen_ts "
+            f"запрещён, чтобы не создать преждевременный повторный вход.</i>"
         )
         log.error(f"lifecycle_state.json повреждён: {e}")
         send_tg(msg)
-        return {}
+        sys.exit(1)
     now = time.time()
     ttl = IDEA_REGISTRY_TTL_DAYS * 86400
     out = {}

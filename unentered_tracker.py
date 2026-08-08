@@ -46,6 +46,7 @@ def load_jsonl(path):
         return []
 
     out = []
+    bad = 0
     for ln in path.read_text(encoding="utf-8").splitlines():
         ln = ln.strip()
         if not ln:
@@ -53,7 +54,10 @@ def load_jsonl(path):
         try:
             out.append(json.loads(ln))
         except json.JSONDecodeError:
-            continue
+            bad += 1
+
+    if bad:
+        print(f"WARNING: {path.name} — {bad} битых строк пропущено")
 
     return out
 
