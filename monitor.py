@@ -2341,12 +2341,14 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         sl_exit = _detect_sl_exit(ot, sym)
         if sl_exit:
             exit_reason, cur, exit_price_source = sl_exit
+            lifecycle_complete = True
             log.error(
                 f"RECONCILE MISSING {sym} — на бирже позиции нет, "
                 f"обнаружен исполненный SL, закрываем как STOP_LOSS"
             )
         else:
             exit_reason = "EXCHANGE_CLOSED"
+            lifecycle_complete = False
             cur = ot.get("last_price")
             exit_price_source = "last_seen" if cur else "unknown"
             log.error(
@@ -2363,7 +2365,7 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
             price_full,
             exit_price_source=exit_price_source,
             exit_candidates=[exit_reason],
-            lifecycle_complete=False,
+            lifecycle_complete=lifecycle_complete,
             exchange_close_status="confirmed",
         )
         cd = COOLDOWN_BY_EXIT_REASON.get(exit_reason, 60)
@@ -2590,6 +2592,9 @@ def manage_open_trade(
         dq["last_price_observation"] = "scrape_incomplete"
         dq["last_price_observation_ts"] = ts
     elif not symbol_in_current_scrape:
+        dq["discovery_missing_count"] = (
+            dq.get("discovery_missing_count", 0) + 1
+        )
         dq["last_price_observation"] = "discovery_missing"
         dq["last_price_observation_ts"] = ts
     else:
