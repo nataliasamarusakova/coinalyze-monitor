@@ -1,0 +1,210 @@
+name: Coinalyze Monitor
+
+on:
+  repository_dispatch:
+    types: [run_monitor]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coinalyze-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Полный fetch — нужен для корректных rebase/push
+          fetch-depth: 1
+          # Явно разрешаем использовать креденшалы (GITHUB_TOKEN)
+          persist-credentials: true
+          # Явно переключаемся на main
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax check
+        run: python -m py_compile monitor.py conditions.py unentered_tracker.py bingx_client.py make_dashboard.py trades_report.py
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browser binaries
+        id: cache-playwright-browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Chromium (если кеша нет)
+        if: steps.cache-playwright-browsers.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Install only system deps (браузер уже в кеше)
+        if: steps.cache-playwright-browsers.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
+
+      - name: Run monitor
+        env:
+          COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
+          COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
+          ENABLE_BINGX: "true"
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+          BINGX_MARGIN_USDT: "1"
+          BINGX_LEVERAGE: "10"
+        run: python monitor.py
+
+      - name: Run unentered tracker
+        run: python unentered_tracker.py
+
+      - name: Build dashboard
+        id: build_dashboard
+        run: python make_dashboard.py
+
+      - name: Notify on dashboard build failure
+        if: failure() && steps.build_dashboard.outcome == 'failure'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT_ID}" \
+              -d text="⚠️ Monitor CI: сборка дашборда (make_dashboard.py) упала. Торговые данные из monitor.py не пострадали и будут закоммичены отдельно." >/dev/null || true
+          fi
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            debug_page.html
+            debug_screenshot.png
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Commit snapshot log and state
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -e
+          git config user.name "actions-user"
+          git config user.email "actions@github.com"
+
+          alert() {
+            local msg="$1"
+            echo "::error::$msg"
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                -d chat_id="${TG_CHAT_ID}" \
+                -d text="⚠️ Monitor CI: $msg" >/dev/null || true
+            fi
+          }
+
+          # Удаляем мусорные файлы, которые не должны попасть в коммит
+          rm -f debug_page.html debug_screenshot.png pending_trades.json
+          rm -f *.corrupt.*
+
+          # Добавляем ВСЕ изменения
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Нет изменений для коммита"
+          else
+            if ! git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+              alert "git commit failed — изменения текущего прогона не сохранены в git"
+              exit 1
+            fi
+          fi
+
+          # Убедиться что нет unstaged changes
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "ВНИМАНИЕ: после коммита остались unstaged changes, добавляем их"
+            git add -A
+            git commit -m "snapshot-extra $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+          fi
+
+          # Переключаемся на локальную main и настраиваем upstream (если нужно)
+          git checkout -B main
+          git branch --set-upstream-to=origin/main main || true
+
+          # Сначала пробуем корректно сделать реbase и запушить в main.
+          n=0
+          max_try_main=3
+          while true; do
+            n=$((n+1))
+            echo "Attempt ${n}: fetch/rebase + push to main"
+            set +e
+            git fetch origin main
+            rebase_ok=0
+            git rebase origin/main
+            if [ $? -eq 0 ]; then
+              git push origin HEAD:main
+              push_exit=$?
+              if [ $push_exit -eq 0 ]; then
+                echo "Pushed to main successfully"
+                set -e
+                break
+              fi
+            else
+              git rebase --abort 2>/dev/null || true
+            fi
+            set -e
+
+            if [ "$n" -ge "$max_try_main" ]; then
+              echo "Не удалось запушить в main после ${max_try_main} попыток, перейду к fallback-ветке"
+              # Фоллбек: создаём отдельную ветку и пушим туда
+              FALLBACK_BRANCH="ci/save/runner-commit-$(date -u +%Y%m%dT%H%M%SZ)"
+              git checkout -B "$FALLBACK_BRANCH"
+              if git push -u origin HEAD:"$FALLBACK_BRANCH"; then
+                echo "Патч сохранён в ветке ${FALLBACK_BRANCH}"
+                # Можно оповестить в телеграм
+                alert "Snapshot сохранён в ветке ${FALLBACK_BRANCH}"
+                break
+              else
+                # не удалось запушить даже в fallback — сохраняем патч локально и выйдем с ошибкой,
+                # чтобы последующий шаг загрузил артефакт
+                git format-patch -1 HEAD --stdout > /tmp/runner-commit.patch || git diff --binary > /tmp/runner-changes.diff || true
+                alert "git push failed и push fallback-ветки не удался — патч сохранён локально /tmp/runner-commit.patch"
+                exit 1
+              fi
+            fi
+
+            # экспоненциальный бэкофф перед следующей попыткой
+            sleep $((n * 5))
+          done
+
+          echo "Commit/push OK"
+
+      - name: Upload runner commit as artifact (fallback)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-commit
+          path: |
+            /tmp/runner-commit.patch
+            /tmp/runner-changes.diff
+          if-no-files-found: ignore
+          retention-days: 7
