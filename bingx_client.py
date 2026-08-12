@@ -43,6 +43,22 @@ except json.JSONDecodeError:
 _CONTRACT_CACHE = {"ts": 0.0, "data": {}}
 _CONTRACT_TTL = 3600
 
+def _tp_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
+    """Проверка что TP ордер принадлежит конкретной сделке.
+    TP-parsed может содержать либо явный trade_id (старый формат
+    clientOrderId), либо только trade_hash (текущий детерминированный
+    формат без timestamp).
+    """
+    if parsed is None:
+        return False
+    if not trade_id:
+        return True
+    tid = str(trade_id)
+    if parsed.get("trade_id"):
+        return parsed["trade_id"] in (tid, tid.replace("_", ""))
+    if parsed.get("trade_hash"):
+        return parsed["trade_hash"] == _trade_id_hash(tid)
+    return False
 
 # ============================================================
 # LOW-LEVEL API
