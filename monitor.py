@@ -3109,6 +3109,30 @@ def run():
             continue
         new_ot = existing.get("open_trade")
         new_tid = existing.get("trade_id")
+        # Без этого prev_state на следующем прогоне всегда читается как
+        if not has_trade:
+            wl_all[sym] = {
+                "state": state,
+                "previous_state": prev_state,
+                "action": ACTIONS.get(state, ""),
+                "confidence": conf,
+                "score": score,
+                "momentum": sig["momentum"],
+                "pattern": sig["pattern"],
+                "name": r.get("name", sym),
+                "first_seen": existing.get("first_seen", ts),
+                "last_seen": ts,
+                "snapshots": existing.get("snapshots", 0) + 1,
+                "missed_runs": existing.get("missed_runs", 0),
+                "neutral_runs": 0,
+                "entry_earliness": round(sig["early_val"], 2),
+                "signal_strength": sig["strength"],
+                "window": sig["window"],
+                "reasons": sig["reasons"],
+                "warnings": sig["warnings"],
+                "mom_tags": sig["mom_tags"],
+            }
+            existing = wl_all[sym]
         if new_ot is None and state in ENTRY_STATES and sig["price"]:
             info = lifecycle_state.get(sym, {})
             if info.get("cooldown_until", 0) > ts:
