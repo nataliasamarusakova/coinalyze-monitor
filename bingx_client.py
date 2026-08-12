@@ -32,6 +32,7 @@ ORDERS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bingx_ord
 
 TP_CLIENT_ORDER_PREFIX = "CM_TP_"
 SL_CLIENT_ORDER_PREFIX = "CM_SL_"
+OPEN_CLIENT_ORDER_PREFIX = "CM_OPEN_"
 VALID_TP_LEGS = {"tp1", "tp2", "tp3"}
 
 try:
@@ -230,6 +231,17 @@ def build_sl_client_order_id(trade_id: str = None) -> str:
     """v3.1: ID полностью детерминирован (без timestamp) — CM_SL_<hash8>."""
     key = _trade_id_hash(trade_id) if trade_id else uuid.uuid4().hex[:8]
     return f"{SL_CLIENT_ORDER_PREFIX}{key}"
+
+
+def build_open_client_order_id(symbol: str, trade_id: str = None) -> str:
+    """Детерминированный clientOrderId для OPEN-ордера (MARKET BUY).
+    Формат: CM_OPEN_<hash8> — ≤ 40 символов.
+    Обеспечивает идемпотентность: повторный вызов _request() с тем же
+    trade_id отправит ТОТ ЖЕ clientOrderId, и биржа отклонит дубликат.
+    """
+    raw = f"{symbol}:{trade_id}" if trade_id else symbol
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{OPEN_CLIENT_ORDER_PREFIX}{key}"
 
 
 def parse_sl_client_order_id(client_id: str) -> dict | None:
@@ -1053,12 +1065,14 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
             ),
         }
     _set_leverage(bx_symbol, leverage)
+    client_order_id = build_open_client_order_id(bx_symbol, trade_id)
     params = {
         "symbol": bx_symbol,
         "side": "BUY",
         "positionSide": "LONG",
         "type": "MARKET",
         "quantity": str(qty),
+        "clientOrderId": client_order_id,
     }
     resp = _request("POST", ORDER_PATH, params)
     if resp.get("code") != 0:
@@ -1084,11 +1098,11 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
             }
         err = f"code={resp.get('code')} msg={resp.get('msg')}"
         _log_event({
-            "event": "open_failed",
-            "symbol": symbol,
-            "bx_symbol": bx_symbol,
-            "error": err,
-            "trade_id": trade_id,
+                "event": "open_failed",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "error": err,
+                "trade_id": trade_id,
         })
         return {
             "status": "error",
@@ -1101,6 +1115,7 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
         "symbol": symbol,
         "bx_symbol": bx_symbol,
         "order_id": oid,
+        "client_order_id": client_order_id,
         "qty": qty,
         "price": price,
         "leverage": leverage,
@@ -1110,6 +1125,7 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
     return {
         "status": "opened",
         "order_id": oid,
+        "client_order_id": client_order_id,
         "qty": qty,
         "symbol": bx_symbol,
         "leverage": leverage,
@@ -1136,7 +1152,30 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
         return {"status": "error", "error": open_res.get("error"), "symbol": bx_symbol, "open": open_res}
     pos = wait_for_position_fill(symbol, timeout_sec=fill_timeout_sec)
     if pos.get("status") != "found":
+        # BUG-003 FIX: после timeout делаем одну финальную попытку
+        # получить подтверждённый qty с биржи, а не использовать
+        # запрошенный объём из open_res.
+        final_pos = get_position(symbol)
+        if final_pos.get("status") == "found" and final_pos.get("positionAmt"):
+            confirmed_qty = float(final_pos["positionAmt"])
+            log.info(
+                f"[{symbol}] позиция подтверждена после timeout: "
+                f"positionAmt={confirmed_qty}"
+            )
+            return {
+                "status": "found",
+                "symbol": bx_symbol,
+                "open": open_res,
+                "position": final_pos,
+                "avg_price": final_pos.get("avgPrice"),
+                "qty_initial": confirmed_qty,
+                "qty_remaining": confirmed_qty,
+            }
         qty_opened = float(open_res.get("qty") or 0.0)
+        log.warning(
+            f"[{symbol}] позиция не подтверждена биржей — "
+            f"используется запрошенный qty={qty_opened} (не подтверждён)"
+        )
         return {
             "status": "open_no_tp",
             "symbol": bx_symbol,
@@ -1144,7 +1183,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "position": pos,
             "qty_initial": qty_opened,
             "qty_remaining": qty_opened,
-            "qty_initial_uncertain": status == "already_open",
+            "qty_initial_uncertain": True,
         }
     return {
         "status": "found",
