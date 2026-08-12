@@ -3425,7 +3425,7 @@ def run():
                         r.get("liq_short24"), r.get("liq_long24"), r.get("oi")
                     ),
                     "entry_fr_oiw_zscore": calc_entry_fr_oiw_zscore_from_hist(
-                        hist, r.get("fr_oiw")
+                        hist[:-1], r.get("fr_oiw")
                     ),
                 }
                 signal_wl = wl_all.get(sym)
