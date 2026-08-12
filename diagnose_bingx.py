@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Диагностика BingX DEMO (Testnet): Все ордера Swap за 7 дней.
+Диагностика BingX DEMO: Все ордера Swap за 1 день.
 """
 
 import os
@@ -40,7 +40,7 @@ def bingx_get(path: str, params: dict, api_key: str, api_secret: str):
     url = f"{BASE_URL}{path}?{query}"
     headers = {"X-BX-APIKEY": api_key}
     
-    print(f"🔗 Запрос: {url}")
+    print(f"🔗 Запрос: GET {path}")
     response = requests.get(url, headers=headers, timeout=30)
     
     if response.status_code != 200:
@@ -54,21 +54,21 @@ def bingx_get(path: str, params: dict, api_key: str, api_secret: str):
 
 def main():
     print("=" * 80)
-    print("🚀 BingX DEMO Diagnostics: ALL SWAP ORDERS (Last 7 Days)")
+    print("🚀 BingX DEMO Diagnostics: ALL SWAP ORDERS (Last 24 Hours)")
     print("=" * 80)
     api_key, api_secret = get_credentials()
 
+    # Диапазон: 1 день (24 часа)
     end_time = int(time.time() * 1000)
-    start_time = end_time - (7 * 24 * 60 * 60 * 1000)
+    start_time = end_time - (1 * 24 * 60 * 60 * 1000)
 
-    # Запрашиваем без фильтра symbol, чтобы увидеть вообще всё на демо-счете
     params = {
         "limit": 100, 
         "startTime": start_time,
         "endTime": end_time,
     }
 
-    print(f"\n📅 Период: {time.strftime('%Y-%m-%d', time.localtime(start_time/1000))} — {time.strftime('%Y-%m-%d', time.localtime(end_time/1000))}")
+    print(f"\n📅 Период: {time.strftime('%Y-%m-%d %H:%M', time.localtime(start_time/1000))} — {time.strftime('%Y-%m-%d %H:%M', time.localtime(end_time/1000))}")
 
     print("\n" + "=" * 80)
     print("DEMO SWAP: /openApi/swap/v2/trade/allOrders")
@@ -91,14 +91,19 @@ def main():
     if orders:
         print("\n--- ПРИМЕРЫ ПОСЛЕДНИХ 10 ОРДЕРОВ (для анализа type/status) ---")
         for o in orders[-10:]:
-            print(f"Symbol: {o.get('symbol'):<12} | Type: {str(o.get('type')).upper():<20} | Status: {str(o.get('status')).upper():<15} | Executed: {o.get('executedQty')}")
+            t = str(o.get('type')).upper()
+            s = str(o.get('status')).upper()
+            sym = o.get('symbol')
+            exec_qty = o.get('executedQty')
             
-        print("\n💡 Внимательно посмотрите на поле 'type' у ордеров со статусом FILLED.")
-        print("   Если там 'MARKET' вместо 'TAKE_PROFIT_MARKET' — наша гипотеза подтверждена!")
+            # Подсветка исполненных ордеров
+            marker = "🔥" if s == "FILLED" and float(exec_qty or 0) > 0 else "  "
+            print(f"{marker} Symbol: {sym:<12} | Type: {t:<20} | Status: {s:<15} | Executed: {exec_qty}")
+            
+        print("\n💡 Ищите ордер с executedQty > 0 и статусом FILLED.")
+        print("   Посмотрите на поле 'type'. Если там 'MARKET' — гипотеза подтверждена!")
     else:
-        print("\n⚠️ Список ордеров пуст. Убедитесь, что:")
-        print("   1. API-ключи созданы именно для ДЕМО-счета (в настройках демо-аккаунта).")
-        print("   2. Сделка была совершена менее 7 дней назад.")
+        print("\n⚠️ Список ордеров пуст за последние 24 часа.")
 
     print("\n" + "=" * 80)
     print("✅ Диагностика завершена")
