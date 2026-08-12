@@ -2119,8 +2119,6 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 f"Закрыто: {delta_qty:.8f}\n"
                 f"Осталось: {remaining_text} "
                 f"({remaining_pct_text})\n"
-                f"Время исполнения: "
-                f"<code>{esc(fill_time_text)}</code>"
             )
             event_id = (
                 f"tp:{trade_id or 'unknown'}:{order_id}:{executed_qty:.12f}"
