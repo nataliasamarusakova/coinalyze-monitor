@@ -1221,7 +1221,8 @@ def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
         recent = snaps[-MIN_SNAPS_LIFECYCLE:]
         result_a = check_confirmed_path_a(recent)
         result_b = check_confirmed_path_b(recent, cvd_mom) 
-        if (result_a["passed"] or result_b["passed"]):
+        trends_ok = derived["cvd_trend"] != "down" and derived["oi_trend"] != "down"
+        if (result_a["passed"] or result_b["passed"]) and trends_ok:
             is_early = result_b["passed"] and not result_a["passed"]
             if is_early:
                 reasons.append(
