@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Диагностика BingX DEMO: Все ордера Swap за 1 день.
+Диагностика BingX DEMO: Все ордера Swap за 5 часов.
 """
 
 import os
@@ -54,13 +54,13 @@ def bingx_get(path: str, params: dict, api_key: str, api_secret: str):
 
 def main():
     print("=" * 80)
-    print("🚀 BingX DEMO Diagnostics: ALL SWAP ORDERS (Last 24 Hours)")
+    print("🚀 BingX DEMO Diagnostics: ALL SWAP ORDERS (Last 5 Hours)")
     print("=" * 80)
     api_key, api_secret = get_credentials()
 
-    # Диапазон: 1 день (24 часа)
+    # Диапазон: 5 часов
     end_time = int(time.time() * 1000)
-    start_time = end_time - (1 * 24 * 60 * 60 * 1000)
+    start_time = end_time - (5 * 60 * 60 * 1000)
 
     params = {
         "limit": 100, 
@@ -103,7 +103,7 @@ def main():
         print("\n💡 Ищите ордер с executedQty > 0 и статусом FILLED.")
         print("   Посмотрите на поле 'type'. Если там 'MARKET' — гипотеза подтверждена!")
     else:
-        print("\n⚠️ Список ордеров пуст за последние 24 часа.")
+        print("\n⚠️ Список ордеров пуст за последние 5 часов.")
 
     print("\n" + "=" * 80)
     print("✅ Диагностика завершена")
