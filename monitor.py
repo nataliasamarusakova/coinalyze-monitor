@@ -2308,8 +2308,19 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         log.error(f"RECONCILE ORPHAN {o['bx_symbol']} qty={o['qty']} — нет в журнале")
         if RECONCILE_AUTOCLOSE:
             try:
+                # BUG-004 FIX: перед закрытием orphan-позиции
+                # отменяем TP/SL на бирже (полный lifecycle),
+                # даже если локально они не известны.
+                tp_cancel = bingx_client.cancel_take_profit_orders(o["bx_symbol"])
+                sl_cancel = bingx_client.cancel_stop_loss_orders(o["bx_symbol"])
+                log.info(
+                    f"RECONCILE ORPHAN {o['bx_symbol']} TP/SL cancel: "
+                    f"tp={tp_cancel.get('status')} sl={sl_cancel.get('status')}"
+                )
                 r = bingx_client._close_position(o["bx_symbol"], float(o["qty"]))
                 o["autoclose_result"] = r
+                o["tp_cancel_status"] = tp_cancel.get("status")
+                o["sl_cancel_status"] = sl_cancel.get("status")
                 log.info(
                     f"RECONCILE ORPHAN {o['bx_symbol']} автозакрытие: {r.get('status')}"
                 )
@@ -2476,6 +2487,8 @@ def _update_shadows(ot, ts, pnl_pct, strength):
         ot["last_signal_strength"] = strength
     elif strength is not None:
         ot["last_signal_strength"] = strength
+
+
 def _retry_failed_exchange_tp(ot, symbol):
     """Retry отсутствующих Exchange TP после TP_FAILED.
     Execution-only операция:
@@ -2558,6 +2571,82 @@ def _retry_failed_exchange_tp(ot, symbol):
             f"[{symbol}] TP_RETRY exception: {e}"
         )
         return False
+
+
+def _retry_failed_exchange_sl(ot, symbol):
+    """Retry отсутствующего Exchange SL после TP_PLACED + sl_order=None.
+    Execution-only операция:
+    - сначала проверяем реальные SL на бирже;
+    - если SL уже есть — восстанавливаем ссылку;
+    - если SL нет — создаём заново;
+    - research/lifecycle logic не затрагивается.
+    """
+    if not ENABLE_BINGX:
+        return False
+    bx = ot.get("bingx") or {}
+    # SL retry нужен когда TP размещён, но SL отсутствует локально.
+    if bx.get("execution_status") != "TP_PLACED":
+        return False
+    if bx.get("sl_order") is not None:
+        return False
+    qty = safe(
+        bx.get("qty_remaining"),
+        safe(
+            bx.get("qty_initial"),
+            safe(bx.get("qty"), 0.0),
+        ),
+    )
+    avg_price = bx.get("bingx_avg_price")
+    if not avg_price:
+        avg_price = ot.get("entry_price")
+    if qty <= 0 or not avg_price:
+        log.warning(
+            f"[{symbol}] SL_RETRY skipped: "
+            f"qty={qty} avg_price={avg_price}"
+        )
+        return False
+    trade_id = ot.get("trade_id_full")
+    try:
+        import bingx_client
+        # Сначала проверяем, может SL уже есть на бирже.
+        existing = bingx_client.get_open_sl_orders(symbol)
+        if existing.get("status") == "ok" and existing.get("count", 0) > 0:
+            sl_orders = existing.get("orders", [])
+            bx["sl_order"] = sl_orders[0]
+            ot["bingx"] = bx
+            log.info(
+                f"[{symbol}] SL_RETRY: SL уже существует на бирже "
+                f"({existing.get('count')} шт.) — восстанавливаем ссылку"
+            )
+            return True
+        # SL нет на бирже — создаём.
+        sl_result = bingx_client.place_stop_loss_order(
+            symbol,
+            avg_price,
+            qty,
+            STOP_LOSS_PCT,
+            trade_id=trade_id,
+        )
+        if sl_result.get("status") == "created":
+            bx["sl_order"] = sl_result
+            ot["bingx"] = bx
+            log.info(
+                f"[{symbol}] SL_RETRY SUCCESS: "
+                f"stop_price={sl_result.get('stop_price')}"
+            )
+            return True
+        log.error(
+            f"[{symbol}] SL_RETRY FAILED: "
+            f"{sl_result.get('error')}"
+        )
+        return False
+    except Exception as e:
+        log.error(
+            f"[{symbol}] SL_RETRY exception: {e}"
+        )
+        return False
+
+
 def manage_open_trade(
     sym,
     ot,
@@ -2572,6 +2661,8 @@ def manage_open_trade(
     # P1: восстановление Exchange TP после предыдущего TP_FAILED.
     # Execution-only операция; research/lifecycle не меняется.
     _retry_failed_exchange_tp(ot, sym)
+    # P1: восстановление Exchange SL после TP_PLACED + sl_order=None.
+    _retry_failed_exchange_sl(ot, sym)
     state = (signal or {}).get("state")
     score = (signal or {}).get("score", 0)
     strength = (signal or {}).get("strength")
