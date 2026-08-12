@@ -2109,20 +2109,15 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
             remaining_pct_text = (
                 f"{remaining_pct:.1f}%" if remaining_pct is not None else "—"
             )
-            status_text = (
-                "исполнен полностью" if status == "FILLED"
-                else "исполнен частично"
-            )
             telegram_text = (
-                f"🎯 <b>{esc(ot.get('name', symbol))} "
-                f"({esc(symbol)})</b> — TP {esc(leg).upper()}\n"
+                f"💰 <b>{esc(ot.get('name', symbol))} "
+                f"({esc(symbol)})</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"<b>{esc(status_text)}</b>\n"
-                f"Цена исполнения: <b>{price_text}</b>\n"
-                f"PnL TP: <b>{pnl_text}</b>\n"
-                f"Исполнено сейчас: <b>{delta_qty:.8f}</b>\n"
-                f"Исполнено всего: <b>{executed_qty:.8f}</b>\n"
-                f"Осталось: <b>{remaining_text}</b> "
+                f"Leg: {esc(leg)}\n"
+                f"PnL TP: {pnl_text}\n"
+                f"Цена исполнения: {price_text}\n"
+                f"Закрыто: {delta_qty:.8f}\n"
+                f"Осталось: {remaining_text} "
                 f"({remaining_pct_text})\n"
                 f"Время исполнения: "
                 f"<code>{esc(fill_time_text)}</code>"
