@@ -1,5 +1,7 @@
 """
 bingx_client.py — BingX USDT-M Perpetual Swap, демо-счёт (VST).
+v3.2 — Регистронезависимый парсинг clientOrderId (BingX возвращает в lower case).
+       Превентивный фикс статуса PARTIALLYFILLED для TP/SL.
 v3.0 — Добавлена оркестровка открытия позиции с защитой (open_position + attach_protection),
        чтобы monitor.py не делал прямых низкоуровневых вызовов API при входе в сделку.
 v2.9 — Добавлен биржевой STOP_LOSS (STOP_MARKET), исправлено поле clientOrderId.
@@ -227,19 +229,23 @@ def parse_tp_client_order_id(client_id: str) -> dict | None:
     Поддержка старых форматов оставлена для распознавания ордеров,
     созданных до этого фикса (переходный период).
     """
-    if not client_id or not client_id.startswith(TP_CLIENT_ORDER_PREFIX):
+    if not client_id:
         return None
-    parts = client_id.split("_")
+    upper_id = client_id.upper()
+    if not upper_id.startswith(TP_CLIENT_ORDER_PREFIX):
+        return None
+    parts = upper_id.split("_")
+    valid_legs_upper = {leg.upper() for leg in VALID_TP_LEGS}
     if len(parts) < 4 or parts[0] != "CM" or parts[1] != "TP":
         return None
-    if len(parts) == 4 and _is_hex8(parts[2]) and parts[3] in VALID_TP_LEGS:
-        return {"trade_id": None, "trade_hash": parts[2], "leg": parts[3]}
-    if len(parts) == 5 and _is_hex8(parts[2]) and parts[3] in VALID_TP_LEGS:
-        return {"trade_id": None, "trade_hash": parts[2], "leg": parts[3]}
-    if len(parts) >= 6 and parts[4] in VALID_TP_LEGS:
-        return {"trade_id": parts[2], "trade_hash": None, "leg": parts[4]}
-    if parts[3] in VALID_TP_LEGS:
-        return {"trade_id": None, "trade_hash": None, "leg": parts[3]}
+    if len(parts) == 4 and _is_hex8(parts[2]) and parts[3] in valid_legs_upper:
+        return {"trade_id": None, "trade_hash": parts[2].lower(), "leg": parts[3].lower()}
+    if len(parts) == 5 and _is_hex8(parts[2]) and parts[3] in valid_legs_upper:
+        return {"trade_id": None, "trade_hash": parts[2].lower(), "leg": parts[3].lower()}
+    if len(parts) >= 6 and parts[4] in valid_legs_upper:
+        return {"trade_id": parts[2], "trade_hash": None, "leg": parts[4].lower()}
+    if parts[3] in valid_legs_upper:
+        return {"trade_id": None, "trade_hash": None, "leg": parts[3].lower()}
     return None
 
 
@@ -265,18 +271,17 @@ def parse_sl_client_order_id(client_id: str) -> dict | None:
     v3.1 deterministic: CM_SL_<hash8>        (3 части)
     v2.9 hash+ts:        CM_SL_<hash8>_<ts>   (4 части, обратная совместимость)
     """
-    if not client_id or not client_id.startswith(SL_CLIENT_ORDER_PREFIX):
+    if not client_id:
         return None
-    parts = client_id.split("_")
+    upper_id = client_id.upper()
+    if not upper_id.startswith(SL_CLIENT_ORDER_PREFIX):
+        return None
+    parts = upper_id.split("_")
     if len(parts) == 3 and parts[0] == "CM" and parts[1] == "SL":
-        return {"trade_hash": parts[2]}
+        return {"trade_hash": parts[2].lower()}
     if len(parts) == 4 and parts[0] == "CM" and parts[1] == "SL":
-        return {"trade_hash": parts[2]}
+        return {"trade_hash": parts[2].lower()}
     return None
-
-
-
-
 
 
 def _sl_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
@@ -388,7 +393,7 @@ def get_open_tp_orders(symbol: str) -> dict:
         is_our_tp = (
             o.get("type") in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET")
             and o.get("positionSide") == "LONG"
-            and str(o.get("clientOrderId", "")).startswith(TP_CLIENT_ORDER_PREFIX)
+            and str(o.get("clientOrderId", "")).upper().startswith(TP_CLIENT_ORDER_PREFIX)
         )
         if is_our_tp:
             tp_orders.append(o)
@@ -411,7 +416,7 @@ def get_filled_tp_orders(symbol: str, opened_ts: int = None, trade_id: str = Non
         order_type = o.get("type")
         order_time = o.get("time", 0)
         if not (
-            status in ("FILLED", "PARTIALLY_FILLED")
+            status in ("FILLED", "PARTIALLY_FILLED", "PARTIALLYFILLED")
             and order_type in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET")
         ):
             continue
@@ -745,7 +750,7 @@ def get_open_sl_orders(symbol: str) -> dict:
         is_our_sl = (
             o.get("type") in ("STOP", "STOP_MARKET")
             and o.get("positionSide") == "LONG"
-            and str(o.get("clientOrderId", "")).startswith(SL_CLIENT_ORDER_PREFIX)
+            and str(o.get("clientOrderId", "")).upper().startswith(SL_CLIENT_ORDER_PREFIX)
         )
         if is_our_sl:
             sl_orders.append(o)
@@ -765,7 +770,7 @@ def get_filled_sl_orders(symbol: str, opened_ts: int = None, trade_id: str = Non
         order_type = o.get("type")
         order_time = o.get("time", 0)
         if not (
-            status in ("FILLED", "PARTIALLY_FILLED")
+            status in ("FILLED", "PARTIALLY_FILLED", "PARTIALLYFILLED")
             and order_type in ("STOP", "STOP_MARKET")
         ):
             continue
