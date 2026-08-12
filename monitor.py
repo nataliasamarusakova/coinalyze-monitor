@@ -2350,6 +2350,7 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         if sl_exit:
             exit_reason, cur, exit_price_source = sl_exit
             lifecycle_complete = True
+            m["sl_explained"] = True
             log.error(
                 f"RECONCILE MISSING {sym} — на бирже позиции нет, "
                 f"обнаружен исполненный SL, закрываем как STOP_LOSS"
@@ -2385,7 +2386,8 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         entry.pop("open_trade", None)
         entry.pop("trade_id", None)
         save_watchlist(wl_all)
-    if missing:
+    unexplained = [m for m in missing if not m.get("sl_explained")]
+    if unexplained:
         send_tg(
             f"🔻 <b>Сверка: позиции нет на бирже, но она была в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"{len(missing)} шт.: {esc(', '.join(m['symbol'] for m in missing[:12]))}\n"
