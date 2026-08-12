@@ -2,6 +2,16 @@ name: Diagnose BingX Orders
 
 on:
   workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Trading pair symbol"
+        required: false
+        default: "PROM-USDT"
+
+      page_size:
+        description: "How many orders to fetch"
+        required: false
+        default: "50"
 
 jobs:
   diagnose-bingx-orders:
@@ -9,7 +19,9 @@ jobs:
 
     env:
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
-      BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
+      BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
+      DIAGNOSE_SYMBOL: ${{ inputs.symbol }}
+      DIAGNOSE_PAGE_SIZE: ${{ inputs.page_size }}
 
     steps:
       - name: Checkout repository
@@ -24,6 +36,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
+
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
@@ -33,10 +46,10 @@ jobs:
           set -o pipefail
           python diagnose_bingx.py 2>&1 | tee bingx_diagnose_output.txt
 
-      - name: Upload diagnose output
+      - name: Upload diagnostics output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bingx-diagnose-output
+          name: bingx-diagnose-output-${{ github.run_id }}
           path: bingx_diagnose_output.txt
           retention-days: 7
