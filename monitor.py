@@ -2390,7 +2390,7 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
     if unexplained:
         send_tg(
             f"🔻 <b>Сверка: позиции нет на бирже, но она была в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
-            f"{len(missing)} шт.: {esc(', '.join(m['symbol'] for m in missing[:12]))}\n"
+            f"{len(unexplained)} шт.: {esc(', '.join(m['symbol'] for m in unexplained[:12]))}\n"
             f"<i>Закрыты как STOP_LOSS/EXCHANGE_CLOSED (cooldown применён). Возможна ликвидация или ручное закрытие.</i>"
         )
     if mismatch:
