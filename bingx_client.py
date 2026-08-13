@@ -1271,6 +1271,8 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "symbol": bx_symbol,
         }
 
+    asset_class = classify_bingx_contract(contract)
+
     if str(contract.get("apiStateOpen", "")).lower() != "true":
         return {
             "status": "skipped",
@@ -1278,7 +1280,6 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "symbol": bx_symbol,
         }
 
-    asset_class = classify_bingx_contract(contract)
     open_res = open_long(symbol, price, trade_id=trade_id)
     status = open_res.get("status")
     if status == "foreign_position":
@@ -1420,22 +1421,7 @@ def close_long(
         trade_id,
     )
 
-def debug_resolve_symbols():
-    for symbol in ("CRV", "ORCL", "ASTS", "SNDK", "EWY"):
-        contract = get_contract(symbol)
-
-        if not contract:
-            print(f"{symbol}: NOT FOUND")
-            continue
-
-        print(
-            f"{symbol}: "
-            f"displayName={contract.get('displayName')} "
-            f"bingx_symbol={contract.get('symbol')} "
-            f"asset_class={classify_bingx_contract(contract)} "
-            f"status={contract.get('status')} "
-            f"apiStateOpen={contract.get('apiStateOpen')}"
-        )
+ 
 
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, trade_id: str = None) -> dict:
     real_amt = _position_amt(bx_symbol)
@@ -1481,5 +1467,4 @@ def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, tra
                 "trade_id": trade_id})
     return {"status": "error", "error": err}
 
-if __name__ == "__main__":
-    debug_resolve_symbols()
+ 
