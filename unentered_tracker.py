@@ -492,12 +492,12 @@ def run():
                 cvd_mom,
             )
 
-            asset_class = classify_asset_class(
-                {
-                    "symbol": sym,
-                    "name": cand.get("name", ""),
-                }
-            )
+            contract = bingx_client.get_contract(sym)
+
+            if contract:
+                asset_class = bingx_client.classify_bingx_contract(contract)
+            else:
+                asset_class = "unknown"
 
             analysis_rec = {
                 "detect_ts": detect_ts,
