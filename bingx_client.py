@@ -192,13 +192,27 @@ def _normalize_orders_list(resp: dict) -> list:
 # ============================================================
 def to_bx_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
+
+    if not s:
+        return symbol
+
+    # Явный пользовательский mapping имеет высший приоритет.
     if s in SYMBOL_MAP:
-        return SYMBOL_MAP[s]
+        return str(SYMBOL_MAP[s]).strip().upper()
+
+    # Пытаемся найти реальный BingX execution symbol.
+    contract = get_contract(s)
+    if contract:
+        return str(contract.get("symbol", "")).strip().upper()
+
+    # Fallback: старое поведение, если контракт не найден.
     s = s.replace("-", "")
     if s.endswith("USDT"):
         s = s[:-4]
+
     if not s:
         return symbol
+
     return f"{s}-USDT"
 
 
