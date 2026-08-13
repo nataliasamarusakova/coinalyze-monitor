@@ -15,7 +15,7 @@ from conditions import (
 )
 
 try:
-    from monitor import SIGNAL_LOGIC_VERSION, classify_asset_class, TRADE_WIN_PCT
+    from monitor import SIGNAL_LOGIC_VERSION, TRADE_WIN_PCT
 except Exception:
     SIGNAL_LOGIC_VERSION = 1
     TRADE_WIN_PCT = 1.0
