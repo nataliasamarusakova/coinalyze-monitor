@@ -1142,7 +1142,7 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
     max_lev = min(max_lev, MAX_LEVERAGE)
     if qty < min_qty and leverage < max_lev:
         need_lev = math.ceil(
-            (min_qty * (price or 0) * float(c.get("multiplier") or 1))
+            (min_qty * (price or 0) * float(c.get("multiplier") or c.get("size") or 1))
             / MARGIN_USDT
         )
         leverage = min(max(need_lev, leverage), max_lev)
