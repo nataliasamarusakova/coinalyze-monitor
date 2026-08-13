@@ -3235,6 +3235,7 @@ def run():
             continue
         new_ot = existing.get("open_trade")
         new_tid = existing.get("trade_id")
+        bingx_entry_blocked = bool(existing.get("bingx_entry_blocked", False))
         if not has_trade:
             wl_all[sym] = {
                 "state": state,
@@ -3256,9 +3257,12 @@ def run():
                 "reasons": sig["reasons"],
                 "warnings": sig["warnings"],
                 "mom_tags": sig["mom_tags"],
+                "bingx_entry_blocked": existing.get("bingx_entry_blocked", False),
+                "bingx_entry_block_reason": existing.get("bingx_entry_block_reason"),
+                "bingx_entry_block_symbol": existing.get("bingx_entry_block_symbol"),
             }
             existing = wl_all[sym]
-        if new_ot is None and state in ENTRY_STATES and sig["price"]:
+        if (new_ot is None and not bingx_entry_blocked and state in ENTRY_STATES and sig["price"]):
             info = lifecycle_state.get(sym, {})
             if info.get("cooldown_until", 0) > ts:
                 left = round((info["cooldown_until"] - ts) / 60, 1)
@@ -3401,10 +3405,6 @@ def run():
                             bx["partial_legs_done"] = []
                             bx["execution_status"] = "OPEN"
                             new_ot["bingx"] = bx
-                            # Crash-safe checkpoint: позиция подтверждена биржей,
-                            # сохраняем ДО попытки разместить TP/SL, чтобы при сбое
-                            # TP/SL могли быть добавлены повторно на следующем
-                            # прогоне (см. _retry_failed_exchange_tp).
                             entry_temp = dict(existing)
                             entry_temp["open_trade"] = new_ot
                             entry_temp["trade_id"] = new_tid
@@ -3544,6 +3544,10 @@ def run():
                     "reasons": sig["reasons"],
                     "warnings": sig["warnings"],
                     "mom_tags": sig["mom_tags"],
+                    "bingx_entry_blocked": existing.get("bingx_entry_blocked", False),
+                    "bingx_entry_block_reason": existing.get("bingx_entry_block_reason"),
+                    "bingx_entry_block_symbol": existing.get("bingx_entry_block_symbol"),
+                    "bingx_entry_blocked_ts": existing.get("bingx_entry_blocked_ts"),
                 }
                 if new_ot is not None:
                     entry["open_trade"] = new_ot
@@ -3728,6 +3732,7 @@ TG_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ACTIVE_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ENTRY_STATES = {"CONFIRMED_TREND", "ACCELERATION"}
 CLOSE_STATES = {"EXHAUSTION", "DISTRIBUTION"}
+
 if __name__ == "__main__":
     try:
         run()
