@@ -1256,6 +1256,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
     между подтверждением открытия позиции и размещением защиты.
     """
     bx_symbol = to_bx_symbol(symbol)
+    contract = get_contract(symbol)
     if not contract_exists(symbol):
         return {"status": "skipped", "reason": "contract_not_found", "symbol": bx_symbol}
     open_res = open_long(symbol, price, trade_id=trade_id)
