@@ -96,20 +96,42 @@ def _log_event(event: dict):
 
 def _contracts() -> dict:
     now = time.time()
-    if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
+
+    if (
+        _CONTRACT_CACHE["data"]
+        and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL
+    ):
         return _CONTRACT_CACHE["data"]
+
     resp = _request("GET", CONTRACTS_PATH, signed=False)
+
     if resp.get("code") == 0:
         data = {}
+        by_display_name = {}
+
         for c in resp.get("data", []) or []:
-            sym = c.get("symbol")
+            sym = str(c.get("symbol", "")).strip().upper()
+            display_name = str(c.get("displayName", "")).strip().upper()
+
             if sym:
                 data[sym] = c
-        _CONTRACT_CACHE.update({"ts": now, "data": data})
+
+            if display_name:
+                by_display_name[display_name] = c
+
+        _CONTRACT_CACHE.update({
+            "ts": now,
+            "data": data,
+            "by_display_name": by_display_name,
+        })
+
         return data
-    else:
-        log.error(f"contracts fetch failed: {resp.get('code')} {resp.get('msg')}")
-        return _CONTRACT_CACHE["data"]
+
+    log.error(
+        f"contracts fetch failed: {resp.get('code')} {resp.get('msg')}"
+    )
+
+    return _CONTRACT_CACHE["data"]
 
 
 def _normalize_orders_list(resp: dict) -> list:
