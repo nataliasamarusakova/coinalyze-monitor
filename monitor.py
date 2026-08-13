@@ -1933,7 +1933,7 @@ def close_trade(
         else ot["trade_id_full"],
         "symbol": symbol,
         "name": ot.get("name", symbol),
-        "asset_class": ot.get("asset_class", classify_asset_class({"symbol": symbol})),
+        "asset_class": ot.get("asset_class", "unknown"),
         "entry_ts": ot["entry_ts"],
         "entry_price": ep,
         "exit_ts": exit_ts,
