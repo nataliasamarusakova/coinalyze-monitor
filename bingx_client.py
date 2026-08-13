@@ -1420,6 +1420,22 @@ def close_long(
         trade_id,
     )
 
+def debug_resolve_symbols():
+    for symbol in ("CRV", "ORCL", "ASTS", "SNDK", "EWY"):
+        contract = get_contract(symbol)
+
+        if not contract:
+            print(f"{symbol}: NOT FOUND")
+            continue
+
+        print(
+            f"{symbol}: "
+            f"displayName={contract.get('displayName')} "
+            f"bingx_symbol={contract.get('symbol')} "
+            f"asset_class={classify_bingx_contract(contract)} "
+            f"status={contract.get('status')} "
+            f"apiStateOpen={contract.get('apiStateOpen')}"
+        )
 
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, trade_id: str = None) -> dict:
     real_amt = _position_amt(bx_symbol)
@@ -1464,3 +1480,6 @@ def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, tra
     _log_event({"event": "close_failed", "bx_symbol": bx_symbol, "qty": qty, "error": err,
                 "trade_id": trade_id})
     return {"status": "error", "error": err}
+
+if __name__ == "__main__":
+    debug_resolve_symbols()
