@@ -174,6 +174,23 @@ def get_contract(symbol: str) -> dict | None:
     #    symbol=NCSKORCL2USD-USDT.
     return _CONTRACT_CACHE["by_display_name"].get(target)
 
+def classify_bingx_contract(contract: dict | None) -> str:
+    if not contract:
+        return "unknown"
+
+    bx_symbol = str(contract.get("symbol", "")).strip().upper()
+
+    if bx_symbol.startswith(("NCSK", "NCSI")):
+        return "equity"
+
+    if bx_symbol.startswith("NCCO"):
+        return "commodity"
+
+    if bx_symbol.startswith("NCFX"):
+        return "forex"
+
+    return "crypto"
+
 def _normalize_orders_list(resp: dict) -> list:
     """Нормализация поля data из ответа BingX API.
     BingX может вернуть список словарей, словарь {"orders": [...]},
