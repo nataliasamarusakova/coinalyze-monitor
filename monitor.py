@@ -3166,6 +3166,10 @@ def run():
                     try:
                         import bingx_client
                         open_result = bingx_client.open_position(sym, sig["price"], trade_id=new_tid)
+                        if open_result.get("asset_class"):
+                            new_ot["asset_class"] = open_result["asset_class"]
+                        if open_result.get("symbol"):
+                            new_ot["bingx_symbol"] = open_result["symbol"]
                         open_status = open_result.get("status")
                         if open_status == "foreign_position":
                             new_ot["bingx"] = {
