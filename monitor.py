@@ -1734,7 +1734,7 @@ def open_trade_record(
         "entry_shadow_predicates": (
             {k: shadow[k] for k, _ in SHADOW_VARIANTS} if shadow else None
         ),
-        "asset_class": classify_asset_class(r),
+        "asset_class": "unknown",
         "name": r.get("name", r.get("symbol", "")),
         "engine_versions": dict(ENGINE_VERSIONS),
         "entry_snapshot": entry_snapshot,
@@ -1933,7 +1933,7 @@ def close_trade(
         else ot["trade_id_full"],
         "symbol": symbol,
         "name": ot.get("name", symbol),
-        "asset_class": ot.get("asset_class", classify_asset_class({"symbol": symbol})),
+        "asset_class": ot.get("asset_class", "unknown"),
         "entry_ts": ot["entry_ts"],
         "entry_price": ep,
         "exit_ts": exit_ts,
