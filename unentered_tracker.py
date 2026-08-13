@@ -1,5 +1,6 @@
 """unentered_tracker.py — детектор упущенных движений."""
 import json, time
+import bingx_client
 from bisect import bisect_left
 from pathlib import Path
 from typing import Optional
