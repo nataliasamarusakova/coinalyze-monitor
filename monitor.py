@@ -1818,15 +1818,18 @@ def _attempt_exchange_close(ot, symbol):
         return "unconfirmed"
     ot["bingx_close"] = res
     status = res.get("status")
-    if status in ("closed", "already_closed"):
+    
+    if status == "closed":
         bx["qty_remaining"] = 0.0
         bx["execution_status"] = "CLOSED_MANUAL"
         ot["bingx"] = bx
+
         log.info(
             f"[{symbol}] BingX CLOSE ok "
             f"orderId={res.get('order_id')} "
             f"qty={qty_to_close}"
         )
+
         log_execution_event(
             symbol,
             "close_confirmed",
@@ -1835,6 +1838,26 @@ def _attempt_exchange_close(ot, symbol):
             trade_id=ot.get("trade_id_full"),
         )
         return "confirmed"
+
+    if status == "already_closed":
+        bx["qty_remaining"] = 0.0
+        bx["execution_status"] = "CLOSED_EXTERNAL"
+        ot["bingx"] = bx
+
+        log.info(
+            f"[{symbol}] BingX CLOSE: LONG позиции уже нет "
+            f"на бирже, SELL не отправлялся"
+        )
+
+        log_execution_event(
+            symbol,
+            "close_confirmed_external",
+            qty=qty_to_close,
+            order_id=None,
+            trade_id=ot.get("trade_id_full"),
+        )
+        return "confirmed"
+     
     log.error(
         f"[{symbol}] BingX CLOSE НЕ подтверждён: "
         f"status={status} error={res.get('error')}"
