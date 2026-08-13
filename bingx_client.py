@@ -1247,7 +1247,6 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
         "trade_id": trade_id,
     }
 
-
 def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_sec: int = 30) -> dict:
     """Оркестровка входа: проверка контракта → open_long → дождаться
     подтверждения позиции на бирже.
@@ -1283,14 +1282,16 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
     open_res = open_long(symbol, price, trade_id=trade_id)
     status = open_res.get("status")
     if status == "foreign_position":
-        return {"status": "foreign_position", "symbol": bx_symbol, "open": open_res}
+        return {
+            "status": "foreign_position",
+            "symbol": bx_symbol,
+            "asset_class": asset_class,
+            "open": open_res,
+        }
     if status not in ("opened", "already_open"):
         return {"status": "error", "error": open_res.get("error"), "symbol": bx_symbol, "open": open_res}
     pos = wait_for_position_fill(symbol, timeout_sec=fill_timeout_sec)
     if pos.get("status") != "found":
-        # BUG-003 FIX: после timeout делаем одну финальную попытку
-        # получить подтверждённый qty с биржи, а не использовать
-        # запрошенный объём из open_res.
         final_pos = get_position(symbol)
         if final_pos.get("status") == "found" and final_pos.get("positionAmt"):
             confirmed_qty = float(final_pos["positionAmt"])
@@ -1301,11 +1302,12 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             return {
                 "status": "found",
                 "symbol": bx_symbol,
+                "asset_class": asset_class,
                 "open": open_res,
-                "position": final_pos,
-                "avg_price": final_pos.get("avgPrice"),
-                "qty_initial": confirmed_qty,
-                "qty_remaining": confirmed_qty,
+                "position": pos,
+                "avg_price": pos.get("avgPrice"),
+                "qty_initial": pos.get("positionAmt"),
+                "qty_remaining": pos.get("positionAmt"),
             }
         qty_opened = float(open_res.get("qty") or 0.0)
         log.warning(
