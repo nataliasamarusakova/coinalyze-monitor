@@ -1317,6 +1317,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
         return {
             "status": "open_no_tp",
             "symbol": bx_symbol,
+            "asset_class": asset_class,
             "open": open_res,
             "position": pos,
             "qty_initial": qty_opened,
@@ -1326,6 +1327,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
     return {
         "status": "found",
         "symbol": bx_symbol,
+        "asset_class": asset_class,
         "open": open_res,
         "position": pos,
         "avg_price": pos.get("avgPrice"),
