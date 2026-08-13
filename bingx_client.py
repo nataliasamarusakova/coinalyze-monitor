@@ -1432,13 +1432,11 @@ def close_long(
         trade_id,
     )
 
- 
-
 def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, trade_id: str = None) -> dict:
     real_amt = _position_amt(bx_symbol)
     if qty > real_amt:
         if real_amt <= 0:
-            return {"status": "skipped", "error": f"нет LONG позиции для {bx_symbol}"}
+            return {"status": "already_closed", "error": f"нет LONG позиции для {bx_symbol}"}
         log.warning(f"[{bx_symbol}] qty={qty} > real_amt={real_amt} — ограничиваем до {real_amt}")
         qty = real_amt
     c = _contracts().get(bx_symbol)
