@@ -1257,8 +1257,29 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
     """
     bx_symbol = to_bx_symbol(symbol)
     contract = get_contract(symbol)
-    if not contract_exists(symbol):
-        return {"status": "skipped", "reason": "contract_not_found", "symbol": bx_symbol}
+    
+    if not contract:
+        return {
+            "status": "skipped",
+            "reason": "contract_not_found",
+            "symbol": bx_symbol,
+        }
+
+    if contract.get("status") != 1:
+        return {
+            "status": "skipped",
+            "reason": "contract_unavailable",
+            "symbol": bx_symbol,
+        }
+
+    if str(contract.get("apiStateOpen", "")).lower() != "true":
+        return {
+            "status": "skipped",
+            "reason": "api_open_disabled",
+            "symbol": bx_symbol,
+        }
+
+    asset_class = classify_bingx_contract(contract)
     open_res = open_long(symbol, price, trade_id=trade_id)
     status = open_res.get("status")
     if status == "foreign_position":
