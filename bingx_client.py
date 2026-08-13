@@ -1388,7 +1388,7 @@ def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, tra
     c = _contracts().get(bx_symbol)
     if c:
         prec = int(c.get("quantityPrecision") or 0)
-        min_qty = float(c.get("minQty") or 0)
+        min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
         rounded = _round_qty(qty, prec)
         if rounded <= 0:
             log.warning(f"[{bx_symbol}] округление {qty}→0 — отправляем исходный qty")
