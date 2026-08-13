@@ -556,8 +556,7 @@ def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> 
 # ============================================================
 # TP ORDER CREATION / CANCELLATION
 # ============================================================
-def place_take_profit_orders(symbol: str, avg_price: float, position_qty: float,
-                              tp_levels: list = None, trade_id: str = None) -> dict:
+def place_take_profit_orders(symbol: str, avg_price: float, position_qty: float, tp_levels: list = None, trade_id: str = None) -> dict:
     """Создать BingX TP ордера через Trigger Order API.
     v2.7: БЕЗ reduceOnly (BingX Hedge Mode запрещает это поле).
     Привязка к LONG через positionSide=LONG.
@@ -586,7 +585,7 @@ def place_take_profit_orders(symbol: str, avg_price: float, position_qty: float,
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
     prec = int(c.get("quantityPrecision") or 0)
-    min_qty = float(c.get("minQty") or 0)
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     available_qty = position_qty - existing_qty
     if available_qty <= 0:
         log.warning(f"[{symbol}] вся qty уже зарезервирована существующими TP")
