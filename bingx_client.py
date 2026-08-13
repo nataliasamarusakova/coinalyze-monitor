@@ -863,8 +863,7 @@ def get_filled_sl_orders(symbol: str, opened_ts: int = None, trade_id: str = Non
     return {"status": "ok", "orders": filled_sl, "count": len(filled_sl)}
 
 
-def place_stop_loss_order(symbol: str, avg_price: float, qty: float,
-                           stop_loss_pct: float, trade_id: str = None) -> dict:
+def place_stop_loss_order(symbol: str, avg_price: float, qty: float, stop_loss_pct: float, trade_id: str = None) -> dict:
     """Создать биржевой STOP_LOSS (STOP_MARKET) для LONG-позиции.
     Гарантированное исполнение на бирже независимо от того, работает ли
     программная проверка внутри monitor.py на момент прогона.
@@ -876,7 +875,7 @@ def place_stop_loss_order(symbol: str, avg_price: float, qty: float,
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
     prec = int(c.get("quantityPrecision") or 0)
-    min_qty = float(c.get("minQty") or 0)
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     qty_r = _round_qty(qty, prec)
     if qty_r <= 0 or qty_r < min_qty:
         return {"status": "error", "error": f"qty={qty_r} < minQty={min_qty}"}
