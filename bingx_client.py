@@ -1363,7 +1363,6 @@ def attach_protection(symbol: str, avg_price: float, qty: float, tp_levels: list
         "sl_result": sl_result,
     }
 
-
 def close_long(
     symbol: str,
     qty: float,
