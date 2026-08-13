@@ -3642,7 +3642,14 @@ def run():
                 if llm_res:
                     agree = "✅" if llm_res.get("agree") is True else "❌"
                     msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
-                send_tg(msg)
+
+                if has_trade and state in ENTRY_STATES:
+                    log.info(
+                        f"[{sym}] ENTRY Telegram suppressed: "
+                        f"open_trade already exists, trade_id={existing.get('trade_id')}"
+                    )
+                else:
+                    send_tg(msg)
     if LAST_SCRAPE_COMPLETE:
         for sym in list(wl_all.keys()):
             entry = wl_all[sym]
