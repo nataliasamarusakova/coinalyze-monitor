@@ -3309,20 +3309,32 @@ def run():
                             new_ot["bingx_symbol"] = open_result["symbol"]
                         open_status = open_result.get("status")
                         if open_status == "foreign_position":
+                            
                             new_ot["bingx"] = {
                                 "status": "skipped",
                                 "reason": "foreign_position",
                                 "symbol": open_result.get("symbol"),
                             }
+                            
                             log.warning(
                                 f"[{sym}] BingX SKIP: existing position NOT owned by this trade. "
                                 f"Refusing to adopt foreign position."
                             )
+                            
                             send_tg(
                                 f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                                 f"Сигнал есть, но на бирже уже есть чужая позиция.\n"
                                 f"<i>Вход пропущен для безопасности. Закрой старую позицию вручную.</i>"
                             )
+                            
+                            new_ot = None
+                            new_tid = None
+
+                            existing["bingx_entry_blocked"] = True
+                            existing["bingx_entry_block_reason"] = "foreign_position"
+                            existing["bingx_entry_block_symbol"] = open_result.get("symbol")
+                            existing["bingx_entry_blocked_ts"] = ts
+                            bingx_entry_blocked = True
 
                         elif open_status == "skipped":
                             new_ot["bingx"] = {
