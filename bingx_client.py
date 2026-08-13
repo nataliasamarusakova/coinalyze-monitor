@@ -1,16 +1,7 @@
 """
 bingx_client.py — BingX USDT-M Perpetual Swap, демо-счёт (VST).
-v3.2 — Регистронезависимый парсинг clientOrderId (BingX возвращает в lower case).
-       Превентивный фикс статуса PARTIALLYFILLED для TP/SL.
-v3.0 — Добавлена оркестровка открытия позиции с защитой (open_position + attach_protection),
-       чтобы monitor.py не делал прямых низкоуровневых вызовов API при входе в сделку.
-v2.9 — Добавлен биржевой STOP_LOSS (STOP_MARKET), исправлено поле clientOrderId.
-v2.8 — fix: биржа возвращает поле "clientOrderId" (маленькая d), а не "clientOrderID".
-       Это ломало детекцию TP-филлов и фильтр "наш ордер" во всех местах.
-v2.7 — Hedge Mode: TP без reduceOnly + ослабленный фильтр.
-
-НЕ влияет на research статистику (trades.jsonl, win_rate, return_60m).
 """
+
 import os, json, time, hmac, hashlib, math, logging, uuid
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
@@ -42,7 +33,11 @@ try:
 except json.JSONDecodeError:
     SYMBOL_MAP = {}
 
-_CONTRACT_CACHE = {"ts": 0.0, "data": {}}
+_CONTRACT_CACHE = {
+    "ts": 0.0,
+    "data": {},
+    "by_display_name": {},
+}
 _CONTRACT_TTL = 3600
 
 def _tp_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
