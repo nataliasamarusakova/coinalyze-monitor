@@ -217,8 +217,15 @@ def to_bx_symbol(symbol: str) -> str:
 
 
 def contract_exists(symbol: str) -> bool:
-    bx_symbol = to_bx_symbol(symbol)
-    return bx_symbol in _contracts()
+    contract = get_contract(symbol)
+
+    if not contract:
+        return False
+
+    return (
+        contract.get("status") == 1
+        and str(contract.get("apiStateOpen", "")).lower() == "true"
+    )
 
 
 def contract_limits(symbol: str) -> dict:
