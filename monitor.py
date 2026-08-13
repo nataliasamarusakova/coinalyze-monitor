@@ -3177,12 +3177,36 @@ def run():
                                 "symbol": open_result.get("symbol"),
                             }
                             log.info(
-                                f"[{sym}] BingX SKIP: контракт {open_result.get('symbol')} не найден"
+                                f"[{sym}] BingX SKIP: "
+                                f"reason={open_result.get('reason')} "
+                                f"symbol={open_result.get('symbol')}"
                             )
+                            reason = open_result.get("reason")
+
+                            if reason == "contract_not_found":
+                                skip_text = (
+                                    f"Сигнал есть, но контракт "
+                                    f"{esc(str(open_result.get('symbol')))} не найден на BingX."
+                                )
+                            elif reason == "api_open_disabled":
+                                skip_text = (
+                                    f"Сигнал есть, но BingX сейчас запрещает открытие "
+                                    f"позиции по контракту {esc(str(open_result.get('symbol')))}."
+                                )
+                            elif reason == "contract_unavailable":
+                                skip_text = (
+                                    f"Сигнал есть, но контракт "
+                                    f"{esc(str(open_result.get('symbol')))} сейчас недоступен для торговли."
+                                )
+                            else:
+                                skip_text = (
+                                    f"Сигнал есть, но биржевой вход пропущен: "
+                                    f"{esc(str(reason or 'unknown'))}."
+                                )
+
                             send_tg(
                                 f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                f"Сигнал есть, но биржевой вход пропущен: контракт "
-                                f"{esc(str(open_result.get('symbol')))} не найден на BingX.\n"
+                                f"{skip_text}\n"
                                 f"<i>Позиция открыта только как research-идея, без реального ордера. "
                                 f"Retry не предусмотрен для этой причины.</i>"
                             )
