@@ -234,7 +234,7 @@ def contract_limits(symbol: str) -> dict:
 
 
 def _qty_for(c: dict, price: float, leverage: int):
-    mult = float(c.get("multiplier") or 1)
+    mult = float(c.get("multiplier") or c.get("size") or 1)
     prec = int(c.get("quantityPrecision") or 0)
     min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     if not price or price <= 0 or mult <= 0:
