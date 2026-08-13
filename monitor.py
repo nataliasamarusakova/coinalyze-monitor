@@ -3184,6 +3184,8 @@ def run():
                                 f"<i>Позиция открыта только как research-идея, без реального ордера. "
                                 f"Retry не предусмотрен для этой причины.</i>"
                             )
+                            new_ot = None
+                            new_tid = None
                         elif open_status == "error":
                             new_ot["bingx"] = {"status": "error", "error": open_result.get("error")}
                             log.error(f"[{sym}] BingX OPEN error: {open_result.get('error')}")
@@ -3196,7 +3198,8 @@ def run():
                                 f"актуален на следующем прогоне, вход не повторится, потому что "
                                 f"open_trade уже создан. Проверьте вручную.</i>"
                             )
-        
+                            new_ot = None
+                            new_tid = None
                         elif open_status == "open_no_tp":
                             bx = dict(open_result.get("open", {}))
                             bx["qty_initial"] = open_result.get("qty_initial")
