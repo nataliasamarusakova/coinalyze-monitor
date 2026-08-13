@@ -258,7 +258,7 @@ def contract_limits(symbol: str) -> dict:
 
 
 def _qty_for(c: dict, price: float, leverage: int):
-    mult = float(c.get("multiplier") or c.get("size") or 1)
+    mult = float(c.get("multiplier") or 1)
     prec = int(c.get("quantityPrecision") or 0)
     min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     if not price or price <= 0 or mult <= 0:
@@ -1163,10 +1163,7 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
     max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
     max_lev = min(max_lev, MAX_LEVERAGE)
     if qty < min_qty and leverage < max_lev:
-        need_lev = math.ceil(
-            (min_qty * (price or 0) * float(c.get("multiplier") or c.get("size") or 1))
-            / MARGIN_USDT
-        )
+        need_lev = math.ceil((min_qty * (price or 0) * float(c.get("multiplier") or 1)) / MARGIN_USDT)
         leverage = min(max(need_lev, leverage), max_lev)
         qty, prec, min_qty = _qty_for(c, price, leverage)
     if qty is None or qty <= 0 or qty < min_qty:
@@ -1474,5 +1471,3 @@ def _close_position(bx_symbol: str, qty: float, client_order_id: str = None, tra
     _log_event({"event": "close_failed", "bx_symbol": bx_symbol, "qty": qty, "error": err,
                 "trade_id": trade_id})
     return {"status": "error", "error": err}
-
- 
