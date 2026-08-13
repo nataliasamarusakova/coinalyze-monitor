@@ -1138,7 +1138,7 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
             "status": "error",
             "error": "некорректная цена",
         }
-    max_lev = int(c.get("maxLeverage") or MAX_LEVERAGE)
+    max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
     max_lev = min(max_lev, MAX_LEVERAGE)
     if qty < min_qty and leverage < max_lev:
         need_lev = math.ceil(
