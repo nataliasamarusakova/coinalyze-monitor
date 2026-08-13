@@ -7,13 +7,18 @@ from bisect import bisect_right
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
+
 try:
     from playwright_stealth import stealth_sync
+
     _STEALTH_AVAILABLE = True
 except ImportError:
     _STEALTH_AVAILABLE = False
+
     def stealth_sync(page):
         pass
+
+
 from conditions import (
     check_confirmed_path_a,
     check_confirmed_path_b,
@@ -23,6 +28,7 @@ from conditions import (
     SHADOW_VARIANTS,
     CONFIG as CONDITIONS_CONFIG,
 )
+
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
 SNAPSHOTS_FILE = BASE / "snapshots.jsonl"
@@ -45,7 +51,9 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+QWEN_BASE_URL = os.environ.get(
+    "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+)
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
 MAX_PAGES = 5
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
@@ -58,7 +66,7 @@ BINGX_TP_LEVELS = [
     {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
 ]
 
-ALLOW_NO_STEALTH = (os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true")
+ALLOW_NO_STEALTH = os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true"
 MARKET_TTL_DAYS = 2
 SNAPSHOTS_TTL_DAYS = 7
 HEARTBEAT_TTL_DAYS = 3
@@ -161,6 +169,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor")
 MIN_FR_ZSCORE_OBS = 3
+
+
 def _research_float(v):
     if v is None:
         return None
@@ -168,12 +178,16 @@ def _research_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
 def calc_entry_oi_price_regime(oi_chg4h, price_chg24):
     oi = _research_float(oi_chg4h)
     pc = _research_float(price_chg24)
     if oi is None or pc is None:
         return None
     return f"OI_{'UP' if oi > 0 else 'DOWN'}_" f"PRICE_{'UP' if pc > 0 else 'DOWN'}"
+
+
 def calc_entry_short_liq_share24(liq_short, liq_long):
     ls = _research_float(liq_short)
     ll = _research_float(liq_long)
@@ -181,6 +195,8 @@ def calc_entry_short_liq_share24(liq_short, liq_long):
         return None
     total = ls + ll
     return round(ls / total, 6) if total > 0 else None
+
+
 def calc_entry_liq_imbalance(liq_short, liq_long):
     ls = _research_float(liq_short)
     ll = _research_float(liq_long)
@@ -188,12 +204,16 @@ def calc_entry_liq_imbalance(liq_short, liq_long):
         return None
     total = ls + ll
     return round((ls - ll) / total, 6) if total > 0 else None
+
+
 def calc_entry_funding_oi_pressure(fr_oiw, oi_chg4h):
     fr = _research_float(fr_oiw)
     oi4h = _research_float(oi_chg4h)
     if fr is None or oi4h is None:
         return None
     return round(-fr * oi4h, 8)
+
+
 def calc_entry_liquidation_intensity(liq_short, liq_long, oi_abs):
     ls = _research_float(liq_short)
     ll = _research_float(liq_long)
@@ -202,6 +222,8 @@ def calc_entry_liquidation_intensity(liq_short, liq_long, oi_abs):
         return None
     total = ls + ll
     return round(total / oi, 8) if oi > 0 else None
+
+
 def calc_entry_fr_oiw_zscore_from_hist(hist, current_fr):
     cur = _research_float(current_fr)
     if cur is None:
@@ -218,6 +240,8 @@ def calc_entry_fr_oiw_zscore_from_hist(hist, current_fr):
     if std_fr == 0.0:
         return None
     return round((cur - mean_fr) / std_fr, 4)
+
+
 def parse_number(raw):
     if raw is None:
         return None
@@ -232,30 +256,47 @@ def parse_number(raw):
         return float(s) * mult
     except ValueError:
         return None
+
+
 def now_ts():
     return int(time.time())
+
+
 def esc(val):
     return html_mod.escape(str(val), quote=False)
+
+
 def fmt_pct(val):
     if val is None:
         return "—"
     return f"{'+' if val>0 else ''}{val:.1f}%"
+
+
 def fmt_num(val, suffix="", dec=1):
     if val is None:
         return "—"
     return f"{val:.{dec}f}{suffix}"
+
+
 def fmt_price(val):
     if val is None:
         return "—"
     n = float(val)
     dec = 4 if abs(n) >= 0.01 else 10
     return f"{n:.{dec}f}".rstrip("0").rstrip(".")
+
+
 def safe(val, default=0.0):
     return val if val is not None else default
+
+
 def clamp(val, lo, hi):
     return max(lo, min(hi, val))
+
+
 def valid_price(p):
     return p is not None and p > 0
+
 
 def price_at(price_full, sym, ts_target, max_lag_sec=None):
     idx = price_full.get(sym, [])
@@ -277,11 +318,14 @@ def price_at(price_full, sym, ts_target, max_lag_sec=None):
         return None
 
     return found_price
-    
+
+
 def resolve_exit_reason(candidates):
     all_triggered = [r for r in EXIT_PRIORITY if candidates.get(r, False)]
     resolved = all_triggered[0] if all_triggered else None
     return resolved, all_triggered
+
+
 def compute_snapshot_hash(snapshot):
     snapshot_json = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
     return {
@@ -289,9 +333,12 @@ def compute_snapshot_hash(snapshot):
         "version": "v1",
         "value": hashlib.sha256(snapshot_json.encode()).hexdigest(),
     }
+
+
 def discovery_fingerprint():
     from urllib.parse import urlparse, parse_qs
     import base64
+
     url = COINALYZE_URL or ""
     out = {
         "url_sha256": hashlib.sha256(url.encode()).hexdigest()[:16],
@@ -317,6 +364,8 @@ def discovery_fingerprint():
     except Exception as e:
         out["parse_error"] = str(e)[:80]
     return out
+
+
 def log_discovery_change(fp, ts):
     prev = load_jsonl(DISCOVERY_HISTORY_FILE)
     last = prev[-1] if prev else None
@@ -343,6 +392,8 @@ def log_discovery_change(fp, ts):
     else:
         log.info(f"DISCOVERY baseline {fp['url_sha256']}")
     return True
+
+
 def _atomic_write_text(path: Path, text: str):
     d = path.parent
     fd, tmp_name = tempfile.mkstemp(dir=str(d), prefix=f".{path.name}.", suffix=".tmp")
@@ -359,9 +410,13 @@ def _atomic_write_text(path: Path, text: str):
         except Exception:
             pass
         raise
+
+
 def append_jsonl(path, rec):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def _append_execution_event_durable(event):
     try:
         with open(EXECUTION_EVENTS_FILE, "a", encoding="utf-8") as f:
@@ -372,6 +427,8 @@ def _append_execution_event_durable(event):
     except Exception as e:
         log.error(f"Durable execution journal write failed: {e}")
         return False
+
+
 def load_jsonl(path):
     if not path.exists():
         return []
@@ -388,6 +445,8 @@ def load_jsonl(path):
     if bad:
         log.warning(f"{path.name}: {bad} битых строк пропущено при загрузке")
     return out
+
+
 def cleanup_jsonl(path, ttl_days):
     if not path.exists():
         return
@@ -399,6 +458,8 @@ def cleanup_jsonl(path, ttl_days):
         content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in fresh)
         _atomic_write_text(path, content)
         log.info(f"Cleanup {path.name}: -{removed}")
+
+
 def log_execution_event(symbol, kind, **fields):
     event = {"ts": now_ts(), "symbol": symbol, "kind": kind, **fields}
     try:
@@ -406,6 +467,8 @@ def log_execution_event(symbol, kind, **fields):
     except Exception as e:
         log.error(f"log_execution_event({symbol},{kind}) failed: {e}")
         return False
+
+
 def _quarantine_corrupt_file(path):
     if not path.exists():
         return None
@@ -416,6 +479,8 @@ def _quarantine_corrupt_file(path):
     except Exception as e:
         log.error(f"backup {path.name}: {e}")
         return None
+
+
 def load_watchlist():
     if not WATCHLIST_FILE.exists():
         return {}
@@ -439,8 +504,12 @@ def load_watchlist():
                 sym, rec["open_trade"].get("entry_ts", now_ts())
             )
     return data
+
+
 def save_watchlist(wl):
     _atomic_write_text(WATCHLIST_FILE, json.dumps(wl, ensure_ascii=False, indent=2))
+
+
 def load_lifecycle_state():
     if not LIFECYCLE_STATE_FILE.exists():
         return {}
@@ -472,10 +541,14 @@ def load_lifecycle_state():
         if idea_fresh or cooldown_active:
             out[sym] = v
     return out
+
+
 def save_lifecycle_state(state):
     _atomic_write_text(
         LIFECYCLE_STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2)
     )
+
+
 def load_market_history():
     cutoff = now_ts() - LIFECYCLE_WINDOW_MIN * 60
     recs = load_jsonl(MARKET_HISTORY_FILE)
@@ -491,6 +564,8 @@ def load_market_history():
     for sym in grouped:
         grouped[sym].sort(key=lambda x: x["ts"])
     return grouped
+
+
 def load_price_full():
     recs = load_jsonl(MARKET_HISTORY_FILE)
     idx = {}
@@ -501,6 +576,8 @@ def load_price_full():
     for sym in idx:
         idx[sym].sort(key=lambda x: x[0])
     return idx
+
+
 def load_existing_trade_ids():
     ids = set()
     for r in load_jsonl(TRADES_FILE):
@@ -508,6 +585,8 @@ def load_existing_trade_ids():
         if tid:
             ids.add(tid)
     return ids
+
+
 def load_pending():
     if not PENDING_FILE.exists():
         return []
@@ -545,9 +624,13 @@ def load_pending():
     if len(out) != len(data):
         log.warning(f"pending dedup: {len(data)}→{len(out)}")
     return out
+
+
 def save_pending(pending):
     content = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in pending)
     _atomic_write_text(PENDING_FILE, content)
+
+
 def _ensure_stealth_available():
     if _STEALTH_AVAILABLE:
         return
@@ -566,6 +649,8 @@ def _ensure_stealth_available():
     )
     send_tg(msg)
     sys.exit(1)
+
+
 def _setup_browser_context(p):
     browser = p.chromium.launch(headless=True)
     ctx = browser.new_context(
@@ -611,6 +696,8 @@ def _setup_browser_context(p):
     page = ctx.new_page()
     stealth_sync(page)
     return browser, page
+
+
 def _load_page(page, url):
     page.goto(url, wait_until="networkidle", timeout=60_000)
     page.wait_for_timeout(3000)
@@ -650,6 +737,8 @@ def _load_page(page, url):
     )
     html_text = page.content()
     return html_text
+
+
 def click_next_page(page, current_page_num):
     pag = page.query_selector(".pagination")
     if not pag:
@@ -674,6 +763,8 @@ def click_next_page(page, current_page_num):
             return True
         page.wait_for_timeout(500)
     return False
+
+
 def get_page_urls(html_text):
     soup = BeautifulSoup(html_text, "lxml")
     pagination = soup.select_one(".pagination")
@@ -688,6 +779,8 @@ def get_page_urls(html_text):
         if full_url not in urls:
             urls.append(full_url)
     return urls[:MAX_PAGES]
+
+
 def parse_table(html_text):
     soup = BeautifulSoup(html_text, "lxml")
     rows = soup.select("tbody tr")
@@ -738,6 +831,8 @@ def parse_table(html_text):
     if range_violations:
         log.warning(f"parse_table: {range_violations} подозрительных строк")
     return out
+
+
 def fetch_data() -> list[dict]:
     global LAST_SCRAPE_COMPLETE, LAST_SCRAPE_PAGE_ERRORS
     LAST_SCRAPE_COMPLETE = True
@@ -822,6 +917,8 @@ def fetch_data() -> list[dict]:
         )
     log.info(f"Всего монет после пагинации: {len(all_rows)}")
     return all_rows
+
+
 def passes_filter(r):
     v = r.get("volume24")
     pc = r.get("price_chg24")
@@ -851,6 +948,8 @@ def passes_filter(r):
     if fr is not None and fr > 0.05:
         return False
     return True
+
+
 def calculate_score(r):
     score = 0
     pros, cons = [], []
@@ -906,6 +1005,8 @@ def calculate_score(r):
         score += 1
         pros.append(f"OI/Mc={oim:.3f}")
     return score, pros, cons
+
+
 def calc_derived(snaps):
     n = len(snaps)
     d = {
@@ -922,6 +1023,7 @@ def calc_derived(snaps):
     }
     if n < 2:
         return d
+
     def trend(vals):
         clean = [v for v in vals if v is not None]
         if len(clean) < 2:
@@ -933,6 +1035,7 @@ def calc_derived(snaps):
         if diff < -base * 0.05:
             return "down"
         return "flat"
+
     d["oi_trend"] = trend([s.get("oi_chg24_pct") for s in snaps])
     d["cvd_trend"] = trend([s.get("cvd24") for s in snaps])
     d["price_trend"] = trend([s.get("price_chg24") for s in snaps])
@@ -975,6 +1078,8 @@ def calc_derived(snaps):
     ):
         d["note"] = "Здоровое движение: Price↑ OI и CVD не падают"
     return d
+
+
 def calc_momentum(derived):
     m = 0
     tags = []
@@ -1011,6 +1116,8 @@ def calc_momentum(derived):
         m += 1
         tags.append("OI+CVD sync↑")
     return clamp(m, 0, 10), tags
+
+
 def detect_pattern(r, derived, momentum):
     pc = safe(r.get("price_chg24"))
     oi24 = safe(r.get("oi_chg24_pct"))
@@ -1054,6 +1161,8 @@ def detect_pattern(r, derived, momentum):
     ):
         return "Healthy Trend"
     return "—"
+
+
 def fetch_btc_price_chg():
     try:
         r = requests.get(
@@ -1067,6 +1176,8 @@ def fetch_btc_price_chg():
     except Exception as e:
         log.warning(f"CoinGecko: {e}")
     return None
+
+
 def detect_market_phase(rows):
     btc = next((r for r in rows if r.get("symbol") in BTC_SYMBOLS), None)
     btc_src = "rows"
@@ -1104,6 +1215,8 @@ def detect_market_phase(rows):
         "btc_source": btc_src,
         "breadth_ratio": round(ratio, 3),
     }
+
+
 ACTIONS = {
     "NEUTRAL": "IGNORE",
     "ACCUMULATION": "WATCH",
@@ -1142,6 +1255,8 @@ ALLOWED_FROM = {
         "INVALIDATED",
     },
 }
+
+
 def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
     n = len(snaps)
     reasons, warnings = [], []
@@ -1159,8 +1274,10 @@ def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
     cvd_mom = derived["cvd_momentum"]
     price_accel = derived["price_accel"]
     fund_press = derived["funding_pressure"]
+
     def allowed(target):
         return prev_state in ALLOWED_FROM.get(target, set())
+
     if oi24 < -5 and cvd < 40:
         reasons.append(f"OI24={oi24:.1f}%<-5, CVD={cvd:.0f}<40")
         if pc < -3:
@@ -1203,7 +1320,7 @@ def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
     if allowed("CONFIRMED_TREND") and n >= MIN_SNAPS_LIFECYCLE:
         recent = snaps[-MIN_SNAPS_LIFECYCLE:]
         result_a = check_confirmed_path_a(recent)
-        result_b = check_confirmed_path_b(recent, cvd_mom) 
+        result_b = check_confirmed_path_b(recent, cvd_mom)
         trends_ok = derived["cvd_trend"] != "down" and derived["oi_trend"] != "down"
         if (result_a["passed"] or result_b["passed"]) and trends_ok:
             is_early = result_b["passed"] and not result_a["passed"]
@@ -1257,6 +1374,8 @@ def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
             reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
             return "ACCUMULATION", reasons, warnings, None
     return "NEUTRAL", ["нет подтверждённого движения"], warnings, None
+
+
 def calc_confidence(state, snaps, score, derived, market_mod):
     base = {
         "NEUTRAL": 50,
@@ -1277,12 +1396,16 @@ def calc_confidence(state, snaps, score, derived, market_mod):
     if len(snaps) > 0 and safe(snaps[-1].get("cvd24")) > 95 and state == "ACCELERATION":
         penalty += 5
     return clamp(base + snap_bonus + score + market_mod * 3 - penalty, 0, 100)
+
+
 def entry_earliness(r):
     pc_pos = min(max(safe(r.get("price_chg24")) / 15.0, 0.0), 1.0)
     oi_pos = min(max(safe(r.get("oi_chg24_pct")) / 50.0, 0.0), 1.0)
     fr_pos = min(max(safe(r.get("fr_oiw")) / 0.05, 0.0), 1.0)
     avg = (pc_pos + oi_pos + fr_pos) / 3
     return avg, ("ранняя" if avg < 0.35 else "средняя" if avg < 0.65 else "поздняя")
+
+
 def send_tg(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("TG not configured")
@@ -1319,7 +1442,9 @@ def send_tg(text):
                             break
                     except Exception:
                         pass
-                log.warning(f"TG HTML failed attempt={attempt + 1}/3 status={r.status_code}")
+                log.warning(
+                    f"TG HTML failed attempt={attempt + 1}/3 status={r.status_code}"
+                )
             except Exception as e:
                 log.error(f"TG HTML exception attempt={attempt + 1}/3: {e}")
             if attempt < 2:
@@ -1337,11 +1462,13 @@ def send_tg(text):
                 )
                 if fallback.status_code == 200:
                     try:
-                        delivered = (fallback.json().get("ok") is True)
+                        delivered = fallback.json().get("ok") is True
                     except Exception:
                         delivered = False
                 if not delivered:
-                    log.error(f"TG fallback failed: status={fallback.status_code} body={fallback.text[:200]}")
+                    log.error(
+                        f"TG fallback failed: status={fallback.status_code} body={fallback.text[:200]}"
+                    )
             except Exception as e:
                 log.error(f"TG fallback exception: {e}")
         if not delivered:
@@ -1349,6 +1476,8 @@ def send_tg(text):
             log.error("TG message chunk was NOT delivered")
         time.sleep(0.4)
     return all_ok
+
+
 def _retry_pending_tp_notifications():
     try:
         events = load_jsonl(EXECUTION_EVENTS_FILE)
@@ -1383,9 +1512,7 @@ def _retry_pending_tp_notifications():
         pending.append(event)
     if not pending:
         return False
-    pending.sort(
-        key=lambda e: int(e.get("fill_time_ms", 0) or e.get("ts", 0) or 0)
-    )
+    pending.sort(key=lambda e: int(e.get("fill_time_ms", 0) or e.get("ts", 0) or 0))
     changed = False
     for event in pending:
         event_id = str(event["event_id"])
@@ -1409,11 +1536,11 @@ def _retry_pending_tp_notifications():
                 "recovered": True,
             },
         )
-        log.info(
-            f"[{event.get('symbol')}] TP Telegram recovered event_id={event_id}"
-        )
+        log.info(f"[{event.get('symbol')}] TP Telegram recovered event_id={event_id}")
         changed = True
     return changed
+
+
 def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
     state = wl["state"]
     emoji = STATE_EMOJI.get(state, "⚪")
@@ -1475,6 +1602,8 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
     if research_parts:
         msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
+
+
 def format_trade_close(rec):
     pnl = rec.get("strategy_pnl_pct")
     outcome_unknown = rec.get("outcome_unknown", False)
@@ -1482,9 +1611,7 @@ def format_trade_close(rec):
     emoji = (
         "💚"
         if (pnl is not None and pnl > 0)
-        else "💔"
-        if (pnl is not None and pnl < 0)
-        else "➖"
+        else "💔" if (pnl is not None and pnl < 0) else "➖"
     )
     peak = rec.get("max_pnl_pct")
     dd = rec.get("drawdown_from_peak_pct")
@@ -1527,11 +1654,10 @@ def format_trade_close(rec):
     if fr_z is not None:
         research_parts.append(f"FR z: {fr_z:+.2f}")
     if research_parts:
-        msg += (
-            f"{line}\n"
-            f"📊 Research\n" + " · ".join(research_parts) + "\n"
-        )
+        msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
+
+
 def llm_verify(symbol, wl, cur, snaps):
     if not ENABLE_LLM or not QWEN_API_KEY:
         return None
@@ -1579,8 +1705,12 @@ def llm_verify(symbol, wl, cur, snaps):
     except Exception as e:
         log.warning(f"LLM: {e}")
     return None
+
+
 def _new_trade_id(symbol, ts):
     return f"{symbol}_{ts}_{uuid.uuid4().hex[:8]}"
+
+
 def _fill_horizons(ot, sym, as_of_ts, price_full):
     ep = ot.get("entry_price")
     if not ep:
@@ -1593,6 +1723,8 @@ def _fill_horizons(ot, sym, as_of_ts, price_full):
             if ph:
                 ot[key] = round((ph - ep) / ep * 100, 3)
                 ot[f"{key}_available"] = True
+
+
 def open_trade_record(
     r,
     ts,
@@ -1703,12 +1835,12 @@ def open_trade_record(
         "current_state_start_ts": ts,
         "time_in_states": {},
         "idea_first_seen_ts": idea_first_seen_ts,
-        "idea_age_minutes": round((ts - idea_first_seen_ts) / 60, 1)
-        if idea_first_seen_ts
-        else None,
-        "signal_age_min": round((ts - idea_first_seen_ts) / 60, 1)
-        if idea_first_seen_ts
-        else None,
+        "idea_age_minutes": (
+            round((ts - idea_first_seen_ts) / 60, 1) if idea_first_seen_ts else None
+        ),
+        "signal_age_min": (
+            round((ts - idea_first_seen_ts) / 60, 1) if idea_first_seen_ts else None
+        ),
         "snapshot_count_before_entry": snapshots,
         "watchlist_tenure_runs": snapshots,
         "history_len_before_entry": history_len,
@@ -1777,6 +1909,7 @@ def open_trade_record(
         ot[f"return_{h}m_available"] = False
     return ot
 
+
 def _attempt_exchange_close(ot, symbol):
     """Безопасное полное закрытие exchange-позиции.
     Full close всегда требует:
@@ -1799,6 +1932,7 @@ def _attempt_exchange_close(ot, symbol):
         return "confirmed"
     try:
         import bingx_client
+
         res = bingx_client.close_long(
             symbol,
             qty_to_close,
@@ -1806,9 +1940,7 @@ def _attempt_exchange_close(ot, symbol):
             trade_id=ot.get("trade_id_full"),
         )
     except Exception as e:
-        log.error(
-            f"[{symbol}] EXCHANGE_CLOSE exception: {e}"
-        )
+        log.error(f"[{symbol}] EXCHANGE_CLOSE exception: {e}")
         ot.setdefault("close_attempts", []).append(
             {
                 "ts": now_ts(),
@@ -1818,7 +1950,7 @@ def _attempt_exchange_close(ot, symbol):
         return "unconfirmed"
     ot["bingx_close"] = res
     status = res.get("status")
-    
+
     if status == "closed":
         bx["qty_remaining"] = 0.0
         bx["execution_status"] = "CLOSED_MANUAL"
@@ -1857,7 +1989,7 @@ def _attempt_exchange_close(ot, symbol):
             trade_id=ot.get("trade_id_full"),
         )
         return "confirmed"
-     
+
     log.error(
         f"[{symbol}] BingX CLOSE НЕ подтверждён: "
         f"status={status} error={res.get('error')}"
@@ -1880,10 +2012,12 @@ def _attempt_exchange_close(ot, symbol):
     )
     return "unconfirmed"
 
+
 def _exit_meta(source, exit_ts, last_price_ts):
     if source == "live" or last_price_ts is None:
         return source, 0.0
     return source, round(max(0, exit_ts - last_price_ts) / 60, 1)
+
 
 def close_trade(
     ot,
@@ -1930,16 +2064,20 @@ def close_trade(
     protections_triggered = [
         r for r in (exit_candidates or []) if r in PROTECTION_REASONS
     ]
+
     def winflag(h):
         v = ot.get(f"return_{h}m")
         if v is None:
             return None
         return 1 if v >= TRADE_WIN_PCT else 0
+
     rec = {
         "schema_version": TRADE_SCHEMA_VERSION,
-        "trade_id": f"{symbol}_{ot['entry_ts']}"
-        if not ot.get("trade_id_full")
-        else ot["trade_id_full"],
+        "trade_id": (
+            f"{symbol}_{ot['entry_ts']}"
+            if not ot.get("trade_id_full")
+            else ot["trade_id_full"]
+        ),
         "symbol": symbol,
         "name": ot.get("name", symbol),
         "asset_class": ot.get("asset_class", "unknown"),
@@ -2056,6 +2194,8 @@ def close_trade(
         f"[{symbol}] TRADE → PENDING {exit_reason} strat={strategy_pnl} hold={hold_min}m outcome_unknown={outcome_unknown}"
     )
     send_tg(format_trade_close(rec))
+
+
 def _process_filled_tps(wl_all, ts, price_full, exch):
     """Проверяет исполненные TP-ордера и обновляет qty_remaining/журнал/telegram.
     Сырую детекцию филлов делает bingx_client.compute_new_tp_fills (без
@@ -2081,7 +2221,9 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
         processed_fills = bx.setdefault("tp_fills", {})
         qty_initial = safe(bx.get("qty_initial"), safe(bx.get("qty"), 0.0))
         qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
-        result = bingx_client.compute_new_tp_fills(symbol, trade_id, opened_ts, processed_fills)
+        result = bingx_client.compute_new_tp_fills(
+            symbol, trade_id, opened_ts, processed_fills
+        )
         if result.get("status") != "ok":
             continue
         for filled in result.get("fills", []):
@@ -2108,9 +2250,7 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 else None
             )
             remaining_pct = (
-                new_qty_remaining / qty_initial * 100
-                if qty_initial
-                else None
+                new_qty_remaining / qty_initial * 100 if qty_initial else None
             )
             pnl_text = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "—"
             price_text = fmt_price(avg_price) if avg_price is not None else "—"
@@ -2129,9 +2269,7 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 f"Осталось: {remaining_text} "
                 f"({remaining_pct_text})\n"
             )
-            event_id = (
-                f"tp:{trade_id or 'unknown'}:{order_id}:{executed_qty:.12f}"
-            )
+            event_id = f"tp:{trade_id or 'unknown'}:{order_id}:{executed_qty:.12f}"
             existing_events = load_jsonl(EXECUTION_EVENTS_FILE)
             event_already_exists = any(
                 e.get("event_id") == event_id
@@ -2160,9 +2298,7 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                     qty_before=qty_remaining,
                     qty_remaining=new_qty_remaining,
                     avg_price=avg_price,
-                    pnl_pct=(
-                        round(pnl_pct, 3) if pnl_pct is not None else None
-                    ),
+                    pnl_pct=(round(pnl_pct, 3) if pnl_pct is not None else None),
                     fill_ts=fill_ts,
                     fill_time_ms=fill_time_ms,
                     source="bingx_order_history",
@@ -2197,9 +2333,7 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                         },
                     )
                 else:
-                    log.warning(
-                        f"[{symbol}] TP telegram pending event_id={event_id}"
-                    )
+                    log.warning(f"[{symbol}] TP telegram pending event_id={event_id}")
             log.info(
                 f"[{symbol}] TP {leg} FILLED "
                 f"delta={delta_qty:.8f} total={executed_qty:.8f} "
@@ -2210,6 +2344,8 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
         ot["bingx"] = bx
         entry["open_trade"] = ot
     return changed
+
+
 def _detect_sl_exit(ot, sym):
     """Проверяет, не был ли LONG закрыт именно нашим биржевым STOP_LOSS.
     Возвращает (exit_reason, exit_price, exit_price_source) либо None,
@@ -2233,6 +2369,8 @@ def _detect_sl_exit(ot, sym):
         f"avg_price={order.get('avg_price')} time={order.get('time')}"
     )
     return "STOP_LOSS", order.get("avg_price"), "exchange_fill"
+
+
 def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_state):
     if not ENABLE_BINGX:
         return {"status": "skipped", "reason": "ENABLE_BINGX=false"}
@@ -2453,6 +2591,8 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
     )
     rec["status"] = "ok"
     return rec
+
+
 def _touch_state(ot, state, ts, score, reason):
     if state == ot.get("current_state"):
         return
@@ -2467,6 +2607,8 @@ def _touch_state(ot, state, ts, score, reason):
     )
     if STATE_RANK.get(state, 0) > STATE_RANK.get(ot.get("max_state"), 0):
         ot["max_state"] = state
+
+
 def _update_shadows(ot, ts, pnl_pct, strength):
     sh = ot.setdefault("shadow_stops", {str(l): None for l in SHADOW_STOP_LEVELS})
     if pnl_pct is not None:
@@ -2504,7 +2646,11 @@ def _retry_failed_exchange_tp(ot, symbol):
     if not ENABLE_BINGX:
         return False
     bx = ot.get("bingx") or {}
-    if bx.get("execution_status") not in ("TP_FAILED", "OPEN_NO_TP", "PROTECTION_EXCEPTION"):
+    if bx.get("execution_status") not in (
+        "TP_FAILED",
+        "OPEN_NO_TP",
+        "PROTECTION_EXCEPTION",
+    ):
         return False
     qty = safe(
         bx.get("qty_remaining"),
@@ -2517,14 +2663,12 @@ def _retry_failed_exchange_tp(ot, symbol):
     if not avg_price:
         avg_price = ot.get("entry_price")
     if qty <= 0 or not avg_price:
-        log.warning(
-            f"[{symbol}] TP_RETRY skipped: "
-            f"qty={qty} avg_price={avg_price}"
-        )
+        log.warning(f"[{symbol}] TP_RETRY skipped: " f"qty={qty} avg_price={avg_price}")
         return False
     trade_id = ot.get("trade_id_full")
     try:
         import bingx_client
+
         existing = bingx_client.get_existing_tp_legs(
             symbol,
             BINGX_TP_LEVELS,
@@ -2540,14 +2684,9 @@ def _retry_failed_exchange_tp(ot, symbol):
             bx["tp_orders"] = existing.get("orders", [])
             bx["execution_status"] = "TP_PLACED"
             ot["bingx"] = bx
-            log.info(
-                f"[{symbol}] TP_RETRY: all TP legs already exist"
-            )
+            log.info(f"[{symbol}] TP_RETRY: all TP legs already exist")
             return True
-        log.info(
-            f"[{symbol}] TP_RETRY: missing legs="
-            f"{existing.get('missing', [])}"
-        )
+        log.info(f"[{symbol}] TP_RETRY: missing legs=" f"{existing.get('missing', [])}")
         tp_result = bingx_client.place_take_profit_orders(
             symbol,
             avg_price,
@@ -2566,15 +2705,10 @@ def _retry_failed_exchange_tp(ot, symbol):
                 f"missing={existing.get('missing', [])}"
             )
             return True
-        log.error(
-            f"[{symbol}] TP_RETRY FAILED: "
-            f"{tp_result.get('error')}"
-        )
+        log.error(f"[{symbol}] TP_RETRY FAILED: " f"{tp_result.get('error')}")
         return False
     except Exception as e:
-        log.error(
-            f"[{symbol}] TP_RETRY exception: {e}"
-        )
+        log.error(f"[{symbol}] TP_RETRY exception: {e}")
         return False
 
 
@@ -2605,14 +2739,12 @@ def _retry_failed_exchange_sl(ot, symbol):
     if not avg_price:
         avg_price = ot.get("entry_price")
     if qty <= 0 or not avg_price:
-        log.warning(
-            f"[{symbol}] SL_RETRY skipped: "
-            f"qty={qty} avg_price={avg_price}"
-        )
+        log.warning(f"[{symbol}] SL_RETRY skipped: " f"qty={qty} avg_price={avg_price}")
         return False
     trade_id = ot.get("trade_id_full")
     try:
         import bingx_client
+
         # Сначала проверяем, может SL уже есть на бирже.
         existing = bingx_client.get_open_sl_orders(symbol)
         if existing.get("status") == "ok" and existing.get("count", 0) > 0:
@@ -2640,15 +2772,10 @@ def _retry_failed_exchange_sl(ot, symbol):
                 f"stop_price={sl_result.get('stop_price')}"
             )
             return True
-        log.error(
-            f"[{symbol}] SL_RETRY FAILED: "
-            f"{sl_result.get('error')}"
-        )
+        log.error(f"[{symbol}] SL_RETRY FAILED: " f"{sl_result.get('error')}")
         return False
     except Exception as e:
-        log.error(
-            f"[{symbol}] SL_RETRY exception: {e}"
-        )
+        log.error(f"[{symbol}] SL_RETRY exception: {e}")
         return False
 
 
@@ -2691,9 +2818,7 @@ def manage_open_trade(
         dq["last_price_observation"] = "scrape_incomplete"
         dq["last_price_observation_ts"] = ts
     elif not symbol_in_current_scrape:
-        dq["discovery_missing_count"] = (
-            dq.get("discovery_missing_count", 0) + 1
-        )
+        dq["discovery_missing_count"] = dq.get("discovery_missing_count", 0) + 1
         dq["last_price_observation"] = "discovery_missing"
         dq["last_price_observation_ts"] = ts
     else:
@@ -2705,7 +2830,10 @@ def manage_open_trade(
     dq["exit_price_age_min"] = price_age_min
     if state:
         _touch_state(
-            ot, state, ts, score,
+            ot,
+            state,
+            ts,
+            score,
             "state_transition",
         )
     _fill_horizons(ot, sym, ts, price_full)
@@ -2733,9 +2861,7 @@ def manage_open_trade(
         "EXHAUSTION": state == "EXHAUSTION",
         "DISTRIBUTION": state == "DISTRIBUTION",
         "STOP_LOSS": (
-            cur_price is not None
-            and pnl_pct is not None
-            and pnl_pct <= -STOP_LOSS_PCT
+            cur_price is not None and pnl_pct is not None and pnl_pct <= -STOP_LOSS_PCT
         ),
     }
     soft_conditions = {
@@ -2755,42 +2881,49 @@ def manage_open_trade(
         health_status = "WEAK"
     else:
         health_status = "HEALTHY"
-    health.update({
-        "version": POSITION_MANAGER_VERSION,
-        "last_check_ts": ts,
-        "status": health_status,
-        "state": state,
-        "score": score,
-        "strength": strength,
-        "age_min": age_min,
-        "signal_age_min": signal_age_min,
-        "price_age_min": price_age_min,
-        "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
-        "timeout_reached": timeout_reached,
-        "signal_decay": signal_decay,
-        "missed": missed,
-        "data_stale": data_stale,
-        "discovery_missing": discovery_missing,
-        "soft_conditions": soft_conditions,
-        "hard_candidates": hard_candidates,
-    })
-    try:
-        append_jsonl(EXECUTION_EVENTS_FILE, {
-            "ts": ts,
-            "symbol": sym,
-            "kind": "position_manager_decision",
-            "position_manager_version": POSITION_MANAGER_VERSION,
-            "trade_id": ot.get("trade_id_full"),
-            "decision_state": state,
+    health.update(
+        {
+            "version": POSITION_MANAGER_VERSION,
+            "last_check_ts": ts,
+            "status": health_status,
+            "state": state,
             "score": score,
-            "position_age_min": age_min,
+            "strength": strength,
+            "age_min": age_min,
             "signal_age_min": signal_age_min,
+            "price_age_min": price_age_min,
             "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
+            "timeout_reached": timeout_reached,
+            "signal_decay": signal_decay,
+            "missed": missed,
+            "data_stale": data_stale,
+            "discovery_missing": discovery_missing,
             "soft_conditions": soft_conditions,
             "hard_candidates": hard_candidates,
-            "health_status": health_status,
-            "decision": "PENDING_HARD_EXIT" if any(hard_candidates.values()) else "HOLD",
-        })
+        }
+    )
+    try:
+        append_jsonl(
+            EXECUTION_EVENTS_FILE,
+            {
+                "ts": ts,
+                "symbol": sym,
+                "kind": "position_manager_decision",
+                "position_manager_version": POSITION_MANAGER_VERSION,
+                "trade_id": ot.get("trade_id_full"),
+                "decision_state": state,
+                "score": score,
+                "position_age_min": age_min,
+                "signal_age_min": signal_age_min,
+                "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
+                "soft_conditions": soft_conditions,
+                "hard_candidates": hard_candidates,
+                "health_status": health_status,
+                "decision": (
+                    "PENDING_HARD_EXIT" if any(hard_candidates.values()) else "HOLD"
+                ),
+            },
+        )
     except Exception as e:
         log.error(f"[{sym}] position manager audit failed: {e}")
     close_reason, all_triggered = resolve_exit_reason(hard_candidates)
@@ -2809,9 +2942,12 @@ def manage_open_trade(
             f"signal_age={signal_age_min}m"
         )
     return None, [], None, None, False
+
+
 def run():
     log.info("═══ Прогон ═══")
     import bingx_client
+
     _ensure_stealth_available()
     _retry_pending_tp_notifications()
     wl_all = load_watchlist()
@@ -2871,8 +3007,14 @@ def run():
             continue
         ot.pop("pending_close")
         close_trade(
-            ot, sym, ts, pc["xprice"], pc["reason"], pc["exit_state"],
-            price_full, exit_price_source=pc["xsrc"],
+            ot,
+            sym,
+            ts,
+            pc["xprice"],
+            pc["reason"],
+            pc["exit_state"],
+            price_full,
+            exit_price_source=pc["xsrc"],
             exit_candidates=pc["triggered"],
             lifecycle_complete=pc["lifecycle_complete"],
             exchange_close_status=exch_status,
@@ -2971,9 +3113,7 @@ def run():
                     f"(state={entry['state']})"
                 )
         else:
-            log.info(
-                f"[{sym}] отсутствует в частичном scrape — missed_runs не меняем"
-            )
+            log.info(f"[{sym}] отсутствует в частичном scrape — missed_runs не меняем")
     for sym in list(wl_all.keys()):
         entry = wl_all[sym]
         ot = entry.get("open_trade")
@@ -3020,8 +3160,14 @@ def run():
                 save_watchlist(wl_all)
             else:
                 close_trade(
-                    ot, sym, ts, xprice, reason, exit_state,
-                    price_full, exit_price_source=xsrc,
+                    ot,
+                    sym,
+                    ts,
+                    xprice,
+                    reason,
+                    exit_state,
+                    price_full,
+                    exit_price_source=xsrc,
                     exit_candidates=triggered,
                     lifecycle_complete=complete,
                     exchange_close_status=exch_status,
@@ -3032,7 +3178,9 @@ def run():
                     rec["cooldown_until"] = ts + cd * 60
                     rec["last_exit_reason"] = reason
                     rec["last_exit_ts"] = ts
-                    rec.setdefault("idea_first_seen_ts", ot.get("idea_first_seen_ts") or ts)
+                    rec.setdefault(
+                        "idea_first_seen_ts", ot.get("idea_first_seen_ts") or ts
+                    )
                 entry.pop("open_trade", None)
                 entry.pop("trade_id", None)
                 log.info(f"[{sym}] CLOSE {reason} triggered={triggered} cooldown={cd}м")
@@ -3064,7 +3212,10 @@ def run():
                     log.info(f"[{sym}] {old}: NEUTRAL-оценка {nr}/{NEUTRAL_HYSTERESIS}")
                 else:
                     if old in ACTIVE_STATES:
-                        log.info( f"[{sym}] {old} → NEUTRAL " f"(снята: условия тренда не выполняются {nr} прогонов подряд)")
+                        log.info(
+                            f"[{sym}] {old} → NEUTRAL "
+                            f"(снята: условия тренда не выполняются {nr} прогонов подряд)"
+                        )
                     log.info(f"[{sym}] {old} → NEUTRAL, remove")
                     del wl_all[sym]
             elif has_trade:
@@ -3084,7 +3235,6 @@ def run():
             continue
         new_ot = existing.get("open_trade")
         new_tid = existing.get("trade_id")
-        # Без этого prev_state на следующем прогоне всегда читается как
         if not has_trade:
             wl_all[sym] = {
                 "state": state,
@@ -3145,7 +3295,10 @@ def run():
                 if ENABLE_BINGX and new_ot is not None:
                     try:
                         import bingx_client
-                        open_result = bingx_client.open_position(sym, sig["price"], trade_id=new_tid)
+
+                        open_result = bingx_client.open_position(
+                            sym, sig["price"], trade_id=new_tid
+                        )
                         if open_result.get("asset_class"):
                             new_ot["asset_class"] = open_result["asset_class"]
                         if open_result.get("symbol"):
@@ -3166,7 +3319,7 @@ def run():
                                 f"Сигнал есть, но на бирже уже есть чужая позиция.\n"
                                 f"<i>Вход пропущен для безопасности. Закрой старую позицию вручную.</i>"
                             )
-                         
+
                         elif open_status == "skipped":
                             new_ot["bingx"] = {
                                 "status": "skipped",
@@ -3210,8 +3363,13 @@ def run():
                             new_ot = None
                             new_tid = None
                         elif open_status == "error":
-                            new_ot["bingx"] = {"status": "error", "error": open_result.get("error")}
-                            log.error(f"[{sym}] BingX OPEN error: {open_result.get('error')}")
+                            new_ot["bingx"] = {
+                                "status": "error",
+                                "error": open_result.get("error"),
+                            }
+                            log.error(
+                                f"[{sym}] BingX OPEN error: {open_result.get('error')}"
+                            )
                             send_tg(
                                 f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                                 f"Сигнал есть, но открытие на бирже ЗАВЕРШИЛОСЬ ОШИБКОЙ:\n"
@@ -3252,7 +3410,9 @@ def run():
                             entry_temp["trade_id"] = new_tid
                             wl_all[sym] = entry_temp
                             save_watchlist(wl_all)
-                            log.info(f"[{sym}] Watchlist saved after OPEN (crash-safe point 1)")
+                            log.info(
+                                f"[{sym}] Watchlist saved after OPEN (crash-safe point 1)"
+                            )
                             if bx.get("protection_attempted"):
                                 log.warning(
                                     f"[{sym}] attach_protection ПОВТОРНЫЙ вызов заблокирован — "
@@ -3264,7 +3424,8 @@ def run():
                                     "tp_result": {"status": "skipped_duplicate_guard"},
                                     "tp_status": bx.get("execution_status", "UNKNOWN"),
                                     "tp_orders": bx.get("tp_orders", []),
-                                    "sl_result": bx.get("sl_order") or {"status": "skipped_duplicate_guard"},
+                                    "sl_result": bx.get("sl_order")
+                                    or {"status": "skipped_duplicate_guard"},
                                 }
                             else:
                                 bx["protection_attempted"] = True
@@ -3272,10 +3433,16 @@ def run():
                                 entry_temp["open_trade"] = new_ot
                                 wl_all[sym] = entry_temp
                                 save_watchlist(wl_all)
-                                log.info(f"[{sym}] protection_attempted=True сохранён (crash-safe point 2)")
+                                log.info(
+                                    f"[{sym}] protection_attempted=True сохранён (crash-safe point 2)"
+                                )
                                 protection = bingx_client.attach_protection(
-                                    sym, avg_price, position_qty, BINGX_TP_LEVELS, STOP_LOSS_PCT,
-                                    trade_id=new_tid
+                                    sym,
+                                    avg_price,
+                                    position_qty,
+                                    BINGX_TP_LEVELS,
+                                    STOP_LOSS_PCT,
+                                    trade_id=new_tid,
                                 )
                             bx["tp_orders"] = protection["tp_orders"]
                             bx["execution_status"] = protection["tp_status"]
@@ -3305,7 +3472,9 @@ def run():
                                 )
                             else:
                                 bx["sl_order"] = None
-                                log.error(f"[{sym}] SL НЕ установлен: {sl_result.get('error')}")
+                                log.error(
+                                    f"[{sym}] SL НЕ установлен: {sl_result.get('error')}"
+                                )
                                 send_tg(
                                     f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                                     f"TP установлены, но STOP_LOSS на бирже НЕ создан!\n"
@@ -3313,24 +3482,24 @@ def run():
                                     f"<i>Защита только программная (по факту прогона), риск гэпа выше 5%.</i>"
                                 )
                             new_ot["bingx"] = bx
-                                               
+
                     except Exception as e:
                         log.error(f"[{sym}] BingX OPEN exception: {e}")
-                    
+
                         # КРИТИЧНО:
                         # не уничтожаем уже сохранённое состояние реальной позиции.
                         bx = new_ot.setdefault("bingx", {})
-                    
+
                         bx["execution_status"] = "PROTECTION_EXCEPTION"
                         bx["protection_error"] = str(e)[:500]
-                    
+
                         try:
                             entry_temp = dict(existing)
                             entry_temp["open_trade"] = new_ot
                             entry_temp["trade_id"] = new_tid
                             wl_all[sym] = entry_temp
                             save_watchlist(wl_all)
-                    
+
                             log.info(
                                 f"[{sym}] BingX exception state сохранён без потери "
                                 f"данных открытой позиции"
@@ -3340,15 +3509,15 @@ def run():
                                 f"[{sym}] НЕ УДАЛОСЬ СОХРАНИТЬ состояние после BingX exception: "
                                 f"{save_exc}"
                             )
-                    
+
                         send_tg(
                             f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                             f"BingX: ошибка после открытия/при установке защиты.\n"
                             f"<code>{esc(str(e)[:300])}</code>\n"
                             f"<i>Состояние позиции НЕ сброшено. "
                             f"Требуется повторная проверка защиты.</i>"
-                        )    
-                
+                        )
+
                 log.info(
                     f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
                     f"strength={sig['strength']} window={sig['window']['span_min']}м"
@@ -3471,7 +3640,9 @@ def run():
             if entry.get("open_trade"):
                 continue
             if entry.get("missed_runs", 0) >= MISS_REMOVE_RUNS:
-                log.info(f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove")
+                log.info(
+                    f"[{sym}] нет в данных {entry['missed_runs']} прогонов → remove"
+                )
                 del wl_all[sym]
     else:
         log.warning(
@@ -3495,6 +3666,8 @@ def run():
     log.info(
         f"═══ Готово. Active: {len(wl_all)} · open trades: {open_n} · pending: {len(PENDING)} ═══"
     )
+
+
 def flush_pending(price_full, now, existing_trade_ids):
     global PENDING
     grace = PENDING_GRACE_MIN * 60
@@ -3549,6 +3722,8 @@ def flush_pending(price_full, now, existing_trade_ids):
         else:
             still.append(item)
     PENDING = still
+
+
 TG_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ACTIVE_STATES = {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"}
 ENTRY_STATES = {"CONFIRMED_TREND", "ACCELERATION"}
