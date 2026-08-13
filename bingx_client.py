@@ -1188,6 +1188,16 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
         "quantity": str(qty),
         "clientOrderId": client_order_id,
     }
+    log.info(
+        f"[{symbol}] OPEN DEBUG: "
+        f"bx={bx_symbol} price={price} "
+        f"margin={MARGIN_USDT} leverage={leverage} "
+        f"qty={qty} min_qty={min_qty} "
+        f"size={c.get('size')} multiplier={c.get('multiplier')} "
+        f"tradeMinUSDT={c.get('tradeMinUSDT')} "
+        f"quantityPrecision={c.get('quantityPrecision')} "
+        f"maxLongLeverage={c.get('maxLongLeverage')}"
+    )
     resp = _request("POST", ORDER_PATH, params)
     if resp.get("code") != 0:
         err_msg = str(resp.get("msg", "")).lower()
