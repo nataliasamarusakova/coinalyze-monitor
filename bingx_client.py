@@ -1278,6 +1278,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "status": "skipped",
             "reason": "api_open_disabled",
             "symbol": bx_symbol,
+            "asset_class": asset_class,
         }
 
     open_res = open_long(symbol, price, trade_id=trade_id)
