@@ -133,6 +133,46 @@ def _contracts() -> dict:
 
     return _CONTRACT_CACHE["data"]
 
+def get_contract(symbol: str) -> dict | None:
+    """
+    Найти контракт BingX по тикеру из Coinalyze.
+
+    Сначала ищем обычный API symbol:
+        CRV -> CRV-USDT
+
+    Затем ищем по displayName:
+        ORCL -> ORCL-USDT -> NCSKORCL2USD-USDT
+    """
+    s = (symbol or "").strip().upper()
+
+    if not s:
+        return None
+
+    # Учитываем существующий ручной SYMBOL_MAP.
+    if s in SYMBOL_MAP:
+        mapped = str(SYMBOL_MAP[s]).strip().upper()
+        if mapped:
+            contract = _contracts().get(mapped)
+            if contract:
+                return contract
+
+    s = s.replace("-", "")
+
+    if s.endswith("USDT"):
+        s = s[:-4]
+
+    target = f"{s}-USDT"
+
+    contracts = _contracts()
+
+    # 1. Обычные symbols, например CRV-USDT.
+    contract = contracts.get(target)
+    if contract:
+        return contract
+
+    # 2. TradFi: displayName=ORCL-USDT,
+    #    symbol=NCSKORCL2USD-USDT.
+    return _CONTRACT_CACHE["by_display_name"].get(target)
 
 def _normalize_orders_list(resp: dict) -> list:
     """Нормализация поля data из ответа BingX API.
