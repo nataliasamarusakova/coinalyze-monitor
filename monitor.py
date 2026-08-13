@@ -153,14 +153,7 @@ STATE_RANK = {
     "EXHAUSTION": 5,
     "DISTRIBUTION": 6,
 }
-EQUITY_SYMBOLS = {
-    "MSFT", "CRWV", "BE", "META", "AMZN", "NVDA", "CRWV", "AXTI", "PLTR",
-    "AVGO", "AAPL", "TSLA", "GOOGL", "MSTR", "COIN", "BZ", "DELL", "WDC",
-    "SAMSUNG", "LLY", "RKLB", "SPY", "SQQQ",
-}
-COMMODITY_SYMBOLS = {"CL", "XAU", "XAG"}
-EQUITY_HINTS = ("Inc", "Corp", "Technologies", "Platforms")
-COMMODITY_HINTS = ("Crude", "Oil", "Gold", "Silver")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -263,16 +256,6 @@ def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 def valid_price(p):
     return p is not None and p > 0
-def classify_asset_class(r):
-    sym = r.get("symbol", "")
-    name = r.get("name", "")
-    if sym in COMMODITY_SYMBOLS or any(h in name for h in COMMODITY_HINTS):
-        return "commodity"
-    if sym in EQUITY_SYMBOLS or any(h in name for h in EQUITY_HINTS):
-        return "equity"
-    if not sym:
-        return "unknown"
-    return "crypto"
 
 def price_at(price_full, sym, ts_target, max_lag_sec=None):
     idx = price_full.get(sym, [])
