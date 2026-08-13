@@ -1776,6 +1776,7 @@ def open_trade_record(
         ot[f"return_{h}m"] = None
         ot[f"return_{h}m_available"] = False
     return ot
+
 def _attempt_exchange_close(ot, symbol):
     """Безопасное полное закрытие exchange-позиции.
     Full close всегда требует:
@@ -1817,7 +1818,7 @@ def _attempt_exchange_close(ot, symbol):
         return "unconfirmed"
     ot["bingx_close"] = res
     status = res.get("status")
-    if status == "closed":
+    if status in ("closed", "already_closed"):
         bx["qty_remaining"] = 0.0
         bx["execution_status"] = "CLOSED_MANUAL"
         ot["bingx"] = bx
@@ -1855,10 +1856,12 @@ def _attempt_exchange_close(ot, symbol):
         f"Повторная попытка на следующем прогоне.</i>"
     )
     return "unconfirmed"
+
 def _exit_meta(source, exit_ts, last_price_ts):
     if source == "live" or last_price_ts is None:
         return source, 0.0
     return source, round(max(0, exit_ts - last_price_ts) / 60, 1)
+
 def close_trade(
     ot,
     symbol,
@@ -2838,21 +2841,6 @@ def run():
             continue
         ot = dict(ot)
         pc = ot["pending_close"]
-        # --------------------------------------------------------
-        # FULL CLOSE
-        # --------------------------------------------------------
-        # TP/SL cancellation safety централизована в:
-        #
-        # _attempt_exchange_close()
-        #     ↓
-        # bingx_client.close_long(cancel_tp=True)
-        #     ↓
-        # cancel_take_profit_orders() + cancel_stop_loss_orders()
-        #     ↓
-        # POST-CANCEL verification
-        #
-        # Здесь НЕ вызываем cancel_* отдельно.
-        # --------------------------------------------------------
         exch_status = _attempt_exchange_close(ot, sym)
         if exch_status == "unconfirmed":
             entry["open_trade"] = ot
@@ -2991,20 +2979,6 @@ def run():
                 xsrc = "unknown"
             complete = reason not in ("DATA_STALE", "MISSED")
             exit_state = (sig or {}).get("state") or entry.get("state", "UNKNOWN")
-            # --------------------------------------------------------
-            # FULL CLOSE
-            # --------------------------------------------------------
-            # Безопасность TP/SL централизована внутри:
-            #
-            # _attempt_exchange_close()
-            #     ↓
-            # bingx_client.close_long(cancel_tp=True)
-            #
-            # Если TP/SL не удалось безопасно удалить:
-            # close_long() вернёт "blocked",
-            # _attempt_exchange_close() вернёт "unconfirmed",
-            # и ниже будет создан pending_close.
-            # --------------------------------------------------------
             exch_status = _attempt_exchange_close(ot, sym)
             if exch_status == "unconfirmed":
                 ot["pending_close"] = {
