@@ -20,10 +20,6 @@ except Exception:
     SIGNAL_LOGIC_VERSION = 1
     TRADE_WIN_PCT = 1.0
 
-    def classify_asset_class(r):
-        return "crypto"
-
-
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY = BASE / "market_history.jsonl"
 WATCHLIST = BASE / "watchlist.json"
