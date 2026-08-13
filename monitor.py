@@ -3336,6 +3336,14 @@ def run():
                                 f"symbol={open_result.get('symbol')}"
                             )
                             reason = open_result.get("reason")
+                            blocked_before = bool(existing.get("bingx_entry_blocked", False))
+
+                            if reason in { "contract_not_found", "api_open_disabled", "contract_unavailable"}:
+                                existing["bingx_entry_blocked"] = True
+                                existing["bingx_entry_block_reason"] = reason
+                                existing["bingx_entry_block_symbol"] = open_result.get("symbol")
+                                existing["bingx_entry_blocked_ts"] = ts
+                                bingx_entry_blocked = True
 
                             if reason == "contract_not_found":
                                 skip_text = (
