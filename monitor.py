@@ -3993,19 +3993,27 @@ def run():
                         "warnings": sig["warnings"],
                         "mom_tags": sig["mom_tags"],
                     }
-                llm_res = llm_verify(sym, signal_wl, cur, hist)
-                msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market)
-                if llm_res:
-                    agree = "✅" if llm_res.get("agree") is True else "❌"
-                    msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
 
-                if has_trade and state in ENTRY_STATES:
-                    log.info(
-                        f"[{sym}] ENTRY Telegram suppressed: "
-                        f"open_trade already exists, trade_id={existing.get('trade_id')}"
-                    )
-                else:
+                should_send_tg = True
+                if state in ENTRY_STATES:
+                    if not entry.get("open_trade"):
+                        log.info(f"[{sym}] ENTRY Telegram suppressed: сделка не открыта (Quality Guard / Cooldown / Exchange block)")
+                        should_send_tg = False
+                    elif has_trade:
+                        log.info(
+                            f"[{sym}] ENTRY Telegram suppressed: "
+                            f"open_trade already exists, trade_id={existing.get('trade_id')}"
+                        )
+                        should_send_tg = False
+
+                if should_send_tg:
+                    llm_res = llm_verify(sym, signal_wl, cur, hist)
+                    msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market)
+                    if llm_res:
+                        agree = "✅" if llm_res.get("agree") is True else "❌"
+                        msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
                     send_tg(msg)
+                   
     if LAST_SCRAPE_COMPLETE:
         for sym in list(wl_all.keys()):
             entry = wl_all[sym]
