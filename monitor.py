@@ -3488,6 +3488,9 @@ def run():
                             "stop_loss_pct": adaptive_sl_pct,
                             "tp_levels": [dict(x) for x in adaptive_tp_levels],
                         }
+                        new_ot["bingx"] = {
+                            "protection": adaptive_protection,
+                        }
 
                         log.info(
                             f"[{sym}] Adaptive protection calculated: "
