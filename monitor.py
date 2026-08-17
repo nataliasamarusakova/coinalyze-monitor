@@ -24,6 +24,8 @@ except ImportError:
 from conditions import (
     check_confirmed_path_a,
     check_confirmed_path_b,
+    check_early_move,
+    check_accumulation,
     signal_strength,
     window_quality,
     shadow_variants,
@@ -112,7 +114,7 @@ ENGINE_VERSIONS = {
 }
 HASH_VERSION = "sha256_v1"
 TRADE_TIMEOUT_MIN = 240
-FEE_PCT = 0.0
+FEE_PCT = 0.10
 SIGNAL_DECAY_MIN = 90
 IDEA_REGISTRY_TTL_DAYS = 30
 TRADE_HORIZONS = [30, 60, 120, 240]
@@ -1415,7 +1417,7 @@ STATE_EMOJI = {
 ALLOWED_FROM = {
     "ACCUMULATION": {"NEUTRAL", "ACCUMULATION"},
     "EARLY_MOVE": {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE"},
-    "CONFIRMED_TREND": {"ACCUMULATION", "EARLY_MOVE", "CONFIRMED_TREND"},
+    "CONFIRMED_TREND": {"NEUTRAL", "ACCUMULATION", "EARLY_MOVE", "CONFIRMED_TREND"},
     "ACCELERATION": {"CONFIRMED_TREND", "ACCELERATION"},
     "EXHAUSTION": {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION"},
     "DISTRIBUTION": {"CONFIRMED_TREND", "ACCELERATION", "EXHAUSTION", "DISTRIBUTION"},
@@ -1517,34 +1519,16 @@ def detect_lifecycle(symbol, snaps, score, derived, prev_state="NEUTRAL"):
                 ("early" if is_early else "classic"),
             )
     if allowed("EARLY_MOVE") and n >= 3:
-        last3 = snaps[-3:]
-        price_up = all(
-            safe(last3[i].get("price_chg24")) > safe(last3[i - 1].get("price_chg24"))
-            for i in range(1, 3)
-        )
-        oi_up = all(
-            safe(last3[i].get("oi_chg24_pct")) > safe(last3[i - 1].get("oi_chg24_pct"))
-            for i in range(1, 3)
-        )
-        cvd_up = all(
-            safe(last3[i].get("cvd24")) > safe(last3[i - 1].get("cvd24")) - 3
-            for i in range(1, 3)
-        )
-        vol_up = all(
-            safe(last3[i].get("volume24")) > safe(last3[i - 1].get("volume24")) * 0.95
-            for i in range(1, 3)
-        )
-        if price_up and oi_up and cvd_up and vol_up:
+        res_em = check_early_move(snaps)
+        if res_em.get("passed"):
             reasons.append("3 снимка: Price↑ OI↑ CVD↑ Vol↑")
             return "EARLY_MOVE", reasons, warnings, None
     if allowed("ACCUMULATION") and n >= 3:
-        last3 = snaps[-3:]
-        oi4_pos = all(safe(s.get("oi_chg4h_pct")) > 0 for s in last3)
-        cvd_avg = sum(safe(s.get("cvd24")) for s in last3) / 3
-        fr_ok = all(
-            s.get("fr_oiw") is not None and s.get("fr_oiw") < 0.03 for s in last3
-        )
-        if oi4_pos and cvd_avg > 50 and pc < 5 and fr_ok:
+        res_acc = check_accumulation(snaps)
+        if res_acc.get("passed"):
+            last3 = snaps[-3:]
+            cvd_vals = [s.get("cvd24") for s in last3 if s.get("cvd24") is not None]
+            cvd_avg = sum(cvd_vals) / len(cvd_vals) if cvd_vals else 0.0
             reasons.append(f"OI4h>0 3 снимка, CVD avg={cvd_avg:.0f}>50, FR<0.03")
             reasons.append(f"Price={pc:.1f}%<5 — ещё не ушёл")
             return "ACCUMULATION", reasons, warnings, None
@@ -2208,6 +2192,16 @@ def close_trade(
     exchange_close_status="not_applicable",
 ):
     ep = ot.get("entry_price")
+    # Fallback на биржевую цену исполнения или последний известный снимок цены
+    if exit_price is None or exit_price_source == "unknown":
+        bx_close_avg = ot.get("bingx_close", {}).get("avg_price")
+        if bx_close_avg and bx_close_avg > 0:
+            exit_price = bx_close_avg
+            exit_price_source = "exchange_fill"
+        elif ot.get("last_price") and ot.get("last_price") > 0:
+            exit_price = ot.get("last_price")
+            exit_price_source = "last_seen_snapshot"
+
     _fill_horizons(ot, symbol, exit_ts, price_full)
     outcome_unknown = (exit_price is None) or (exit_price_source == "unknown")
 
@@ -2781,6 +2775,7 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         lrec["cooldown_until"] = ts + cd * 60
         lrec["last_exit_reason"] = exit_reason
         lrec["last_exit_ts"] = ts
+        lrec["last_exit_price"] = cur or ot.get("last_price")
         lrec.setdefault("idea_first_seen_ts", ot.get("idea_first_seen_ts") or ts)
         entry.pop("open_trade", None)
         entry.pop("trade_id", None)
@@ -3194,7 +3189,9 @@ def manage_open_trade(
             f"score={score} pnl={pnl_pct} age={age_min}m "
             f"signal_age={signal_age_min}m soft={soft_conditions}"
         )
-        return close_reason, all_triggered, cur_price, "live", False
+        x_price = cur_price if cur_price else ot.get("last_price")
+        x_src = "live" if cur_price else ("last_seen_snapshot" if ot.get("last_price") else "unknown")
+        return close_reason, all_triggered, x_price, x_src, False
     active_soft = [k for k, v in soft_conditions.items() if v]
     if active_soft:
         log.info(
@@ -3282,6 +3279,7 @@ def run():
         )
         cd = COOLDOWN_BY_EXIT_REASON.get(pc["reason"], 0)
         lrec = lifecycle_state.setdefault(sym, {})
+        lrec["last_exit_price"] = pc.get("xprice") or ot.get("last_price")
         if cd > 0:
             lrec["cooldown_until"] = ts + cd * 60
             lrec["last_exit_reason"] = pc["reason"]
@@ -3435,6 +3433,7 @@ def run():
                 )
                 cd = COOLDOWN_BY_EXIT_REASON.get(reason, 0)
                 rec = lifecycle_state.setdefault(sym, {})
+                rec["last_exit_price"] = xprice or ot.get("last_price")
                 if cd > 0:
                     rec["cooldown_until"] = ts + cd * 60
                     rec["last_exit_reason"] = reason
@@ -3540,10 +3539,21 @@ def run():
 
         if (new_ot is None and not bingx_entry_blocked and state in ENTRY_STATES and sig["price"] and entry_quality_ok):
             info = lifecycle_state.get(sym, {})
+            last_exit_p = info.get("last_exit_price")
+            last_exit_t = info.get("last_exit_ts", 0)
             if info.get("cooldown_until", 0) > ts:
                 left = round((info["cooldown_until"] - ts) / 60, 1)
                 log.info(
                     f"[{sym}] COOLDOWN {left}м (после {info.get('last_exit_reason')}), вход пропущен"
+                )
+            elif (
+                last_exit_p
+                and (ts - last_exit_t) < 180 * 60
+                and sig.get("price")
+                and sig["price"] > last_exit_p * 1.08
+            ):
+                log.info(
+                    f"[{sym}] CHURN GUARD: текущая цена {sig['price']} на >8% выше недавнего выхода ({last_exit_p}) за 180м, перезаход пропущен"
                 )
             else:
                 idea_ts = info.get("idea_first_seen_ts") or ts
