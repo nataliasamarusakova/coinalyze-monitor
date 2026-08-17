@@ -1192,6 +1192,90 @@ def cancel_stop_loss_orders(symbol: str) -> dict:
     }
 
 
+def update_stop_loss_order(
+    symbol: str,
+    new_stop_price: float,
+    qty: float,
+    trade_id: str = None,
+) -> dict:
+    """Обновить (затрейлить) биржевой STOP_LOSS.
+    Сначала отменяет старый SL ордер, затем выставляет новый по new_stop_price.
+    """
+    bx_symbol = to_bx_symbol(symbol)
+    if not new_stop_price or new_stop_price <= 0:
+        return {"status": "error", "error": "некорректный new_stop_price"}
+    
+    # 1. Отменить старые SL
+    cancel_res = cancel_stop_loss_orders(symbol)
+    if cancel_res.get("status") in ("error", "partial_or_failed"):
+        log.warning(
+            f"[{symbol}] update_stop_loss_order: отмена старых SL вернула "
+            f"{cancel_res.get('status')}: {cancel_res.get('error')}"
+        )
+
+    # 2. Выставить новый SL
+    c = _contracts().get(bx_symbol)
+    if not c:
+        return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
+    prec = int(c.get("quantityPrecision") or 0)
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
+    qty_r = _round_qty(qty, prec)
+    if qty_r <= 0 or (min_qty and qty_r < min_qty):
+        return {"status": "error", "error": f"qty={qty_r} < minQty={min_qty}"}
+
+    client_order_id = build_sl_client_order_id(trade_id)
+    params = {
+        "symbol": bx_symbol,
+        "side": "SELL",
+        "positionSide": "LONG",
+        "type": "STOP_MARKET",
+        "stopPrice": str(round(new_stop_price, 8)),
+        "quantity": str(qty_r),
+        "clientOrderId": client_order_id,
+    }
+    resp = _request("POST", ORDER_PATH, params)
+    if resp.get("code") == 0:
+        order = (resp.get("data") or {}).get("order") or {}
+        oid = str(order.get("orderId", ""))
+        _log_event(
+            {
+                "event": "sl_trailing_updated",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "order_id": oid,
+                "client_order_id": client_order_id,
+                "trade_id": trade_id,
+                "stop_price": new_stop_price,
+                "qty": qty_r,
+            }
+        )
+        log.info(
+            f"[{symbol}] Trailing SL обновлён: orderId={oid} stopPrice={new_stop_price:.6f} qty={qty_r}"
+        )
+        return {
+            "status": "created",
+            "order_id": oid,
+            "client_order_id": client_order_id,
+            "stop_price": new_stop_price,
+            "qty": qty_r,
+        }
+    err = f"code={resp.get('code')} msg={resp.get('msg')}"
+    _log_event(
+        {
+            "event": "sl_trailing_failed",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "client_order_id": client_order_id,
+            "trade_id": trade_id,
+            "error": err,
+            "stop_price": new_stop_price,
+            "qty": qty_r,
+        }
+    )
+    log.error(f"[{symbol}] Trailing SL failed: {err}")
+    return {"status": "error", "error": err}
+
+
 # ============================================================
 # FILL DETECTION HELPERS (чистые функции, без side-effects
 # на журналы/telegram/watchlist — это забота monitor.py)
