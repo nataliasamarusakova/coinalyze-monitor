@@ -1745,21 +1745,15 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
     fund_press = cur.get("entry_funding_oi_pressure")
     liq_int = cur.get("entry_liquidation_intensity")
     fr_z = cur.get("entry_fr_oiw_zscore")
-    research_parts = []
-    if regime is not None:
-        research_parts.append(f"Regime: {esc(regime)}")
-    if liq_share is not None:
-        research_parts.append(f"ShortLiq%: {liq_share:.2%}")
-    if liq_imb is not None:
-        research_parts.append(f"LiqImb: {liq_imb:+.3f}")
-    if fund_press is not None:
-        research_parts.append(f"FR·OI pressure: {fund_press:.5f}")
-    if liq_int is not None:
-        research_parts.append(f"LiqInt: {liq_int:.5f}")
-    if fr_z is not None:
-        research_parts.append(f"FR z-score: {fr_z:+.2f}")
-    if research_parts:
-        msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
+    research_parts = [
+        f"Regime: {esc(regime) if regime is not None else '-'}",
+        f"ShortLiq%: {liq_share:.2%}" if liq_share is not None else "ShortLiq%: -",
+        f"LiqImb: {liq_imb:+.3f}" if liq_imb is not None else "LiqImb: -",
+        f"FR·OI pressure: {fund_press:.5f}" if fund_press is not None else "FR·OI pressure: -",
+        f"LiqInt: {liq_int:.5f}" if liq_int is not None else "LiqInt: -",
+        f"FR z-score: {fr_z:+.2f}" if fr_z is not None else "FR z-score: -",
+    ]
+    msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
 
 
@@ -1799,21 +1793,15 @@ def format_trade_close(rec):
     fund_press = rec.get("entry_funding_oi_pressure")
     liq_int = rec.get("entry_liquidation_intensity")
     fr_z = rec.get("entry_fr_oiw_zscore")
-    research_parts = []
-    if regime is not None:
-        research_parts.append(f"Regime: {esc(regime)}")
-    if liq_share is not None:
-        research_parts.append(f"ShortLiq%: {liq_share:.2%}")
-    if liq_imb is not None:
-        research_parts.append(f"LiqImb: {liq_imb:+.3f}")
-    if fund_press is not None:
-        research_parts.append(f"FR·OI: {fund_press:.5f}")
-    if liq_int is not None:
-        research_parts.append(f"LiqInt: {liq_int:.5f}")
-    if fr_z is not None:
-        research_parts.append(f"FR z: {fr_z:+.2f}")
-    if research_parts:
-        msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
+    research_parts = [
+        f"Regime: {esc(regime) if regime is not None else '-'}",
+        f"ShortLiq%: {liq_share:.2%}" if liq_share is not None else "ShortLiq%: -",
+        f"LiqImb: {liq_imb:+.3f}" if liq_imb is not None else "LiqImb: -",
+        f"FR·OI pressure: {fund_press:.5f}" if fund_press is not None else "FR·OI pressure: -",
+        f"LiqInt: {liq_int:.5f}" if liq_int is not None else "LiqInt: -",
+        f"FR z-score: {fr_z:+.2f}" if fr_z is not None else "FR z-score: -",
+    ]
+    msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
 
 
@@ -2580,12 +2568,7 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                             bx["protection"]["current_stop_price"] = target_sl_price
                         log.info(
                             f"[{symbol}] Trailing Stop обновлен: {target_sl_price:.6f} ({sl_label})"
-                        )
-                        send_tg(
-                            f"🛡️ <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b>\n"
-                            f"Trailing Stop установлен: <b>{fmt_price(target_sl_price)}</b>\n"
-                            f"<i>Уровень: {sl_label}</i>"
-                        )
+                        ) 
         bx["tp_fills"] = processed_fills
         ot["bingx"] = bx
         entry["open_trade"] = ot
