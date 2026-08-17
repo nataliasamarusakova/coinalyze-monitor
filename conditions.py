@@ -411,11 +411,11 @@ def _closest_fail(result):
 # Считается каждый прогон, на решения НЕ влияет. Пишется в shadow_signals.jsonl.
 # ═══════════════════════════════════════════════════════════════════════════
 SHADOW_VARIANTS=(
-    ("live",      dict(kofn=False, dense=False, net=False)),  # текущий боевой = v1
-    ("kofn",      dict(kofn=True,  dense=False, net=False)),  # И1
-    ("dense",     dict(kofn=False, dense=True,  net=False)),  # И3
+    ("live",      dict(kofn=True,  dense=True,  net=True)),   # текущий боевой = v3
+    ("v1_legacy", dict(kofn=False, dense=False, net=False)),  # устаревший v1
+    ("kofn_only", dict(kofn=True,  dense=False, net=False)),  # только И1
+    ("dense_only",dict(kofn=False, dense=True,  net=False)),  # только И3
     ("kofn_dense",dict(kofn=True,  dense=True,  net=False)),  # И1+И3
-    ("net",       dict(kofn=True,  dense=True,  net=True)),   # И1+И3+И2
 )
 
 def shadow_variants(snaps, cvd_momentum):
