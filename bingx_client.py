@@ -640,11 +640,60 @@ def place_take_profit_orders(
     Atomic rollback при partial failure.
     """
     if tp_levels is None:
-        tp_levels = [
-            {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.25},
-            {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
-            {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
-        ]
+        return {
+            "status": "error",
+            "error": "tp_levels must be explicitly supplied",
+            "orders": [],
+        }
+
+    if not isinstance(tp_levels, list) or len(tp_levels) != 3:
+        return {
+            "status": "error",
+            "error": "tp_levels must contain exactly 3 levels",
+            "orders": [],
+        }
+
+    expected_legs = {"tp1", "tp2", "tp3"}
+    actual_legs = {
+        str(tp.get("leg"))
+        for tp in tp_levels
+        if isinstance(tp, dict)
+    }
+
+    if actual_legs != expected_legs:
+        return {
+            "status": "error",
+            "error": (
+                f"invalid TP legs: expected={sorted(expected_legs)} "
+                f"got={sorted(actual_legs)}"
+            ),
+            "orders": [],
+        }
+
+    for tp in tp_levels:
+        try:
+            pnl_pct = float(tp.get("pnl_pct"))
+            close_fraction = float(tp.get("close_fraction"))
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "error": f"invalid TP definition: {tp}",
+                "orders": [],
+            }
+
+        if pnl_pct <= 0:
+            return {
+                "status": "error",
+                "error": f"TP pnl_pct must be > 0: {pnl_pct}",
+                "orders": [],
+            }
+
+        if close_fraction <= 0 or close_fraction >= 1:
+            return {
+                "status": "error",
+                "error": f"TP close_fraction invalid: {close_fraction}",
+                "orders": [],
+            }
     bx_symbol = to_bx_symbol(symbol)
     existing_check = get_existing_tp_legs(symbol, tp_levels, trade_id=trade_id)
     if existing_check.get("all_present"):
@@ -973,6 +1022,19 @@ def place_stop_loss_order(
     bx_symbol = to_bx_symbol(symbol)
     if not avg_price or avg_price <= 0:
         return {"status": "error", "error": "некорректная avg_price"}
+    try:
+        stop_loss_pct = float(stop_loss_pct)
+    except (TypeError, ValueError):
+        return {
+            "status": "error",
+            "error": f"invalid stop_loss_pct={stop_loss_pct}",
+        }
+
+    if not (0 < stop_loss_pct <= 25):
+        return {
+            "status": "error",
+            "error": f"stop_loss_pct out of safe range: {stop_loss_pct}",
+        }
     c = _contracts().get(bx_symbol)
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
