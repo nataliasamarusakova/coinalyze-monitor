@@ -3518,253 +3518,253 @@ def run():
                         try:
                             import bingx_client
 
-                        open_result = bingx_client.open_position(sym, sig["price"], trade_id=new_tid)
-                        if open_result.get("asset_class"):
-                            new_ot["asset_class"] = open_result["asset_class"]
-                        if open_result.get("symbol"):
-                            new_ot["bingx_symbol"] = open_result["symbol"]
-                        open_status = open_result.get("status")
-                        if open_status == "foreign_position":
-                            
-                            new_ot["bingx"] = {
-                                "status": "skipped",
-                                "reason": "foreign_position",
-                                "symbol": open_result.get("symbol"),
-                            }
-                            
-                            log.warning(
-                                f"[{sym}] BingX SKIP: existing position NOT owned by this trade. "
-                                f"Refusing to adopt foreign position."
-                            )
-                            
-                            send_tg(
-                                f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                f"Сигнал есть, но на бирже уже есть чужая позиция.\n"
-                                f"<i>Вход пропущен для безопасности. Закрой старую позицию вручную.</i>"
-                            )
-                            
-                            new_ot = None
-                            new_tid = None
+                            open_result = bingx_client.open_position(sym, sig["price"], trade_id=new_tid)
+                            if open_result.get("asset_class"):
+                                new_ot["asset_class"] = open_result["asset_class"]
+                            if open_result.get("symbol"):
+                                new_ot["bingx_symbol"] = open_result["symbol"]
+                            open_status = open_result.get("status")
+                            if open_status == "foreign_position":
+                                
+                                new_ot["bingx"] = {
+                                    "status": "skipped",
+                                    "reason": "foreign_position",
+                                    "symbol": open_result.get("symbol"),
+                                }
+                                
+                                log.warning(
+                                    f"[{sym}] BingX SKIP: existing position NOT owned by this trade. "
+                                    f"Refusing to adopt foreign position."
+                                )
+                                
+                                send_tg(
+                                    f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                                    f"Сигнал есть, но на бирже уже есть чужая позиция.\n"
+                                    f"<i>Вход пропущен для безопасности. Закрой старую позицию вручную.</i>"
+                                )
+                                
+                                new_ot = None
+                                new_tid = None
 
-                            existing["bingx_entry_blocked"] = True
-                            existing["bingx_entry_block_reason"] = "foreign_position"
-                            existing["bingx_entry_block_symbol"] = open_result.get("symbol")
-                            existing["bingx_entry_blocked_ts"] = ts
-                            bingx_entry_blocked = True
-
-                        elif open_status == "skipped":
-                            new_ot["bingx"] = {
-                                "status": "skipped",
-                                "reason": open_result.get("reason"),
-                                "symbol": open_result.get("symbol"),
-                            }
-                            log.info(
-                                f"[{sym}] BingX SKIP: "
-                                f"reason={open_result.get('reason')} "
-                                f"symbol={open_result.get('symbol')}"
-                            )
-                            reason = open_result.get("reason")
-                            
-                            if reason in { "contract_not_found", "api_open_disabled", "contract_unavailable"}:
                                 existing["bingx_entry_blocked"] = True
-                                existing["bingx_entry_block_reason"] = reason
+                                existing["bingx_entry_block_reason"] = "foreign_position"
                                 existing["bingx_entry_block_symbol"] = open_result.get("symbol")
                                 existing["bingx_entry_blocked_ts"] = ts
                                 bingx_entry_blocked = True
 
-                            if reason == "contract_not_found":
-                                skip_text = (
-                                    f"Сигнал есть, но контракт "
-                                    f"{esc(str(open_result.get('symbol')))} не найден на BingX."
-                                )
-                            elif reason == "api_open_disabled":
-                                skip_text = (
-                                    f"Сигнал есть, но BingX сейчас запрещает открытие "
-                                    f"позиции по контракту {esc(str(open_result.get('symbol')))}."
-                                )
-                            elif reason == "contract_unavailable":
-                                skip_text = (
-                                    f"Сигнал есть, но контракт "
-                                    f"{esc(str(open_result.get('symbol')))} сейчас недоступен для торговли."
-                                )
-                            else:
-                                skip_text = (
-                                    f"Сигнал есть, но биржевой вход пропущен: "
-                                    f"{esc(str(reason or 'unknown'))}."
-                                )
-
-                            send_tg(
-                                f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                f"{skip_text}\n"
-                                f"<i>Позиция открыта только как research-идея, без реального ордера. "
-                                f"Retry не предусмотрен для этой причины.</i>"
-                            )
-                            new_ot = None
-                            new_tid = None
-                        elif open_status == "error":
-                            new_ot["bingx"] = {
-                                "status": "error",
-                                "error": open_result.get("error"),
-                            }
-                            log.error(
-                                f"[{sym}] BingX OPEN error: {open_result.get('error')}"
-                            )
-                            send_tg(
-                                f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                f"Сигнал есть, но открытие на бирже ЗАВЕРШИЛОСЬ ОШИБКОЙ:\n"
-                                f"<code>{esc(str(open_result.get('error'))[:200])}</code>\n"
-                                f"<i>Позиция открыта только как research-идея, без реального ордера. "
-                                f"Retry на следующем прогоне не предусмотрен — если сигнал ещё "
-                                f"актуален на следующем прогоне, вход не повторится, потому что "
-                                f"open_trade уже создан. Проверьте вручную.</i>"
-                            )
-                            new_ot = None
-                            new_tid = None
-                        elif open_status == "open_no_tp":
-                            bx = dict(open_result.get("open", {}))
-                            bx["qty_initial"] = open_result.get("qty_initial")
-                            bx["qty_remaining"] = open_result.get("qty_remaining")
-                            bx["partial_legs_done"] = []
-                            bx["tp_orders"] = []
-                            bx["execution_status"] = "OPEN_NO_TP"
-                            bx["protection"] = {
-                                "logic_version": PROTECTION_LOGIC_VERSION,
-                                "source": "adaptive_volatility",
-                                "stop_loss_pct": adaptive_sl_pct,
-                                "tp_levels": [dict(x) for x in adaptive_tp_levels],
-                            }
-                            if open_result.get("qty_initial_uncertain"):
-                                bx["qty_initial_uncertain"] = True
-                            new_ot["bingx"] = bx
-                        elif open_status == "found":
-                            bx = dict(open_result.get("open", {}))
-                            avg_price = open_result.get("avg_price")
-                            position_qty = open_result.get("qty_initial")
-                            bx["bingx_avg_price"] = avg_price
-                            bx["qty_initial"] = position_qty
-                            bx["qty_remaining"] = position_qty
-                            bx["partial_legs_done"] = []
-                            bx["execution_status"] = "OPEN"
-                            bx["protection"] = {
-                                "logic_version": PROTECTION_LOGIC_VERSION,
-                                "source": "adaptive_volatility",
-                                "stop_loss_pct": adaptive_sl_pct,
-                                "tp_levels": [dict(x) for x in adaptive_tp_levels],
-                            }
-                            new_ot["bingx"] = bx
-                            entry_temp = dict(existing)
-                            entry_temp["open_trade"] = new_ot
-                            entry_temp["trade_id"] = new_tid
-                            wl_all[sym] = entry_temp
-                            save_watchlist(wl_all)
-                            log.info(
-                                f"[{sym}] Watchlist saved after OPEN (crash-safe point 1)"
-                            )
-                            if bx.get("protection_attempted"):
-                                log.warning(
-                                    f"[{sym}] attach_protection ПОВТОРНЫЙ вызов заблокирован — "
-                                    f"protection_attempted уже True. Это симптом бага "
-                                    f"(повторный проход блока открытия для уже открытой "
-                                    f"сделки). TP/SL НЕ создаются повторно."
-                                )
-                                protection = {
-                                    "tp_result": {"status": "skipped_duplicate_guard"},
-                                    "tp_status": bx.get("execution_status", "UNKNOWN"),
-                                    "tp_orders": bx.get("tp_orders", []),
-                                    "sl_result": bx.get("sl_order")
-                                    or {"status": "skipped_duplicate_guard"},
+                            elif open_status == "skipped":
+                                new_ot["bingx"] = {
+                                    "status": "skipped",
+                                    "reason": open_result.get("reason"),
+                                    "symbol": open_result.get("symbol"),
                                 }
-                            else:
-                                bx["protection_attempted"] = True
-                                new_ot["bingx"] = bx
-                                entry_temp["open_trade"] = new_ot
-                                wl_all[sym] = entry_temp
-                                save_watchlist(wl_all)
                                 log.info(
-                                    f"[{sym}] protection_attempted=True сохранён (crash-safe point 2)"
+                                    f"[{sym}] BingX SKIP: "
+                                    f"reason={open_result.get('reason')} "
+                                    f"symbol={open_result.get('symbol')}"
                                 )
-                                protection = bingx_client.attach_protection(
-                                    sym,
-                                    avg_price,
-                                    position_qty,
-                                    adaptive_tp_levels,
-                                    adaptive_sl_pct,
-                                    trade_id=new_tid,
-                                )
-                            bx["tp_orders"] = protection["tp_orders"]
-                            bx["execution_status"] = protection["tp_status"]
-                            new_ot["bingx"] = bx
+                                reason = open_result.get("reason")
+                                
+                                if reason in { "contract_not_found", "api_open_disabled", "contract_unavailable"}:
+                                    existing["bingx_entry_blocked"] = True
+                                    existing["bingx_entry_block_reason"] = reason
+                                    existing["bingx_entry_block_symbol"] = open_result.get("symbol")
+                                    existing["bingx_entry_blocked_ts"] = ts
+                                    bingx_entry_blocked = True
 
-                            if protection["tp_status"] == "TP_PLACED":
-                                log.info(
-                                    f"[{sym}] BingX OPEN qty={position_qty} avgPrice={avg_price:.6f} "
-                                    f"TP: {len(bx['tp_orders'])} уровней"
-                                )
-                            else:
-                                log.error(
-                                    f"[{sym}] TP не созданы: {protection['tp_result'].get('error')}"
-                                )
+                                if reason == "contract_not_found":
+                                    skip_text = (
+                                        f"Сигнал есть, но контракт "
+                                        f"{esc(str(open_result.get('symbol')))} не найден на BingX."
+                                    )
+                                elif reason == "api_open_disabled":
+                                    skip_text = (
+                                        f"Сигнал есть, но BingX сейчас запрещает открытие "
+                                        f"позиции по контракту {esc(str(open_result.get('symbol')))}."
+                                    )
+                                elif reason == "contract_unavailable":
+                                    skip_text = (
+                                        f"Сигнал есть, но контракт "
+                                        f"{esc(str(open_result.get('symbol')))} сейчас недоступен для торговли."
+                                    )
+                                else:
+                                    skip_text = (
+                                        f"Сигнал есть, но биржевой вход пропущен: "
+                                        f"{esc(str(reason or 'unknown'))}."
+                                    )
+
                                 send_tg(
                                     f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                    f"Позиция открыта, но TP не созданы!\n"
-                                    f"Error: {esc(str(protection['tp_result'].get('error'))[:200])}\n"
-                                    f"<i>Позиция остается открытой. Retry в следующем прогоне.</i>"
+                                    f"{skip_text}\n"
+                                    f"<i>Позиция открыта только как research-идея, без реального ордера. "
+                                    f"Retry не предусмотрен для этой причины.</i>"
                                 )
-                            sl_result = protection["sl_result"]
-                            if sl_result.get("status") == "created":
-                                bx["sl_order"] = sl_result
-                                log.info(
-                                    f"[{sym}] SL установлен на бирже: "
-                                    f"stop={sl_result.get('stop_price'):.6f}"
-                                )
-                            else:
-                                bx["sl_order"] = None
+                                new_ot = None
+                                new_tid = None
+                            elif open_status == "error":
+                                new_ot["bingx"] = {
+                                    "status": "error",
+                                    "error": open_result.get("error"),
+                                }
                                 log.error(
-                                    f"[{sym}] SL НЕ установлен: {sl_result.get('error')}"
+                                    f"[{sym}] BingX OPEN error: {open_result.get('error')}"
                                 )
                                 send_tg(
                                     f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                    f"TP установлены, но STOP_LOSS на бирже НЕ создан!\n"
-                                    f"Error: {esc(str(sl_result.get('error'))[:200])}\n"
-                                    f"<i>Защита только программная до успешного восстановления "
-                                    f"exchange SL. Риск гэпа выше уровня adaptive SL.</i>"
+                                    f"Сигнал есть, но открытие на бирже ЗАВЕРШИЛОСЬ ОШИБКОЙ:\n"
+                                    f"<code>{esc(str(open_result.get('error'))[:200])}</code>\n"
+                                    f"<i>Позиция открыта только как research-идея, без реального ордера. "
+                                    f"Retry на следующем прогоне не предусмотрен — если сигнал ещё "
+                                    f"актуален на следующем прогоне, вход не повторится, потому что "
+                                    f"open_trade уже создан. Проверьте вручную.</i>"
                                 )
-                            new_ot["bingx"] = bx
+                                new_ot = None
+                                new_tid = None
+                            elif open_status == "open_no_tp":
+                                bx = dict(open_result.get("open", {}))
+                                bx["qty_initial"] = open_result.get("qty_initial")
+                                bx["qty_remaining"] = open_result.get("qty_remaining")
+                                bx["partial_legs_done"] = []
+                                bx["tp_orders"] = []
+                                bx["execution_status"] = "OPEN_NO_TP"
+                                bx["protection"] = {
+                                    "logic_version": PROTECTION_LOGIC_VERSION,
+                                    "source": "adaptive_volatility",
+                                    "stop_loss_pct": adaptive_sl_pct,
+                                    "tp_levels": [dict(x) for x in adaptive_tp_levels],
+                                }
+                                if open_result.get("qty_initial_uncertain"):
+                                    bx["qty_initial_uncertain"] = True
+                                new_ot["bingx"] = bx
+                            elif open_status == "found":
+                                bx = dict(open_result.get("open", {}))
+                                avg_price = open_result.get("avg_price")
+                                position_qty = open_result.get("qty_initial")
+                                bx["bingx_avg_price"] = avg_price
+                                bx["qty_initial"] = position_qty
+                                bx["qty_remaining"] = position_qty
+                                bx["partial_legs_done"] = []
+                                bx["execution_status"] = "OPEN"
+                                bx["protection"] = {
+                                    "logic_version": PROTECTION_LOGIC_VERSION,
+                                    "source": "adaptive_volatility",
+                                    "stop_loss_pct": adaptive_sl_pct,
+                                    "tp_levels": [dict(x) for x in adaptive_tp_levels],
+                                }
+                                new_ot["bingx"] = bx
+                                entry_temp = dict(existing)
+                                entry_temp["open_trade"] = new_ot
+                                entry_temp["trade_id"] = new_tid
+                                wl_all[sym] = entry_temp
+                                save_watchlist(wl_all)
+                                log.info(
+                                    f"[{sym}] Watchlist saved after OPEN (crash-safe point 1)"
+                                )
+                                if bx.get("protection_attempted"):
+                                    log.warning(
+                                        f"[{sym}] attach_protection ПОВТОРНЫЙ вызов заблокирован — "
+                                        f"protection_attempted уже True. Это симптом бага "
+                                        f"(повторный проход блока открытия для уже открытой "
+                                        f"сделки). TP/SL НЕ создаются повторно."
+                                    )
+                                    protection = {
+                                        "tp_result": {"status": "skipped_duplicate_guard"},
+                                        "tp_status": bx.get("execution_status", "UNKNOWN"),
+                                        "tp_orders": bx.get("tp_orders", []),
+                                        "sl_result": bx.get("sl_order")
+                                        or {"status": "skipped_duplicate_guard"},
+                                    }
+                                else:
+                                    bx["protection_attempted"] = True
+                                    new_ot["bingx"] = bx
+                                    entry_temp["open_trade"] = new_ot
+                                    wl_all[sym] = entry_temp
+                                    save_watchlist(wl_all)
+                                    log.info(
+                                        f"[{sym}] protection_attempted=True сохранён (crash-safe point 2)"
+                                    )
+                                    protection = bingx_client.attach_protection(
+                                        sym,
+                                        avg_price,
+                                        position_qty,
+                                        adaptive_tp_levels,
+                                        adaptive_sl_pct,
+                                        trade_id=new_tid,
+                                    )
+                                bx["tp_orders"] = protection["tp_orders"]
+                                bx["execution_status"] = protection["tp_status"]
+                                new_ot["bingx"] = bx
 
-                    except Exception as e:
-                        log.error(f"[{sym}] BingX OPEN exception: {e}")
+                                if protection["tp_status"] == "TP_PLACED":
+                                    log.info(
+                                        f"[{sym}] BingX OPEN qty={position_qty} avgPrice={avg_price:.6f} "
+                                        f"TP: {len(bx['tp_orders'])} уровней"
+                                    )
+                                else:
+                                    log.error(
+                                        f"[{sym}] TP не созданы: {protection['tp_result'].get('error')}"
+                                    )
+                                    send_tg(
+                                        f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                                        f"Позиция открыта, но TP не созданы!\n"
+                                        f"Error: {esc(str(protection['tp_result'].get('error'))[:200])}\n"
+                                        f"<i>Позиция остается открытой. Retry в следующем прогоне.</i>"
+                                    )
+                                sl_result = protection["sl_result"]
+                                if sl_result.get("status") == "created":
+                                    bx["sl_order"] = sl_result
+                                    log.info(
+                                        f"[{sym}] SL установлен на бирже: "
+                                        f"stop={sl_result.get('stop_price'):.6f}"
+                                    )
+                                else:
+                                    bx["sl_order"] = None
+                                    log.error(
+                                        f"[{sym}] SL НЕ установлен: {sl_result.get('error')}"
+                                    )
+                                    send_tg(
+                                        f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                                        f"TP установлены, но STOP_LOSS на бирже НЕ создан!\n"
+                                        f"Error: {esc(str(sl_result.get('error'))[:200])}\n"
+                                        f"<i>Защита только программная до успешного восстановления "
+                                        f"exchange SL. Риск гэпа выше уровня adaptive SL.</i>"
+                                    )
+                                new_ot["bingx"] = bx
 
-                        # КРИТИЧНО:
-                        # не уничтожаем уже сохранённое состояние реальной позиции.
-                        bx = new_ot.setdefault("bingx", {})
+                        except Exception as e:
+                            log.error(f"[{sym}] BingX OPEN exception: {e}")
 
-                        bx["execution_status"] = "PROTECTION_EXCEPTION"
-                        bx["protection_error"] = str(e)[:500]
+                            # КРИТИЧНО:
+                            # не уничтожаем уже сохранённое состояние реальной позиции.
+                            bx = new_ot.setdefault("bingx", {})
 
-                        try:
-                            entry_temp = dict(existing)
-                            entry_temp["open_trade"] = new_ot
-                            entry_temp["trade_id"] = new_tid
-                            wl_all[sym] = entry_temp
-                            save_watchlist(wl_all)
+                            bx["execution_status"] = "PROTECTION_EXCEPTION"
+                            bx["protection_error"] = str(e)[:500]
 
-                            log.info(
-                                f"[{sym}] BingX exception state сохранён без потери "
-                                f"данных открытой позиции"
+                            try:
+                                entry_temp = dict(existing)
+                                entry_temp["open_trade"] = new_ot
+                                entry_temp["trade_id"] = new_tid
+                                wl_all[sym] = entry_temp
+                                save_watchlist(wl_all)
+
+                                log.info(
+                                    f"[{sym}] BingX exception state сохранён без потери "
+                                    f"данных открытой позиции"
+                                )
+                            except Exception as save_exc:
+                                log.critical(
+                                    f"[{sym}] НЕ УДАЛОСЬ СОХРАНИТЬ состояние после BingX exception: "
+                                    f"{save_exc}"
+                                )
+
+                            send_tg(
+                                f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                                f"BingX: ошибка после открытия/при установке защиты.\n"
+                                f"<code>{esc(str(e)[:300])}</code>\n"
+                                f"<i>Состояние позиции НЕ сброшено. "
+                                f"Требуется повторная проверка защиты.</i>"
                             )
-                        except Exception as save_exc:
-                            log.critical(
-                                f"[{sym}] НЕ УДАЛОСЬ СОХРАНИТЬ состояние после BingX exception: "
-                                f"{save_exc}"
-                            )
-
-                        send_tg(
-                            f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                            f"BingX: ошибка после открытия/при установке защиты.\n"
-                            f"<code>{esc(str(e)[:300])}</code>\n"
-                            f"<i>Состояние позиции НЕ сброшено. "
-                            f"Требуется повторная проверка защиты.</i>"
-                        )
 
                 log.info(
                     f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
