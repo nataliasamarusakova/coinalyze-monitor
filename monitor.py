@@ -72,11 +72,11 @@ LEGACY_BINGX_TP_LEVELS = [
 ]
 
 LEGACY_STOP_LOSS_PCT = 5.0
-PROTECTION_LOGIC_VERSION = 1
+PROTECTION_LOGIC_VERSION = 2
 STOP_MODE = "adaptive_volatility" 
 
 ALLOW_NO_STEALTH = os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true"
-MARKET_TTL_DAYS = 2
+MARKET_TTL_DAYS = 14
 SNAPSHOTS_TTL_DAYS = 7
 HEARTBEAT_TTL_DAYS = 3
 LIFECYCLE_WINDOW_MIN = 90
@@ -85,18 +85,18 @@ MISS_EXIT_RUNS = 2
 MISS_REMOVE_RUNS = 4
 NEUTRAL_HYSTERESIS = 2
 TRADE_SCHEMA_VERSION = 4
-SIGNAL_LOGIC_VERSION = 2
-LIFECYCLE_ENGINE_VERSION = 3
-POSITION_MANAGER_VERSION = 1
+SIGNAL_LOGIC_VERSION = 3
+LIFECYCLE_ENGINE_VERSION = 4
+POSITION_MANAGER_VERSION = 2
 HARD_EXIT_REASONS = {
     "EXCHANGE_CLOSED",
     "INVALIDATED",
     "EXHAUSTION",
     "DISTRIBUTION",
     "STOP_LOSS",
+    "TIMEOUT",
 }
 SOFT_POSITION_REASONS = {
-    "TIMEOUT",
     "SIGNAL_DECAY",
     "MISSED",
     "DATA_STALE",
@@ -107,7 +107,7 @@ ENGINE_VERSIONS = {
     "signal": SIGNAL_LOGIC_VERSION,
     "lifecycle": LIFECYCLE_ENGINE_VERSION,
     "protection": PROTECTION_LOGIC_VERSION,
-    "created": "2026-08-05",
+    "created": "2026-08-17",
     "conditions": CONDITIONS_CONFIG,
 }
 HASH_VERSION = "sha256_v1"
@@ -140,6 +140,7 @@ COOLDOWN_BY_EXIT_REASON = {
     "DISTRIBUTION": 60,
     "EXHAUSTION": 45,
     "EXCHANGE_CLOSED": 60,
+    "TIMEOUT": 30,
 }
 PROTECTION_REASONS = {"STOP_LOSS"}
 EXIT_PRIORITY = [
@@ -148,6 +149,7 @@ EXIT_PRIORITY = [
     "EXHAUSTION",
     "DISTRIBUTION",
     "STOP_LOSS",
+    "TIMEOUT",
 ]
 EXIT_CLASS = {
     "EXCHANGE_CLOSED": "EXTERNAL",
@@ -1098,26 +1100,23 @@ def passes_filter(r):
     oi4 = r.get("oi_chg4h_pct")
     cvd = r.get("cvd24")
     lls = r.get("lls24")
-    oim = r.get("oi_mktcap_ratio")
     oiv = r.get("oi_vol_ratio")
     fr = r.get("fr_oiw")
-    if v is None or v <= 1_000_000:
+    if v is None or v <= 500_000:
         return False
-    if pc is None or pc < 1.0 or pc > 15.0:
+    if pc is None or pc < 0.5 or pc > 15.0:
         return False
-    if oi is None or oi <= 5.0 or oi >= 50.0:
+    if oi is None or oi <= 2.0 or oi >= 50.0:
         return False
     if oi4 is None or oi4 <= 0:
         return False
-    if cvd is None or cvd <= 55:
+    if cvd is None or cvd <= 50:
         return False
     if lls is None or lls >= 40:
         return False
-    if oim is None or oim >= 0.15:
+    if oiv is None or oiv < 0.05 or oiv > 3.0:
         return False
-    if oiv is None or oiv < 0.1 or oiv > 2.5:
-        return False
-    if fr is not None and fr > 0.05:
+    if fr is not None and fr > 0.08:
         return False
     return True
 
@@ -1169,13 +1168,17 @@ def calculate_score(r):
         if -0.01 <= fr <= 0.03:
             score += 1
             pros.append(f"FR={fr:.4f}")
-        elif fr > 0.05:
+        elif fr > 0.06:
             score -= 2
-            cons.append(f"FR={fr:.4f}>0.05")
+            cons.append(f"FR={fr:.4f}>0.06")
     oim = r.get("oi_mktcap_ratio")
-    if oim is not None and oim < 0.10:
-        score += 1
-        pros.append(f"OI/Mc={oim:.3f}")
+    if oim is not None:
+        if oim >= 0.15:
+            score += 2
+            pros.append(f"OI/Mc={oim:.3f}>=0.15")
+        elif oim >= 0.05:
+            score += 1
+            pros.append(f"OI/Mc={oim:.3f}")
     return score, pros, cons
 
 
@@ -2207,11 +2210,42 @@ def close_trade(
     ep = ot.get("entry_price")
     _fill_horizons(ot, symbol, exit_ts, price_full)
     outcome_unknown = (exit_price is None) or (exit_price_source == "unknown")
-    gross = (
-        round((exit_price - ep) / ep * 100, 3)
-        if (exit_price and ep and not outcome_unknown)
-        else None
-    )
+
+    # Volume-weighted realized PnL accounting for partial TP fills on BingX
+    bx = ot.get("bingx") or {}
+    tpf = bx.get("tp_fills") or {}
+    qty_initial = safe(bx.get("qty_initial"), safe(bx.get("qty"), 0.0))
+    tp_orders = {str(o.get("order_id")): o for o in bx.get("tp_orders", [])}
+
+    if tpf and qty_initial and qty_initial > 0 and ep and ep > 0:
+        realized_weighted_pnl = 0.0
+        total_closed_qty = 0.0
+        for oid, filled_qty in tpf.items():
+            o = tp_orders.get(str(oid))
+            tp_price = o.get("price") if o else None
+            if not tp_price and o and o.get("pnl_pct"):
+                tp_price = ep * (1.0 + o["pnl_pct"] / 100.0)
+            if tp_price:
+                leg_pnl = (tp_price - ep) / ep * 100.0
+                realized_weighted_pnl += (filled_qty / qty_initial) * leg_pnl
+                total_closed_qty += filled_qty
+
+        rem_fraction = max(0.0, 1.0 - (total_closed_qty / qty_initial))
+        if exit_price and ep and not outcome_unknown:
+            rem_pnl = (exit_price - ep) / ep * 100.0
+            realized_weighted_pnl += rem_fraction * rem_pnl
+            gross = round(realized_weighted_pnl, 3)
+        elif total_closed_qty > 0:
+            gross = round(realized_weighted_pnl, 3)
+        else:
+            gross = None
+    else:
+        gross = (
+            round((exit_price - ep) / ep * 100, 3)
+            if (exit_price and ep and not outcome_unknown)
+            else None
+        )
+
     max_pnl = ot.get("max_pnl_pct", 0.0)
     min_pnl = ot.get("min_pnl_pct", 0.0)
     peak_ts = ot.get("peak_ts", ot["entry_ts"])
@@ -2512,6 +2546,52 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 f"remaining={qty_remaining:.8f} time={fill_time_text}"
             )
             changed = True
+
+            # Trailing Stop Loss on BingX after TP fill
+            if qty_remaining > 0 and entry_price and entry_price > 0:
+                prot_info = bx.get("protection") or {}
+                tp_lvls = prot_info.get("tp_levels") or LEGACY_BINGX_TP_LEVELS
+                tp_dict = {lvl.get("leg"): lvl.get("pnl_pct", 3.0) for lvl in tp_lvls}
+
+                all_filled_legs = {leg}
+                for fid in processed_fills:
+                    for o in bx.get("tp_orders", []):
+                        if str(o.get("order_id")) == str(fid):
+                            all_filled_legs.add(o.get("leg"))
+
+                target_sl_price = None
+                sl_label = ""
+                if "tp3" in all_filled_legs:
+                    target_pct = tp_dict.get("tp2", 6.0)
+                    target_sl_price = entry_price * (1.0 + target_pct / 100.0)
+                    sl_label = f"Locked TP2 (+{target_pct:.1f}%)"
+                elif "tp2" in all_filled_legs:
+                    target_pct = tp_dict.get("tp1", 3.0)
+                    target_sl_price = entry_price * (1.0 + target_pct / 100.0)
+                    sl_label = f"Locked TP1 (+{target_pct:.1f}%)"
+                elif "tp1" in all_filled_legs:
+                    target_sl_price = entry_price * 1.001
+                    sl_label = "Breakeven (+0.1%)"
+
+                cur_sl_order = bx.get("sl_order") or {}
+                cur_sl_price = float(cur_sl_order.get("stop_price") or 0.0)
+
+                if target_sl_price and target_sl_price > cur_sl_price:
+                    trail_res = bingx_client.update_stop_loss_order(
+                        symbol, target_sl_price, qty_remaining, trade_id=trade_id
+                    )
+                    if trail_res.get("status") == "created":
+                        bx["sl_order"] = trail_res
+                        if isinstance(bx.get("protection"), dict):
+                            bx["protection"]["current_stop_price"] = target_sl_price
+                        log.info(
+                            f"[{symbol}] Trailing Stop обновлен: {target_sl_price:.6f} ({sl_label})"
+                        )
+                        send_tg(
+                            f"🛡️ <b>{esc(ot.get('name', symbol))} ({esc(symbol)})</b>\n"
+                            f"Trailing Stop установлен: <b>{fmt_price(target_sl_price)}</b>\n"
+                            f"<i>Уровень: {sl_label}</i>"
+                        )
         bx["tp_fills"] = processed_fills
         ot["bingx"] = bx
         entry["open_trade"] = ot
@@ -3029,17 +3109,24 @@ def manage_open_trade(
     )
     missed = missed_runs >= MISS_REMOVE_RUNS
     protection_sl_pct, _, protection_source = get_trade_protection(ot)
+    bx_sl = (ot.get("bingx") or {}).get("sl_order") or {}
+    stop_p = bx_sl.get("stop_price")
+    if stop_p and ep and ep > 0:
+        is_sl_hit = (cur_price is not None and cur_price <= stop_p)
+    else:
+        is_sl_hit = (
+            cur_price is not None and pnl_pct is not None and pnl_pct <= -protection_sl_pct
+        )
+
     hard_candidates = {
         "EXCHANGE_CLOSED": False,
         "INVALIDATED": state == "INVALIDATED",
         "EXHAUSTION": state == "EXHAUSTION",
         "DISTRIBUTION": state == "DISTRIBUTION",
-        "STOP_LOSS": (
-            cur_price is not None and pnl_pct is not None and pnl_pct <= -protection_sl_pct
-        ),
+        "STOP_LOSS": is_sl_hit,
+        "TIMEOUT": timeout_reached,
     }
     soft_conditions = {
-        "TIMEOUT": timeout_reached,
         "SIGNAL_DECAY": signal_decay,
         "MISSED": missed,
         "DATA_STALE": data_stale,
@@ -3436,7 +3523,22 @@ def run():
                 "bingx_entry_block_symbol": existing.get("bingx_entry_block_symbol"),
             }
             existing = wl_all[sym]
-        if (new_ot is None and not bingx_entry_blocked and state in ENTRY_STATES and sig["price"]):
+
+        # Quality Entry Guards to prevent buying momentum exhaustion tops (>15%) or falling assets
+        entry_pc24 = safe(r.get("price_chg24"), 0.0)
+        entry_lls = safe(r.get("lls24"), 0.0)
+        entry_vol = safe(r.get("volume24"), 0.0)
+        entry_quality_ok = (
+            0.5 <= entry_pc24 <= 15.0
+            and entry_lls < 40.0
+            and (entry_vol >= 500_000 or entry_vol == 0.0)
+        )
+        if not entry_quality_ok and state in ENTRY_STATES and new_ot is None:
+            log.info(
+                f"[{sym}] ENTRY BLOCKED BY QUALITY GUARD: price_chg24={entry_pc24:.1f}% lls24={entry_lls:.1f} vol={entry_vol}"
+            )
+
+        if (new_ot is None and not bingx_entry_blocked and state in ENTRY_STATES and sig["price"] and entry_quality_ok):
             info = lifecycle_state.get(sym, {})
             if info.get("cooldown_until", 0) > ts:
                 left = round((info["cooldown_until"] - ts) / 60, 1)
