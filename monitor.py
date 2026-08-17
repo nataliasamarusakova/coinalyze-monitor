@@ -7,6 +7,8 @@ from bisect import bisect_right
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import requests
+from statistics import median
+
 
 try:
     from playwright_stealth import stealth_sync
@@ -60,11 +62,18 @@ COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
 
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
 # TP levels are for real-time position management only and do not affect PnL calculation.
-BINGX_TP_LEVELS = [
+# Adaptive protection is used for NEW BingX positions.
+# These legacy values are retained ONLY for already-open positions
+# created before adaptive protection was introduced.
+LEGACY_BINGX_TP_LEVELS = [
     {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.25},
     {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
     {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
 ]
+
+LEGACY_STOP_LOSS_PCT = 5.0
+PROTECTION_LOGIC_VERSION = 1
+STOP_MODE = "adaptive_volatility" 
 
 ALLOW_NO_STEALTH = os.environ.get("ALLOW_NO_STEALTH", "false").lower() == "true"
 MARKET_TTL_DAYS = 2
@@ -97,14 +106,13 @@ ENGINE_VERSIONS = {
     "schema": TRADE_SCHEMA_VERSION,
     "signal": SIGNAL_LOGIC_VERSION,
     "lifecycle": LIFECYCLE_ENGINE_VERSION,
+    "protection": PROTECTION_LOGIC_VERSION,
     "created": "2026-08-05",
     "conditions": CONDITIONS_CONFIG,
 }
 HASH_VERSION = "sha256_v1"
 TRADE_TIMEOUT_MIN = 240
 FEE_PCT = 0.0
-STOP_MODE = "fixed"
-STOP_LOSS_PCT = 5.0
 SIGNAL_DECAY_MIN = 90
 IDEA_REGISTRY_TTL_DAYS = 30
 TRADE_HORIZONS = [30, 60, 120, 240]
@@ -297,6 +305,170 @@ def clamp(val, lo, hi):
 def valid_price(p):
     return p is not None and p > 0
 
+def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
+    """
+    Dynamic SL + 3 TP levels based on volatility of the current symbol.
+
+    No symbol lists.
+    No external requests.
+    Uses:
+      - absolute 24h price movement as a slow volatility component;
+      - observed price range from monitor history as a local component.
+
+    Output:
+      (stop_loss_pct, tp_levels)
+    """
+
+    try:
+        pc24 = abs(float(r.get("price_chg24") or 0.0))
+    except (TypeError, ValueError):
+        pc24 = 0.0
+
+    prices = []
+
+    for snap in snaps or []:
+        try:
+            price = float(snap.get("price"))
+        except (TypeError, ValueError):
+            continue
+
+        if price > 0:
+            prices.append(price)
+
+    # Make sure current price is included.
+    try:
+        current_price = float(r.get("price"))
+    except (TypeError, ValueError):
+        current_price = 0.0
+
+    if current_price > 0:
+        if not prices or prices[-1] != current_price:
+            prices.append(current_price)
+
+    # We need either:
+    #   - enough local observations, or
+    #   - a usable 24h move.
+    if len(prices) < 3 and pc24 <= 0:
+        raise ValueError(
+            f"insufficient volatility data: "
+            f"prices={len(prices)} price_chg24={pc24}"
+        )
+
+    # Slow volatility component.
+    base_vol = pc24 / 4.0
+
+    # Local observed range.
+    #
+    # IMPORTANT:
+    # use median(prices), not min(prices).
+    # Using min() artificially inflates range after a downward move.
+    if len(prices) >= 3:
+        reference_price = median(prices)
+
+        if reference_price > 0:
+            window_range_pct = (
+                (max(prices) - min(prices))
+                / reference_price
+            ) * 100.0
+
+            base_vol = max(
+                base_vol,
+                window_range_pct * 1.5,
+            )
+
+    # Base step.
+    #
+    # LOW volatility cannot collapse below 1%.
+    # EXTREME volatility cannot make the base step exceed 7%.
+    step = max(1.0, min(base_vol, 7.0))
+
+    # Final TP levels are capped independently.
+    tp1 = round(min(step, 7.0), 2)
+    tp2 = round(min(step * 2.2, 15.0), 2)
+    tp3 = round(min(step * 4.0, 28.0), 2)
+
+    # Slightly wider SL than TP1 for lower-volatility instruments.
+    # At the extreme cap:
+    #   TP1 = 7%
+    #   SL  = 7%
+    sl_pct = round(
+        min(max(tp1 * 1.2, 1.2), 7.0),
+        2,
+    )
+
+    if not (0 < tp1 < tp2 < tp3):
+        raise ValueError(
+            f"invalid adaptive TP sequence: "
+            f"{tp1}, {tp2}, {tp3}"
+        )
+
+    if not (0 < sl_pct <= 7.0):
+        raise ValueError(
+            f"invalid adaptive SL: {sl_pct}"
+        )
+
+    # Preserve existing lifecycle:
+    # 25% / 25% / 25%, with existing 25% runner untouched.
+    tp_levels = [
+        {
+            "leg": "tp1",
+            "pnl_pct": tp1,
+            "close_fraction": 0.25,
+        },
+        {
+            "leg": "tp2",
+            "pnl_pct": tp2,
+            "close_fraction": 0.25,
+        },
+        {
+            "leg": "tp3",
+            "pnl_pct": tp3,
+            "close_fraction": 0.25,
+        },
+    ]
+
+    return sl_pct, tp_levels
+
+def get_trade_protection(ot: dict) -> tuple[float, list[dict], str]:
+    """
+    Return protection parameters belonging to THIS position.
+
+    New adaptive positions:
+        ot["bingx"]["protection"]
+
+    Old positions created before adaptive protection:
+        legacy 5% SL + 3/6/9 TP.
+
+    Never recalculate protection for an already-open position.
+    """
+
+    bx = ot.get("bingx") or {}
+    protection = bx.get("protection")
+
+    if isinstance(protection, dict):
+        try:
+            sl_pct = float(protection["stop_loss_pct"])
+            tp_levels = protection["tp_levels"]
+
+            if (
+                sl_pct > 0
+                and isinstance(tp_levels, list)
+                and len(tp_levels) == 3
+            ):
+                return (
+                    sl_pct,
+                    [dict(x) for x in tp_levels],
+                    "adaptive",
+                )
+        except (TypeError, ValueError, KeyError):
+            pass
+
+    # Existing position created before adaptive protection.
+    return (
+        LEGACY_STOP_LOSS_PCT,
+        [dict(x) for x in LEGACY_BINGX_TP_LEVELS],
+        "legacy",
+    )
 
 def price_at(price_full, sym, ts_target, max_lag_sec=None):
     idx = price_full.get(sym, [])
@@ -2668,10 +2840,10 @@ def _retry_failed_exchange_tp(ot, symbol):
     trade_id = ot.get("trade_id_full")
     try:
         import bingx_client
-
+        _, tp_levels, protection_source = get_trade_protection(ot)
         existing = bingx_client.get_existing_tp_legs(
             symbol,
-            BINGX_TP_LEVELS,
+            tp_levels,
             trade_id=trade_id,
         )
         if existing.get("status") == "error":
@@ -2691,7 +2863,7 @@ def _retry_failed_exchange_tp(ot, symbol):
             symbol,
             avg_price,
             qty,
-            BINGX_TP_LEVELS,
+            tp_levels,
             trade_id=trade_id,
         )
         status = tp_result.get("status")
@@ -2742,6 +2914,7 @@ def _retry_failed_exchange_sl(ot, symbol):
         log.warning(f"[{symbol}] SL_RETRY skipped: " f"qty={qty} avg_price={avg_price}")
         return False
     trade_id = ot.get("trade_id_full")
+    sl_pct, _, protection_source = get_trade_protection(ot)
     try:
         import bingx_client
 
@@ -2761,7 +2934,7 @@ def _retry_failed_exchange_sl(ot, symbol):
             symbol,
             avg_price,
             qty,
-            STOP_LOSS_PCT,
+            sl_pct,
             trade_id=trade_id,
         )
         if sl_result.get("status") == "created":
@@ -2855,13 +3028,14 @@ def manage_open_trade(
         and price_age_min >= PRICE_STALE_EXIT_MIN
     )
     missed = missed_runs >= MISS_REMOVE_RUNS
+    protection_sl_pct, _, protection_source = get_trade_protection(ot)
     hard_candidates = {
         "EXCHANGE_CLOSED": False,
         "INVALIDATED": state == "INVALIDATED",
         "EXHAUSTION": state == "EXHAUSTION",
         "DISTRIBUTION": state == "DISTRIBUTION",
         "STOP_LOSS": (
-            cur_price is not None and pnl_pct is not None and pnl_pct <= -STOP_LOSS_PCT
+            cur_price is not None and pnl_pct is not None and pnl_pct <= -protection_sl_pct
         ),
     }
     soft_conditions = {
@@ -3296,13 +3470,55 @@ def run():
                 )
                 new_ot["trade_id_full"] = new_tid
                 new_ot["opened_ts"] = ts
+                                
                 if ENABLE_BINGX and new_ot is not None:
+                    # --------------------------------------------------------
+                    # ADAPTIVE PROTECTION MUST BE CALCULATED BEFORE OPEN.
+                    # Если расчёт не удался — реальную позицию не открываем.
+                    # --------------------------------------------------------
                     try:
-                        import bingx_client
-
-                        open_result = bingx_client.open_position(
-                            sym, sig["price"], trade_id=new_tid
+                        adaptive_sl_pct, adaptive_tp_levels = compute_adaptive_tp_sl(
+                            r,
+                            sig["hist"],
                         )
+
+                        adaptive_protection = {
+                            "logic_version": PROTECTION_LOGIC_VERSION,
+                            "source": "adaptive_volatility",
+                            "stop_loss_pct": adaptive_sl_pct,
+                            "tp_levels": [dict(x) for x in adaptive_tp_levels],
+                        }
+
+                        log.info(
+                            f"[{sym}] Adaptive protection calculated: "
+                            f"SL={adaptive_sl_pct:.2f}% "
+                            f"TP="
+                            f"{adaptive_tp_levels[0]['pnl_pct']:.2f}/"
+                            f"{adaptive_tp_levels[1]['pnl_pct']:.2f}/"
+                            f"{adaptive_tp_levels[2]['pnl_pct']:.2f}"
+                        )
+
+                    except Exception as e:
+                        log.error(
+                            f"[{sym}] Adaptive TP/SL calculation failed: {e}"
+                        )
+
+                        send_tg(
+                            f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                            f"BingX DEMO вход пропущен.\n"
+                            f"Adaptive TP/SL не удалось рассчитать:\n"
+                            f"<code>{esc(str(e)[:250])}</code>\n"
+                            f"<i>Реальная позиция не открывалась.</i>"
+                        )
+
+                        new_ot = None
+                        new_tid = None
+
+                    if new_ot is not None:
+                        try:
+                            import bingx_client
+
+                        open_result = bingx_client.open_position(sym, sig["price"], trade_id=new_tid)
                         if open_result.get("asset_class"):
                             new_ot["asset_class"] = open_result["asset_class"]
                         if open_result.get("symbol"):
@@ -3411,6 +3627,12 @@ def run():
                             bx["partial_legs_done"] = []
                             bx["tp_orders"] = []
                             bx["execution_status"] = "OPEN_NO_TP"
+                            bx["protection"] = {
+                                "logic_version": PROTECTION_LOGIC_VERSION,
+                                "source": "adaptive_volatility",
+                                "stop_loss_pct": adaptive_sl_pct,
+                                "tp_levels": [dict(x) for x in adaptive_tp_levels],
+                            }
                             if open_result.get("qty_initial_uncertain"):
                                 bx["qty_initial_uncertain"] = True
                             new_ot["bingx"] = bx
@@ -3423,6 +3645,12 @@ def run():
                             bx["qty_remaining"] = position_qty
                             bx["partial_legs_done"] = []
                             bx["execution_status"] = "OPEN"
+                            bx["protection"] = {
+                                "logic_version": PROTECTION_LOGIC_VERSION,
+                                "source": "adaptive_volatility",
+                                "stop_loss_pct": adaptive_sl_pct,
+                                "tp_levels": [dict(x) for x in adaptive_tp_levels],
+                            }
                             new_ot["bingx"] = bx
                             entry_temp = dict(existing)
                             entry_temp["open_trade"] = new_ot
@@ -3459,8 +3687,8 @@ def run():
                                     sym,
                                     avg_price,
                                     position_qty,
-                                    BINGX_TP_LEVELS,
-                                    STOP_LOSS_PCT,
+                                    adaptive_tp_levels,
+                                    adaptive_sl_pct,
                                     trade_id=new_tid,
                                 )
                             bx["tp_orders"] = protection["tp_orders"]
@@ -3498,7 +3726,8 @@ def run():
                                     f"🚨 <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                                     f"TP установлены, но STOP_LOSS на бирже НЕ создан!\n"
                                     f"Error: {esc(str(sl_result.get('error'))[:200])}\n"
-                                    f"<i>Защита только программная (по факту прогона), риск гэпа выше 5%.</i>"
+                                    f"<i>Защита только программная до успешного восстановления "
+                                    f"exchange SL. Риск гэпа выше уровня adaptive SL.</i>"
                                 )
                             new_ot["bingx"] = bx
 
