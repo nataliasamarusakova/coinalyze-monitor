@@ -1567,6 +1567,23 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "open": open_res,
         }
     if status not in ("opened", "already_open"):
+        # Проверяем, не открылась ли позиция на бирже, несмотря на ошибку/таймаут ответа
+        pos_check = get_position(symbol)
+        if pos_check.get("status") == "found" and float(pos_check.get("positionAmt", 0) or 0) > 0:
+            log.warning(
+                f"[{symbol}] open_long вернул статус {status} ({open_res.get('error')}), "
+                f"но позиция найдена на бирже (qty={pos_check.get('positionAmt')}). Безопасно подхватываем."
+            )
+            return {
+                "status": "found",
+                "symbol": bx_symbol,
+                "asset_class": asset_class,
+                "open": open_res,
+                "position": pos_check,
+                "avg_price": pos_check.get("avgPrice"),
+                "qty_initial": float(pos_check.get("positionAmt")),
+                "qty_remaining": float(pos_check.get("positionAmt")),
+            }
         return {
             "status": "error",
             "error": open_res.get("error"),
@@ -1719,22 +1736,28 @@ def close_long(
         float(qty),
         client_order_id,
         trade_id,
+        is_full_close=cancel_tp,
     )
 
 
 def _close_position(
-    bx_symbol: str, qty: float, client_order_id: str = None, trade_id: str = None
+    bx_symbol: str,
+    qty: float,
+    client_order_id: str = None,
+    trade_id: str = None,
+    is_full_close: bool = False,
 ) -> dict:
     real_amt = _position_amt(bx_symbol)
-    if qty > real_amt:
-        if real_amt <= 0:
-            return {
-                "status": "already_closed",
-                "error": f"нет LONG позиции для {bx_symbol}",
-            }
-        log.warning(
-            f"[{bx_symbol}] qty={qty} > real_amt={real_amt} — ограничиваем до {real_amt}"
-        )
+    if real_amt <= 0:
+        return {
+            "status": "already_closed",
+            "error": f"нет LONG позиции для {bx_symbol}",
+        }
+    if is_full_close or qty > real_amt:
+        if abs(qty - real_amt) > 1e-12:
+            log.info(
+                f"[{bx_symbol}] Full close: корректируем qty {qty} → real_amt {real_amt}"
+            )
         qty = real_amt
     c = _contracts().get(bx_symbol)
     if c:
@@ -1786,6 +1809,7 @@ def _close_position(
     if resp.get("code") == 0:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
+        avg_p = float(order.get("avgPrice") or order.get("price") or 0.0) or None
         _log_event(
             {
                 "event": "close",
@@ -1793,9 +1817,16 @@ def _close_position(
                 "order_id": oid,
                 "qty": qty,
                 "trade_id": trade_id,
+                "avg_price": avg_p,
             }
         )
-        return {"status": "closed", "order_id": oid, "qty": qty, "symbol": bx_symbol}
+        return {
+            "status": "closed",
+            "order_id": oid,
+            "qty": qty,
+            "symbol": bx_symbol,
+            "avg_price": avg_p,
+        }
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
     _log_event(
         {
