@@ -1717,10 +1717,10 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
     liq_int = cur.get("entry_liquidation_intensity")
     fr_z = cur.get("entry_fr_oiw_zscore")
     research_parts = [
-        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
+        *([ f"FR·OI: {fund_press:.5f}"] if fund_press is not None else []),
         *([ f"LiqImb: {liq_imb:+.3f}"] if liq_imb is not None else []),
-        *([ f"FR·OI pressure: {fund_press:.5f}"] if fund_press is not None else []),
         *([ f"LiqInt: {liq_int:.5f}"] if liq_int is not None else []),
+        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
         *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
     msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
@@ -1763,10 +1763,10 @@ def format_trade_close(rec):
     liq_int = rec.get("entry_liquidation_intensity")
     fr_z = rec.get("entry_fr_oiw_zscore")
     research_parts = [
-        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
+        *([ f"FR·OI: {fund_press:.5f}"] if fund_press is not None else []),
         *([ f"LiqImb: {liq_imb:+.3f}"] if liq_imb is not None else []),
-        *([ f"FR·OI pressure: {fund_press:.5f}"] if fund_press is not None else []),
         *([ f"LiqInt: {liq_int:.5f}"] if liq_int is not None else []),
+        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
         *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
     msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
