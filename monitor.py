@@ -290,16 +290,18 @@ def valid_price(p):
 
 def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
     """
-    Dynamic SL + 3 TP levels based on volatility of the current symbol.
+    Adaptive protection for NEW LONG positions.
 
-    No symbol lists.
-    No external requests.
-    Uses:
-      - absolute 24h price movement as a slow volatility component;
-      - observed price range from monitor history as a local component.
+    Model:
+      - volatility = max(24h component, robust local range);
+      - SL is the single risk unit R;
+      - TP levels are expressed as multiples of R;
+      - stronger OI/CVD/LLS continuation widens the TP ladder;
+      - one global TP3 cap preserves the ladder geometry;
+      - 10% / 15% / 35% + 40% runner.
 
-    Output:
-      (stop_loss_pct, tp_levels)
+    Protection is calculated once before opening a position.
+    Existing positions must keep their already stored protection.
     """
 
     try:
@@ -318,99 +320,147 @@ def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
         if price > 0:
             prices.append(price)
 
-    # Make sure current price is included.
     try:
-        current_price = float(r.get("price"))
+        current_price = float(r.get("price") or 0.0)
     except (TypeError, ValueError):
         current_price = 0.0
 
-    if current_price > 0:
-        if not prices or prices[-1] != current_price:
-            prices.append(current_price)
+    if current_price > 0 and (not prices or prices[-1] != current_price):
+        prices.append(current_price)
 
-    # We need either:
-    #   - enough local observations, or
-    #   - a usable 24h move.
     if len(prices) < 3 and pc24 <= 0:
         raise ValueError(
             f"insufficient volatility data: "
             f"prices={len(prices)} price_chg24={pc24}"
         )
 
-    # Slow volatility component.
-    base_vol = pc24 / 4.0
+    volatility_pct = pc24 / 3.0
 
-    # Local observed range.
-    #
-    # IMPORTANT:
-    # use median(prices), not min(prices).
-    # Using min() artificially inflates range after a downward move.
     if len(prices) >= 3:
-        reference_price = median(prices)
+        ordered = sorted(prices)
+        n = len(ordered)
 
-        if reference_price > 0:
-            window_range_pct = (
-                (max(prices) - min(prices))
-                / reference_price
+        def _interp(index_float):
+            lo = int(index_float)
+            hi = min(lo + 1, n - 1)
+            frac = index_float - lo
+            return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+        p10 = _interp((n - 1) * 0.10)
+        p90 = _interp((n - 1) * 0.90)
+        reference_price = median(ordered)
+
+        if reference_price > 0 and p90 > p10:
+            local_range_pct = (
+                (p90 - p10) / reference_price
             ) * 100.0
 
-            base_vol = max(
-                base_vol,
-                window_range_pct * 1.5,
+            volatility_pct = max(
+                volatility_pct,
+                local_range_pct * 1.75,
             )
 
-    # Base step.
-    #
-    # LOW volatility cannot collapse below 3%.
-    # EXTREME volatility cannot make the base step exceed 7%.
-    step = max(3.0, min(base_vol, 7.0))
+    if volatility_pct <= 0:
+        raise ValueError(
+            f"invalid volatility estimate: {volatility_pct}"
+        )
 
-    # Final TP levels are capped independently.
-    tp1 = round(min(step, 7.0), 2)
-    tp2 = round(min(step * 2.2, 15.0), 2)
-    tp3 = round(min(step * 4.0, 28.0), 2)
+    sl_pct = min(max(volatility_pct * 0.85, 1.50), 6.00,)
+    sl_pct = round(sl_pct, 2)
 
-    # Slightly wider SL than TP1 for lower-volatility instruments.
-    # At the extreme cap:
-    #   TP1 = 7%
-    #   SL  = 7%
-    sl_pct = round(
-        min(max(tp1 * 1.2, 1.2), 7.0),
-        2,
+    if sl_pct <= 0:
+        raise ValueError(f"invalid adaptive SL: {sl_pct}")
+
+    try:
+        oi24 = float(r.get("oi_chg24_pct") or 0.0)
+    except (TypeError, ValueError):
+        oi24 = 0.0
+
+    try:
+        oi4h = float(r.get("oi_chg4h_pct") or 0.0)
+    except (TypeError, ValueError):
+        oi4h = 0.0
+
+    try:
+        cvd = float(r.get("cvd24") or 0.0)
+    except (TypeError, ValueError):
+        cvd = 0.0
+
+    try:
+        lls = float(r.get("lls24") or 100.0)
+    except (TypeError, ValueError):
+        lls = 100.0
+
+    if (oi24 >= 10.0 and oi4h >= 10.0 and cvd >= 80.0 and lls < 30.0):
+        tp_r1, tp_r2, tp_r3 = 1.50, 2.75, 4.50
+
+    elif (
+        oi24 >= 5.0
+        and oi4h >= 5.0
+        and cvd >= 70.0
+        and lls < 35.0
+    ):
+        tp_r1, tp_r2, tp_r3 = 1.35, 2.50, 4.00
+
+    else:
+        tp_r1, tp_r2, tp_r3 = 1.25, 2.25, 3.50
+
+    tp1 = sl_pct * tp_r1
+    tp2 = sl_pct * tp_r2
+    tp3 = sl_pct * tp_r3
+
+    min_gap_12 = max(1.00, sl_pct * 0.40)
+    min_gap_23 = max(1.50, sl_pct * 0.60)
+
+    tp2 = max(
+        tp2,
+        tp1 + min_gap_12,
     )
 
-    if not (0 < tp1 < tp2 < tp3):
+    tp3 = max(
+        tp3,
+        tp2 + min_gap_23,
+    )
+
+    max_tp3 = 30.0
+
+    if tp3 > max_tp3:
+        scale = max_tp3 / tp3
+        tp1 *= scale
+        tp2 *= scale
+        tp3 = max_tp3
+
+    tp1 = round(tp1, 2)
+    tp2 = round(tp2, 2)
+    tp3 = round(tp3, 2)
+
+    if not (0 < sl_pct < tp1 < tp2 < tp3):
         raise ValueError(
-            f"invalid adaptive TP sequence: "
-            f"{tp1}, {tp2}, {tp3}"
+            f"invalid adaptive TP/SL sequence: "
+            f"SL={sl_pct}, TP={tp1}/{tp2}/{tp3}"
         )
 
-    if not (0 < sl_pct <= 7.0):
-        raise ValueError(
-            f"invalid adaptive SL: {sl_pct}"
-        )
-
-    # Preserve existing lifecycle:
-    # 25% / 25% / 25%, with existing 25% runner untouched.
     tp_levels = [
         {
             "leg": "tp1",
             "pnl_pct": tp1,
-            "close_fraction": 0.25,
+            "close_fraction": 0.10,
         },
         {
             "leg": "tp2",
             "pnl_pct": tp2,
-            "close_fraction": 0.25,
+            "close_fraction": 0.15,
         },
         {
             "leg": "tp3",
             "pnl_pct": tp3,
-            "close_fraction": 0.25,
+            "close_fraction": 0.35,
         },
     ]
 
     return sl_pct, tp_levels
+
+
 
 def get_trade_protection(ot: dict) -> tuple[float, list[dict], str]:
     """
