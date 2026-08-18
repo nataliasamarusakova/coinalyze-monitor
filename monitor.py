@@ -3457,6 +3457,18 @@ def run():
             continue
         new_ot = existing.get("open_trade")
         new_tid = existing.get("trade_id")
+        bingx_block_reason = existing.get("bingx_entry_block_reason")
+
+        BINGX_RETRYABLE_BLOCK_REASONS = {
+            "api_open_disabled",
+            "contract_unavailable",
+            "contract_state_unavailable",
+        }
+
+        # Legacy state created by older versions must not keep a dynamic
+        # BingX execution condition blocked forever.
+        if (existing.get("bingx_entry_blocked", False) and bingx_block_reason in BINGX_RETRYABLE_BLOCK_REASONS): existing["bingx_entry_blocked"] = False
+
         bingx_entry_blocked = bool(existing.get("bingx_entry_blocked", False))
         if not has_trade:
             wl_all[sym] = {
@@ -3642,7 +3654,7 @@ def run():
                                 )
                                 reason = open_result.get("reason")
                                 
-                                if reason in { "contract_not_found", "api_open_disabled", "contract_unavailable"}:
+                                if reason == "contract_not_found":
                                     existing["bingx_entry_blocked"] = True
                                     existing["bingx_entry_block_reason"] = reason
                                     existing["bingx_entry_block_symbol"] = open_result.get("symbol")
@@ -3656,13 +3668,15 @@ def run():
                                     )
                                 elif reason == "api_open_disabled":
                                     skip_text = (
-                                        f"Сигнал есть, но BingX сейчас запрещает открытие "
-                                        f"позиции по контракту {esc(str(open_result.get('symbol')))}."
+                                        f"Сигнал есть, но BingX API сейчас временно не разрешает "
+                                        f"автоматическое открытие "
+                                        f"{esc(str(open_result.get('symbol')))} "
+                                        f"(apiStateOpen=false)."
                                     )
                                 elif reason == "contract_unavailable":
                                     skip_text = (
-                                        f"Сигнал есть, но контракт "
-                                        f"{esc(str(open_result.get('symbol')))} сейчас недоступен для торговли."
+                                        "Сигнал есть, но BingX не удалось получить свежие "
+                                        "данные о состоянии контракта. Реальный ордер не отправлялся."
                                     )
                                 else:
                                     skip_text = (
@@ -3673,8 +3687,8 @@ def run():
                                 send_tg(
                                     f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
                                     f"{skip_text}\n"
-                                    f"<i>Позиция открыта только как research-идея, без реального ордера. "
-                                    f"Retry не предусмотрен для этой причины.</i>"
+                                    f"<i>Позиция открыта только как research-идея. Реальный ордер не отправлялся. "
+                                    f"Состояние будет перепроверено в следующем прогоне.</i>"
                                 )
                                 new_ot = None
                                 new_tid = None
@@ -3843,10 +3857,17 @@ def run():
                                 f"Требуется повторная проверка защиты.</i>"
                             )
 
-                log.info(
-                    f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
-                    f"strength={sig['strength']} window={sig['window']['span_min']}м"
-                )
+                if new_ot is not None:
+                    log.info(
+                        f"[{sym}] TRADE OPEN {state} path={sig['path']} @ {sig['price']} "
+                        f"strength={sig['strength']} window={sig['window']['span_min']}м"
+                    )
+                else:
+                    log.info(
+                        f"[{sym}] SIGNAL CONFIRMED {state} path={sig['path']} @ {sig['price']} "
+                        f"strength={sig['strength']} window={sig['window']['span_min']}м "
+                        f"execution=NOT_OPENED"
+                    ) 
                 rec = lifecycle_state.setdefault(sym, {})
                 rec.setdefault("idea_first_seen_ts", ts)
                 entry = {
