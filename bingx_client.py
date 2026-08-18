@@ -735,8 +735,7 @@ def place_take_profit_orders(
     c = _contracts().get(bx_symbol)
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
-    prec = int(c.get("quantityPrecision") or 0)
-    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
+    prec = int(c.get("quantityPrecision") or 0) 
     available_qty = position_qty - existing_qty
     if available_qty <= 0:
         log.warning(f"[{symbol}] вся qty уже зарезервирована существующими TP")
@@ -757,11 +756,7 @@ def place_take_profit_orders(
         close_fraction = float(tp.get("close_fraction", 0.0) or 0.0)
         tp_qty = position_qty * close_fraction
         tp_qty = _round_qty(tp_qty, prec)
-        if tp_qty < min_qty:
-            log.warning(
-                f"[{symbol}] {leg}: qty={tp_qty} < minQty={min_qty}, пропускаем"
-            )
-            continue
+        
         if tp_qty <= 0:
             log.warning(f"[{symbol}] {leg}: qty<=0 после округления, пропускаем")
             continue
