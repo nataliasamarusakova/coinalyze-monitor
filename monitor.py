@@ -192,13 +192,6 @@ def _research_float(v):
         return None
 
 
-def calc_entry_oi_price_regime(oi_chg4h, price_chg24):
-    oi = _research_float(oi_chg4h)
-    pc = _research_float(price_chg24)
-    if oi is None or pc is None:
-        return None
-    return f"OI_{'UP' if oi > 0 else 'DOWN'}_" f"PRICE_{'UP' if pc > 0 else 'DOWN'}"
-
 
 def calc_entry_short_liq_share24(liq_short, liq_long):
     ls = _research_float(liq_short)
@@ -1739,19 +1732,17 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
         msg += f"{line}\n✅ {esc(reas)}\n"
     if warns:
         msg += f"⚠️ {esc(warns)}\n"
-    regime = cur.get("entry_oi_price_regime")
     liq_share = cur.get("entry_short_liq_share24")
     liq_imb = cur.get("entry_liq_imbalance")
     fund_press = cur.get("entry_funding_oi_pressure")
     liq_int = cur.get("entry_liquidation_intensity")
     fr_z = cur.get("entry_fr_oiw_zscore")
     research_parts = [
-        f"Regime: {esc(regime) if regime is not None else '-'}",
-        f"ShortLiq%: {liq_share:.2%}" if liq_share is not None else "ShortLiq%: -",
-        f"LiqImb: {liq_imb:+.3f}" if liq_imb is not None else "LiqImb: -",
-        f"FR·OI pressure: {fund_press:.5f}" if fund_press is not None else "FR·OI pressure: -",
-        f"LiqInt: {liq_int:.5f}" if liq_int is not None else "LiqInt: -",
-        f"FR z-score: {fr_z:+.2f}" if fr_z is not None else "FR z-score: -",
+        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
+        *([ f"LiqImb: {liq_imb:+.3f}"] if liq_imb is not None else []),
+        *([ f"FR·OI pressure: {fund_press:.5f}"] if fund_press is not None else []),
+        *([ f"LiqInt: {liq_int:.5f}"] if liq_int is not None else []),
+        *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
     msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
@@ -1787,19 +1778,17 @@ def format_trade_close(rec):
     r60 = rec.get("return_60m")
     if r60 is not None:
         msg += f"Signal@60m: {r60:+.1f}%\n"
-    regime = rec.get("entry_oi_price_regime")
     liq_share = rec.get("entry_short_liq_share24")
     liq_imb = rec.get("entry_liq_imbalance")
     fund_press = rec.get("entry_funding_oi_pressure")
     liq_int = rec.get("entry_liquidation_intensity")
     fr_z = rec.get("entry_fr_oiw_zscore")
     research_parts = [
-        f"Regime: {esc(regime) if regime is not None else '-'}",
-        f"ShortLiq%: {liq_share:.2%}" if liq_share is not None else "ShortLiq%: -",
-        f"LiqImb: {liq_imb:+.3f}" if liq_imb is not None else "LiqImb: -",
-        f"FR·OI pressure: {fund_press:.5f}" if fund_press is not None else "FR·OI pressure: -",
-        f"LiqInt: {liq_int:.5f}" if liq_int is not None else "LiqInt: -",
-        f"FR z-score: {fr_z:+.2f}" if fr_z is not None else "FR z-score: -",
+        *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
+        *([ f"LiqImb: {liq_imb:+.3f}"] if liq_imb is not None else []),
+        *([ f"FR·OI pressure: {fund_press:.5f}"] if fund_press is not None else []),
+        *([ f"LiqInt: {liq_int:.5f}"] if liq_int is not None else []),
+        *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
     msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
     return msg
@@ -1948,9 +1937,6 @@ def open_trade_record(
     research_liq_long24 = r.get("liq_long24")
     research_oi_abs = r.get("oi")
     research_fr_oiw = r.get("fr_oiw")
-    entry_oi_price_regime = calc_entry_oi_price_regime(
-        research_oi_chg4h, research_price_chg24
-    )
     entry_short_liq_share24 = calc_entry_short_liq_share24(
         research_liq_short24, research_liq_long24
     )
@@ -2033,7 +2019,6 @@ def open_trade_record(
         "entry_market_phase": market.get("phase", "unknown"),
         "entry_market_breadth": market.get("breadth_ratio"),
         "entry_btc_chg24": market.get("btc_chg24"),
-        "entry_oi_price_regime": entry_oi_price_regime,
         "entry_short_liq_share24": entry_short_liq_share24,
         "entry_liq_imbalance": entry_liq_imbalance,
         "entry_funding_oi_pressure": entry_funding_oi_pressure,
@@ -2352,8 +2337,7 @@ def close_trade(
         "entry_liq_long24": ot.get("entry_liq_long24"),
         "entry_ls_accounts": ot.get("entry_ls_accounts"),
         "entry_btc_corr7d": ot.get("entry_btc_corr7d"),
-        "entry_market_phase": ot.get("entry_market_phase"),
-        "entry_oi_price_regime": ot.get("entry_oi_price_regime"),
+        "entry_market_phase": ot.get("entry_market_phase"), 
         "entry_short_liq_share24": ot.get("entry_short_liq_share24"),
         "entry_liq_imbalance": ot.get("entry_liq_imbalance"),
         "entry_funding_oi_pressure": ot.get("entry_funding_oi_pressure"),
@@ -3934,9 +3918,6 @@ def run():
                     "derived": derived,
                     "momentum": sig["momentum"],
                     "pattern": sig["pattern"],
-                    "entry_oi_price_regime": calc_entry_oi_price_regime(
-                        r.get("oi_chg4h_pct"), r.get("price_chg24")
-                    ),
                     "entry_short_liq_share24": calc_entry_short_liq_share24(
                         r.get("liq_short24"), r.get("liq_long24")
                     ),
