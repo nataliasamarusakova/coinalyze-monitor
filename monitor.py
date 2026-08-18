@@ -55,25 +55,11 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = os.environ.get(
-    "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-)
+QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-plus")
 MAX_PAGES = 5
 COINALYZE_URL = os.environ.get("COINALYZE_URL", "")
-
 ENABLE_BINGX = os.environ.get("ENABLE_BINGX", "false").lower() == "true"
-# TP levels are for real-time position management only and do not affect PnL calculation.
-# Adaptive protection is used for NEW BingX positions.
-# These legacy values are retained ONLY for already-open positions
-# created before adaptive protection was introduced.
-LEGACY_BINGX_TP_LEVELS = [
-    {"leg": "tp1", "pnl_pct": 3.0, "close_fraction": 0.25},
-    {"leg": "tp2", "pnl_pct": 6.0, "close_fraction": 0.25},
-    {"leg": "tp3", "pnl_pct": 9.0, "close_fraction": 0.25},
-]
-
-LEGACY_STOP_LOSS_PCT = 5.0
 PROTECTION_LOGIC_VERSION = 2
 STOP_MODE = "adaptive_volatility" 
 
@@ -375,9 +361,9 @@ def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
 
     # Base step.
     #
-    # LOW volatility cannot collapse below 1%.
+    # LOW volatility cannot collapse below 3%.
     # EXTREME volatility cannot make the base step exceed 7%.
-    step = max(1.0, min(base_vol, 7.0))
+    step = max(3.0, min(base_vol, 7.0))
 
     # Final TP levels are capped independently.
     tp1 = round(min(step, 7.0), 2)
@@ -430,41 +416,34 @@ def get_trade_protection(ot: dict) -> tuple[float, list[dict], str]:
     """
     Return protection parameters belonging to THIS position.
 
-    New adaptive positions:
+    Protection must be stored explicitly in:
         ot["bingx"]["protection"]
 
-    Old positions created before adaptive protection:
-        legacy 5% SL + 3/6/9 TP.
-
-    Never recalculate protection for an already-open position.
+    Protection is never recalculated for an already-open position.
     """
-
     bx = ot.get("bingx") or {}
     protection = bx.get("protection")
 
-    if isinstance(protection, dict):
-        try:
-            sl_pct = float(protection["stop_loss_pct"])
-            tp_levels = protection["tp_levels"]
+    if not isinstance(protection, dict):
+        raise ValueError("missing BingX protection for open trade")
 
-            if (
-                sl_pct > 0
-                and isinstance(tp_levels, list)
-                and len(tp_levels) == 3
-            ):
-                return (
-                    sl_pct,
-                    [dict(x) for x in tp_levels],
-                    "adaptive",
-                )
-        except (TypeError, ValueError, KeyError):
-            pass
+    try:
+        sl_pct = float(protection["stop_loss_pct"])
+        tp_levels = protection["tp_levels"]
+    except (TypeError, ValueError, KeyError) as e:
+        raise ValueError(f"invalid BingX protection: {e}") from e
 
-    # Existing position created before adaptive protection.
+    if (
+        sl_pct <= 0
+        or not isinstance(tp_levels, list)
+        or len(tp_levels) != 3
+    ):
+        raise ValueError("invalid BingX protection structure")
+
     return (
-        LEGACY_STOP_LOSS_PCT,
-        [dict(x) for x in LEGACY_BINGX_TP_LEVELS],
-        "legacy",
+        sl_pct,
+        [dict(x) for x in tp_levels],
+        str(protection.get("source", "adaptive_volatility")),
     )
 
 def price_at(price_full, sym, ts_target, max_lag_sec=None):
@@ -2516,8 +2495,24 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
             # Trailing Stop Loss on BingX after TP fill
             if qty_remaining > 0 and entry_price and entry_price > 0:
                 prot_info = bx.get("protection") or {}
-                tp_lvls = prot_info.get("tp_levels") or LEGACY_BINGX_TP_LEVELS
-                tp_dict = {lvl.get("leg"): lvl.get("pnl_pct", 3.0) for lvl in tp_lvls}
+                tp_lvls = prot_info.get("tp_levels") or []
+
+                if len(tp_lvls) != 3:
+                    log.error(
+                        f"[{symbol}] TP trailing skipped: invalid protection "
+                        f"tp_levels={tp_lvls}"
+                    )
+                    continue
+
+                tp_dict = {
+                    lvl.get("leg"): float(lvl.get("pnl_pct"))
+                    for lvl in tp_lvls
+                    if (
+                        isinstance(lvl, dict)
+                        and lvl.get("leg")
+                        and lvl.get("pnl_pct") is not None
+                    )
+                }
 
                 all_filled_legs = {leg}
                 for fid in processed_fills:
