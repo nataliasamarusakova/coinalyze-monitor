@@ -288,6 +288,7 @@ def clamp(val, lo, hi):
 def valid_price(p):
     return p is not None and p > 0
 
+
 def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
     """
     Adaptive protection for NEW LONG positions.
@@ -365,11 +366,11 @@ def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
             f"invalid volatility estimate: {volatility_pct}"
         )
 
-    sl_pct = min(max(volatility_pct * 0.85, 1.50), 6.00,)
-    sl_pct = round(sl_pct, 2)
-
-    if sl_pct <= 0:
-        raise ValueError(f"invalid adaptive SL: {sl_pct}")
+    sl_pct = 5.00
+    #sl_pct = min(max(volatility_pct * 0.85, 1.50), 6.00,)
+    #sl_pct = round(sl_pct, 2)
+    #if sl_pct <= 0:
+    #    raise ValueError(f"invalid adaptive SL: {sl_pct}")
 
     try:
         oi24 = float(r.get("oi_chg24_pct") or 0.0)
