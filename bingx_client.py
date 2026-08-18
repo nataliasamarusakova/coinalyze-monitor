@@ -115,40 +115,66 @@ def _log_event(event: dict):
         log.error(f"bingx_orders.jsonl write failed: {e}")
 
 
+def _refresh_contracts() -> dict:
+    """Force a fresh /quote/contracts snapshot for execution decisions.
+
+    The normal contract cache remains available for ordinary lookups.
+    Execution decisions must not use stale apiStateOpen/apiStateClose.
+    """
+    now = time.time()
+    resp = _request("GET", CONTRACTS_PATH, signed=False)
+
+    if resp.get("code") != 0:
+        err = f"code={resp.get('code')} msg={resp.get('msg')}"
+        log.error(f"contracts refresh failed: {err}")
+        return {
+            "status": "error",
+            "error": err,
+        }
+
+    data = {}
+    by_display_name = {}
+
+    for c in resp.get("data", []) or []:
+        sym = str(c.get("symbol", "")).strip().upper()
+        display_name = str(c.get("displayName", "")).strip().upper()
+
+        if sym:
+            data[sym] = c
+
+        if display_name:
+            by_display_name[display_name] = c
+
+    _CONTRACT_CACHE.update(
+        {
+            "ts": now,
+            "data": data,
+            "by_display_name": by_display_name,
+        }
+    )
+
+    log.info(f"contracts refresh OK: {len(data)} contracts")
+
+    return {
+        "status": "ok",
+        "count": len(data),
+    }
+
+
 def _contracts() -> dict:
     now = time.time()
 
     if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
         return _CONTRACT_CACHE["data"]
 
-    resp = _request("GET", CONTRACTS_PATH, signed=False)
+    refresh = _refresh_contracts()
 
-    if resp.get("code") == 0:
-        data = {}
-        by_display_name = {}
+    if refresh.get("status") == "ok":
+        return _CONTRACT_CACHE["data"]
 
-        for c in resp.get("data", []) or []:
-            sym = str(c.get("symbol", "")).strip().upper()
-            display_name = str(c.get("displayName", "")).strip().upper()
-
-            if sym:
-                data[sym] = c
-
-            if display_name:
-                by_display_name[display_name] = c
-
-        _CONTRACT_CACHE.update(
-            {
-                "ts": now,
-                "data": data,
-                "by_display_name": by_display_name,
-            }
-        )
-
-        return data
-
-    log.error(f"contracts fetch failed: {resp.get('code')} {resp.get('msg')}")
-
+    # Для обычных lookup разрешаем использовать последний известный cache.
+    # Execution-path вызывает _refresh_contracts() отдельно и не использует
+    # stale execution state при ошибке refresh.
     return _CONTRACT_CACHE["data"]
 
 
@@ -1524,12 +1550,17 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
 
 
 def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_sec: int = 30) -> dict:
-    """Оркестровка входа: проверка контракта → open_long → дождаться
-    подтверждения позиции на бирже.
-    НЕ размещает TP/SL — это отдельный шаг (attach_protection), чтобы
-    вызывающая сторона (monitor.py) успела сохранить crash-safe checkpoint
-    между подтверждением открытия позиции и размещением защиты.
-    """
+   
+    refresh = _refresh_contracts()
+
+    if refresh.get("status") != "ok":
+        return {
+            "status": "skipped",
+            "reason": "contract_state_unavailable",
+            "symbol": str(symbol or "").strip().upper() or symbol,
+            "error": refresh.get("error"),
+        }
+
     bx_symbol = to_bx_symbol(symbol)
     contract = get_contract(symbol)
 
