@@ -11,7 +11,7 @@
     "first_seen": 1787008284,
     "last_seen": 1787020008,
     "snapshots": 3,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 23,
     "entry_earliness": 0.22,
     "signal_strength": 9.6,
@@ -54,7 +54,7 @@
     "first_seen": 1787010382,
     "last_seen": 1787020008,
     "snapshots": 4,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 12,
     "entry_earliness": 0.31,
     "signal_strength": 10.0,
@@ -93,10 +93,10 @@
     "pattern": "—",
     "name": "MultiversX",
     "first_seen": 1787012180,
-    "last_seen": 1787023274,
+    "last_seen": 1787025093,
     "snapshots": 3,
     "missed_runs": 0,
-    "neutral_runs": 10,
+    "neutral_runs": 11,
     "entry_earliness": 0.2,
     "signal_strength": 9.8,
     "window": {
@@ -126,11 +126,11 @@
       "entry_price": 2.74,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 2.76,
-      "last_price_ts": 1787023274,
-      "max_pnl_pct": 1.4598540145985253,
+      "last_price": 2.8,
+      "last_price_ts": 1787025093,
+      "max_pnl_pct": 2.1897810218977956,
       "min_pnl_pct": 0.0,
-      "peak_ts": 1787018789,
+      "peak_ts": 1787025093,
       "max_state": "CONFIRMED_TREND",
       "state_history": [
         {
@@ -351,7 +351,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787023274
+        "last_price_observation_ts": 1787025093
       },
       "shadow_stops": {
         "1.5": null,
@@ -380,9 +380,9 @@
         "trade_id": "EGLD_1787012473_8bb970e8",
         "bingx_avg_price": 2.746,
         "qty_initial": 3.6,
-        "qty_remaining": 3.6,
+        "qty_remaining": 2.7,
         "partial_legs_done": [],
-        "execution_status": "TP_PLACED",
+        "execution_status": "PARTIAL_TP",
         "protection": {
           "logic_version": 2,
           "source": "adaptive_volatility",
@@ -403,7 +403,8 @@
               "pnl_pct": 6.57,
               "close_fraction": 0.25
             }
-          ]
+          ],
+          "current_stop_price": 2.74274
         },
         "protection_attempted": true,
         "tp_orders": [
@@ -437,25 +438,27 @@
         ],
         "sl_order": {
           "status": "created",
-          "order_id": "2089507919221055488",
+          "order_id": "2089560824523350016",
           "client_order_id": "CM_SL_af3e9290",
-          "stop_price": 2.6919038,
-          "qty": 3.6
+          "stop_price": 2.74274,
+          "qty": 2.7
         },
-        "tp_fills": {}
+        "tp_fills": {
+          "2089559016750452736": 0.9
+        }
       },
       "bingx_symbol": "EGLD-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787023274,
+        "last_check_ts": 1787025093,
         "status": "HEALTHY",
         "state": "NEUTRAL",
-        "score": 5,
-        "strength": 5.32,
-        "age_min": 180.0,
+        "score": 7,
+        "strength": 0.0,
+        "age_min": 210.3,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 0.73,
+        "pnl_pct": 2.19,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -477,8 +480,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 5.32,
-      "last_signal_ts": 1787023274
+      "last_signal_strength": 0.0,
+      "last_signal_ts": 1787025093
     },
     "trade_id": "EGLD_1787012473_8bb970e8",
     "state_signal": "NEUTRAL"
@@ -495,7 +498,7 @@
     "first_seen": 1787018509,
     "last_seen": 1787020008,
     "snapshots": 5,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.12,
     "signal_strength": 9.0,
@@ -532,7 +535,7 @@
     "first_seen": 1787018509,
     "last_seen": 1787020008,
     "snapshots": 5,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.07,
     "signal_strength": 4.0,
@@ -559,38 +562,41 @@
     "bingx_entry_block_symbol": null
   },
   "ACU": {
-    "state": "CONFIRMED_TREND",
+    "state": "ACCELERATION",
     "previous_state": "CONFIRMED_TREND",
-    "action": "POSSIBLE_ENTRY",
-    "confidence": 90,
+    "action": "LONG_SETUP",
+    "confidence": 85,
     "score": 4,
-    "momentum": 10,
-    "pattern": "Healthy Trend",
+    "momentum": 9,
+    "pattern": "Momentum Expansion",
     "name": "Acurast",
     "first_seen": 1787019088,
-    "last_seen": 1787023099,
-    "snapshots": 3,
-    "missed_runs": 1,
-    "neutral_runs": 1,
-    "entry_earliness": 0.67,
-    "signal_strength": 10.0,
+    "last_seen": 1787025093,
+    "snapshots": 4,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.7,
+    "signal_strength": 0.0,
     "window": {
-      "span_min": 25.0,
-      "max_gap_min": 9.6,
-      "dense": true,
-      "ts_count": 5
+      "span_min": 84.8,
+      "max_gap_min": 51.5,
+      "dense": false,
+      "ts_count": 3
     },
     "reasons": [
-      "5 снимков: OI>5 CVD>55 LLS<40 OI4h>0 P↑ FR<0.05",
-      "OI и CVD не снижаются (шагово и по тренду)"
+      "OI accel=10.2>2",
+      "CVD mom=10>10",
+      "Price accel=10.3>=1"
     ],
-    "warnings": [],
+    "warnings": [
+      "CVD=100 — близко к максимуму",
+      "Price=22.7% — уже вырос"
+    ],
     "mom_tags": [
       "OI accel↑",
       "CVD mom↑",
       "Price accel↑",
       "Funding stable",
-      "OI4h↑",
       "No divergence",
       "OI+CVD sync↑"
     ],
@@ -610,7 +616,7 @@
     "first_seen": 1787019431,
     "last_seen": 1787020008,
     "snapshots": 2,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 1.0,
     "signal_strength": 4.69,
@@ -647,7 +653,7 @@
     "first_seen": 1787019431,
     "last_seen": 1787020008,
     "snapshots": 2,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.17,
     "signal_strength": 7.5,
@@ -684,7 +690,7 @@
     "first_seen": 1787019431,
     "last_seen": 1787020008,
     "snapshots": 2,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.14,
     "signal_strength": 0.0,
@@ -721,7 +727,7 @@
     "first_seen": 1787019431,
     "last_seen": 1787020008,
     "snapshots": 2,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.08,
     "signal_strength": 4.9,
@@ -759,7 +765,7 @@
     "first_seen": 1787020008,
     "last_seen": 1787020008,
     "snapshots": 1,
-    "missed_runs": 2,
+    "missed_runs": 3,
     "neutral_runs": 0,
     "entry_earliness": 0.11,
     "signal_strength": 3.99,
