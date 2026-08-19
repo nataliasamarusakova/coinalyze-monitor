@@ -13,14 +13,12 @@ OUT = BASE / "docs" / "index.html"
 MISSED_THRESHOLD = 5.0
 
 try:
-    from monitor import TRADE_TIMEOUT_MIN, TRADE_TIMEOUT_EXTENDED_MIN
+    from monitor import TRADE_TIMEOUT_MIN
 except Exception as e:
-    TRADE_TIMEOUT_MIN = 240
-    TRADE_TIMEOUT_EXTENDED_MIN = 360
+    TRADE_TIMEOUT_MIN = 240 
     print(
         f"WARNING: не удалось импортировать timeout settings из monitor.py ({e}); "
-        f"используются fallback: TRADE_TIMEOUT_MIN=240, "
-        f"TRADE_TIMEOUT_EXTENDED_MIN=360"
+        f"используются fallback: TRADE_TIMEOUT_MIN=240, " 
     )
 
 FIELDS = [
@@ -71,7 +69,7 @@ def load_open():
         ets = ot.get("entry_ts", 0)
         lts = ot.get("last_price_ts", ets)
         hold = round((lts - ets) / 60, 1) if lts > ets else 0.0
-        timeout_pct = (min(hold / TRADE_TIMEOUT_EXTENDED_MIN * 100, 100) if TRADE_TIMEOUT_EXTENDED_MIN else 0)
+        timeout_pct = (min(hold / TRADE_TIMEOUT_MIN * 100, 100) if TRADE_TIMEOUT_MIN else 0)
         out.append({
             "symbol": sym,
             "name": ot.get("name", sym),
@@ -380,7 +378,7 @@ def main():
     html = (HTML
             .replace("__DATA__", json.dumps(trades, ensure_ascii=False))
             .replace("__OPEN__", json.dumps(open_positions, ensure_ascii=False))
-            .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_EXTENDED_MIN))
+            .replace("__TIMEOUT_MIN__", str(TRADE_TIMEOUT_MIN))
             .replace("__UNENTERED__", json.dumps(unentered, ensure_ascii=False))
             .replace("__PENDING_UNENTERED__", json.dumps(pending_unentered))
             .replace("__CAPTURE__", json.dumps(capture, ensure_ascii=False))
