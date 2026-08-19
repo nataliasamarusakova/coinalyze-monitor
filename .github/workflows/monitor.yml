@@ -68,20 +68,7 @@ jobs:
           BINGX_MARGIN_USDT: "1"
           BINGX_LEVERAGE: "10"
         run: python monitor.py
-    
-      - name: Run BingX Signal
-        id: bingx_signal
-        continue-on-error: true
-        env:
-          BINGX_BASE_URL: "https://open-api.bingx.com"
-          BINGX_LAB_TIMEOUT_SEC: "15"
-          BINGX_LAB_RECV_WINDOW_MS: "5000"
-          BINGX_LAB_KLINE_LIMIT: "750"
-          BINGX_LAB_OI_MIN_OBS: "72"
-          BINGX_LAB_OI_HISTORY_DAYS: "14"
-          BINGX_LAB_LOOP_SEC: "300"
-        run: python bingx_signal.py --once
-     
+      
       - name: Run unentered tracker
         run: python unentered_tracker.py
 
