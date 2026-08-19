@@ -104,6 +104,7 @@ ENGINE_VERSIONS = {
 }
 HASH_VERSION = "sha256_v1"
 TRADE_TIMEOUT_MIN = 240
+BINGX_SKIP_NOTIFY_COOLDOWN_SEC = 4 * 3600
 FEE_PCT = 0.10
 SIGNAL_DECAY_MIN = 90
 IDEA_REGISTRY_TTL_DAYS = 30
@@ -1663,6 +1664,34 @@ def send_tg(text):
         time.sleep(0.4)
     return all_ok
 
+def should_notify_bingx_skip(existing: dict, reason: str, ts: int) -> bool:
+    """
+    Telegram throttle только для повторных BingX skip-уведомлений.
+
+    Правила:
+      - новая причина → уведомить сразу;
+      - та же причина → не чаще 1 раза за 4 часа;
+      - нет предыдущего успешного уведомления → уведомить.
+
+    Это НЕ участвует в торговой логике и не влияет на entry decision.
+    """
+    last_reason = existing.get("bingx_skip_notify_reason")
+    last_ts = int(existing.get("bingx_skip_notify_ts") or 0)
+
+    if reason != last_reason:
+        return True
+
+    return (ts - last_ts) >= BINGX_SKIP_NOTIFY_COOLDOWN_SEC
+
+
+def mark_bingx_skip_notified(existing: dict, reason: str, ts: int):
+    """
+    Сохраняет только operational state Telegram-notification throttle.
+
+    Эти поля не используются в signal/lifecycle/trade statistics.
+    """
+    existing["bingx_skip_notify_reason"] = reason
+    existing["bingx_skip_notify_ts"] = ts
 
 def _retry_pending_tp_notifications():
     try:
@@ -3549,6 +3578,8 @@ def run():
                 "bingx_entry_blocked": existing.get("bingx_entry_blocked", False),
                 "bingx_entry_block_reason": existing.get("bingx_entry_block_reason"),
                 "bingx_entry_block_symbol": existing.get("bingx_entry_block_symbol"),
+                "bingx_skip_notify_reason": existing.get("bingx_skip_notify_reason"),
+                "bingx_skip_notify_ts": existing.get("bingx_skip_notify_ts"),
             }
             existing = wl_all[sym]
 
@@ -3739,12 +3770,37 @@ def run():
                                         f"{esc(str(reason or 'unknown'))}."
                                     )
 
-                                send_tg(
-                                    f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
-                                    f"{skip_text}\n"
-                                    f"<i>Позиция открыта только как research-идея. Реальный ордер не отправлялся. "
-                                    f"Состояние будет перепроверено в следующем прогоне.</i>"
-                                )
+                                notify_skip = should_notify_bingx_skip(existing, reason, ts)
+
+                                if notify_skip:
+                                    tg_ok = send_tg(
+                                        f"⚠️ <b>{esc(r.get('name', sym))} ({esc(sym)})</b>\n"
+                                        f"{skip_text}\n"
+                                        f"<i>Реальный ордер не отправлялся. "
+                                        f"Состояние BingX будет перепроверено в следующем прогоне.</i>"
+                                    )
+
+                                    # Запоминаем throttle только после успешной доставки.
+                                    if tg_ok:
+                                        mark_bingx_skip_notified(existing, reason, ts)
+
+                                        log.info(
+                                            f"[{sym}] BingX skip Telegram sent: "
+                                            f"reason={reason}"
+                                        )
+                                    else:
+                                        log.warning(
+                                            f"[{sym}] BingX skip Telegram NOT delivered: "
+                                            f"reason={reason}; retry allowed on next run"
+                                        )
+                                else:
+                                    log.info(
+                                        f"[{sym}] BingX skip Telegram suppressed: "
+                                        f"reason={reason}; "
+                                        f"last notification still within "
+                                        f"{BINGX_SKIP_NOTIFY_COOLDOWN_SEC // 3600}h cooldown"
+                                    )
+
                                 new_ot = None
                                 new_tid = None
                             elif open_status == "error":
@@ -3782,6 +3838,9 @@ def run():
                                 if open_result.get("qty_initial_uncertain"):
                                     bx["qty_initial_uncertain"] = True
                                 new_ot["bingx"] = bx
+                                # Реальная позиция открылась — старый skip notification state больше не нужен.
+                                existing.pop("bingx_skip_notify_reason", None)
+                                existing.pop("bingx_skip_notify_ts", None)
                             elif open_status == "found":
                                 bx = dict(open_result.get("open", {}))
                                 avg_price = open_result.get("avg_price")
@@ -3801,6 +3860,8 @@ def run():
                                 entry_temp = dict(existing)
                                 entry_temp["open_trade"] = new_ot
                                 entry_temp["trade_id"] = new_tid
+                                entry_temp.pop("bingx_skip_notify_reason", None)
+                                entry_temp.pop("bingx_skip_notify_ts", None)
                                 wl_all[sym] = entry_temp
                                 save_watchlist(wl_all)
                                 log.info(
@@ -3949,6 +4010,9 @@ def run():
                     "bingx_entry_block_reason": existing.get("bingx_entry_block_reason"),
                     "bingx_entry_block_symbol": existing.get("bingx_entry_block_symbol"),
                     "bingx_entry_blocked_ts": existing.get("bingx_entry_blocked_ts"),
+
+                    "bingx_skip_notify_reason": existing.get("bingx_skip_notify_reason"),
+                    "bingx_skip_notify_ts": existing.get("bingx_skip_notify_ts"),
                 }
                 if new_ot is not None:
                     entry["open_trade"] = new_ot
