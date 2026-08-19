@@ -1,3 +1,7 @@
+"""
+monitor.py.
+"""
+
 import os, sys, time, json, shutil, hashlib, tempfile, uuid
 import html as html_mod
 import logging
@@ -4027,13 +4031,23 @@ def run():
 
                 should_send_tg = True
                 if state in ENTRY_STATES:
-                    if not entry.get("open_trade"):
-                        log.info(f"[{sym}] ENTRY Telegram suppressed: сделка не открыта (Quality Guard / Cooldown / Exchange block)")
+                    # ENTRY-state сам по себе НЕ означает, что новая сделка открыта.
+                    # Источник истины для текущего прохода — new_ot.
+                    if new_ot is None:
+                        log.info(
+                            f"[{sym}] ENTRY Telegram suppressed: "
+                            f"новая сделка в текущем проходе не открыта "
+                            f"(Quality Guard / Cooldown / Exchange block)"
+                        )
                         should_send_tg = False
+
+                    # Если позиция существовала до обработки текущего сигнала,
+                    # это не новый вход и повторный зелёный Telegram не нужен.
                     elif has_trade:
                         log.info(
                             f"[{sym}] ENTRY Telegram suppressed: "
-                            f"open_trade already exists, trade_id={existing.get('trade_id')}"
+                            f"open_trade already existed, "
+                            f"trade_id={existing.get('trade_id')}"
                         )
                         should_send_tg = False
 
