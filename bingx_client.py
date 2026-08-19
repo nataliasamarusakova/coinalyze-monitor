@@ -48,7 +48,11 @@ _CONTRACT_TTL = 3600
 
 
 def _tp_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
-    """Проверка что TP ордер принадлежит конкретной сделке."""
+    """Проверка что TP ордер принадлежит конкретной сделке.
+    TP-parsed может содержать либо явный trade_id (старый формат
+    clientOrderId), либо только trade_hash (текущий детерминированный
+    формат без timestamp).
+    """
     if parsed is None:
         return False
     if not trade_id:
@@ -112,7 +116,11 @@ def _log_event(event: dict):
 
 
 def _refresh_contracts() -> dict:
-    """Force a fresh /quote/contracts snapshot for execution decisions."""
+    """Force a fresh /quote/contracts snapshot for execution decisions.
+
+    The normal contract cache remains available for ordinary lookups.
+    Execution decisions must not use stale apiStateOpen/apiStateClose.
+    """
     now = time.time()
     resp = _request("GET", CONTRACTS_PATH, signed=False)
 
@@ -164,15 +172,28 @@ def _contracts() -> dict:
     if refresh.get("status") == "ok":
         return _CONTRACT_CACHE["data"]
 
+    # Для обычных lookup разрешаем использовать последний известный cache.
+    # Execution-path вызывает _refresh_contracts() отдельно и не использует
+    # stale execution state при ошибке refresh.
     return _CONTRACT_CACHE["data"]
 
 
 def get_contract(symbol: str) -> dict | None:
+    """
+    Найти контракт BingX по тикеру из Coinalyze.
+
+    Сначала ищем обычный API symbol:
+        CRV -> CRV-USDT
+
+    Затем ищем по displayName:
+        ORCL -> ORCL-USDT -> NCSKORCL2USD-USDT
+    """
     s = (symbol or "").strip().upper()
 
     if not s:
         return None
 
+    # Учитываем существующий ручной SYMBOL_MAP.
     if s in SYMBOL_MAP:
         mapped = str(SYMBOL_MAP[s]).strip().upper()
         if mapped:
@@ -186,12 +207,16 @@ def get_contract(symbol: str) -> dict | None:
         s = s[:-4]
 
     target = f"{s}-USDT"
+
     contracts = _contracts()
 
+    # 1. Обычные symbols, например CRV-USDT.
     contract = contracts.get(target)
     if contract:
         return contract
 
+    # 2. TradFi: displayName=ORCL-USDT,
+    #    symbol=NCSKORCL2USD-USDT.
     return _CONTRACT_CACHE["by_display_name"].get(target)
 
 
@@ -214,6 +239,10 @@ def classify_bingx_contract(contract: dict | None) -> str:
 
 
 def _normalize_orders_list(resp: dict) -> list:
+    """Нормализация поля data из ответа BingX API.
+    BingX может вернуть список словарей, словарь {"orders": [...]},
+    строку / None. Возвращает только список словарей.
+    """
     raw = resp.get("data", []) or []
     if isinstance(raw, dict):
         raw = raw.get("orders", []) or []
@@ -231,13 +260,16 @@ def to_bx_symbol(symbol: str) -> str:
     if not s:
         return symbol
 
+    # Явный пользовательский mapping имеет высший приоритет.
     if s in SYMBOL_MAP:
         return str(SYMBOL_MAP[s]).strip().upper()
 
+    # Пытаемся найти реальный BingX execution symbol.
     contract = get_contract(s)
     if contract:
         return str(contract.get("symbol", "")).strip().upper()
 
+    # Fallback: старое поведение, если контракт не найден.
     s = s.replace("-", "")
     if s.endswith("USDT"):
         s = s[:-4]
@@ -265,7 +297,7 @@ def contract_limits(symbol: str) -> dict:
     c = _contracts().get(bx_symbol) or {}
     return {
         "quantity_precision": int(c.get("quantityPrecision") or 0),
-        "min_qty": float(c.get("tradeMinQuantity") or c.get("minQty") or 0),
+        "min_qty": float(c.get("minQty") or 0),
         "min_notional": float(c.get("tradeMinUSDT") or c.get("minNotional") or 0),
         "multiplier": float(c.get("multiplier") or 1),
         "found": bool(c),
@@ -273,25 +305,18 @@ def contract_limits(symbol: str) -> dict:
 
 
 def _qty_for(c: dict, price: float, leverage: int):
-    try:
-        mult = float(c.get("multiplier") or 1.0)
-    except (TypeError, ValueError):
-        mult = 1.0
-    if mult <= 0:
-        mult = 1.0
-
+    mult = float(c.get("multiplier") or 1)
     prec = int(c.get("quantityPrecision") or 0)
-    step = 10 ** (-prec) if prec > 0 else 1.0
-    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0.0)
-
-    if not price or price <= 0:
-        return None, prec, step, mult, min_qty
-
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
+    if not price or price <= 0 or mult <= 0:
+        return None, prec, min_qty
     raw = (MARGIN_USDT * leverage) / (price * mult)
-    raw_quanta = math.floor(round(raw / step, 8))
-    qty = round(raw_quanta * step, prec)
-
-    return qty, prec, step, mult, min_qty
+    if prec > 0:
+        step = 10**-prec
+        qty = round(math.floor(raw / step) * step, prec)
+    else:
+        qty = float(int(raw))
+    return qty, prec, min_qty
 
 
 def _round_qty(qty: float, precision: int) -> float:
@@ -308,6 +333,8 @@ def _round_qty(qty: float, precision: int) -> float:
 
 
 def _is_reduce_only(value) -> bool:
+    """Flexible проверка reduceOnly (может быть bool, str, int).
+    Используется только для MARKET close, НЕ для TP/SL в Hedge Mode."""
     return value in (True, "true", "TRUE", 1, "1")
 
 
@@ -315,6 +342,7 @@ def _is_reduce_only(value) -> bool:
 # TRADE ID HASH / CLIENT ORDER ID
 # ============================================================
 def _trade_id_hash(trade_id: str) -> str:
+    """Короткий детерминированный hash trade_id (8 hex) для clientOrderId."""
     return hashlib.sha256(str(trade_id).encode("utf-8")).hexdigest()[:8]
 
 
@@ -327,11 +355,26 @@ def _is_hex8(s: str) -> bool:
 
 
 def build_tp_client_order_id(leg: str, trade_id: str = None) -> str:
+    """Собрать clientOrderId ≤ 40 символов.
+    v3.1: ID полностью детерминирован (без timestamp) — CM_TP_<hash8>_<leg>.
+    Это даёт естественную идемпотентность: повторный вызов с тем же
+    trade_id+leg генерирует ТОТ ЖЕ ID, и биржа должна отклонить дубликат
+    сама, вместо того чтобы принять его как новый ордер.
+    """
     key = _trade_id_hash(trade_id) if trade_id else uuid.uuid4().hex[:8]
     return f"{TP_CLIENT_ORDER_PREFIX}{key}_{leg}"
 
 
 def parse_tp_client_order_id(client_id: str) -> dict | None:
+    """Парсинг clientOrderId для TP ордеров.
+    Форматы:
+    - v3.1 deterministic: CM_TP_<hash8>_<leg>              (4 части)
+    - v2.6 hash+ts:       CM_TP_<hash8>_<leg>_<ts>          (5 частей)
+    - v2.4 full:          CM_TP_<tradeid>_<symbol>_<leg>_<ts> (6+ частей, leg idx 4)
+    - legacy:             CM_TP_<symbol>_<leg>_<ts>[_<uuid>]  (leg idx 3)
+    Поддержка старых форматов оставлена для распознавания ордеров,
+    созданных до этого фикса (переходный период).
+    """
     if not client_id:
         return None
     upper_id = client_id.upper()
@@ -361,17 +404,27 @@ def parse_tp_client_order_id(client_id: str) -> dict | None:
 
 
 def build_sl_client_order_id(trade_id: str = None) -> str:
+    """v3.1: ID полностью детерминирован (без timestamp) — CM_SL_<hash8>."""
     key = _trade_id_hash(trade_id) if trade_id else uuid.uuid4().hex[:8]
     return f"{SL_CLIENT_ORDER_PREFIX}{key}"
 
 
 def build_open_client_order_id(symbol: str, trade_id: str = None) -> str:
+    """Детерминированный clientOrderId для OPEN-ордера (MARKET BUY).
+    Формат: CM_OPEN_<hash8> — ≤ 40 символов.
+    Обеспечивает идемпотентность: повторный вызов _request() с тем же
+    trade_id отправит ТОТ ЖЕ clientOrderId, и биржа отклонит дубликат.
+    """
     raw = f"{symbol}:{trade_id}" if trade_id else symbol
     key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"{OPEN_CLIENT_ORDER_PREFIX}{key}"
 
 
 def parse_sl_client_order_id(client_id: str) -> dict | None:
+    """Парсинг clientOrderId для SL ордеров.
+    v3.1 deterministic: CM_SL_<hash8>        (3 части)
+    v2.9 hash+ts:        CM_SL_<hash8>_<ts>   (4 части, обратная совместимость)
+    """
     if not client_id:
         return None
     upper_id = client_id.upper()
@@ -413,6 +466,7 @@ def _position_amt(bx_symbol: str) -> float:
 
 
 def list_positions() -> dict:
+    """Все открытые LONG-позиции счёта: {bx_symbol: qty}."""
     resp = _request("GET", POSITION_PATH)
     if resp.get("code") != 0:
         return {
@@ -435,10 +489,12 @@ def list_positions() -> dict:
 
 
 def position_amt(symbol: str) -> float:
+    """Объём LONG по нашему тикеру."""
     return _position_amt(to_bx_symbol(symbol))
 
 
 def get_position(symbol: str) -> dict:
+    """Получить позицию с фактической ценой входа (avgPrice)."""
     bx_symbol = to_bx_symbol(symbol)
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
     if resp.get("code") != 0:
@@ -465,6 +521,7 @@ def get_position(symbol: str) -> dict:
 def wait_for_position_fill(
     symbol: str, timeout_sec: int = 30, poll_interval: float = 1.0
 ) -> dict:
+    """После MARKET order ждать появления позиции с ненулевым avgPrice."""
     bx_symbol = to_bx_symbol(symbol)
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -483,6 +540,11 @@ def wait_for_position_fill(
 # TP ORDER QUERIES
 # ============================================================
 def get_open_tp_orders(symbol: str) -> dict:
+    """Получить все открытые TP ордера для символа (только наши).
+    v2.8: фильтр по полю clientOrderId (биржа возвращает именно так,
+    а не clientOrderID). Главный маркер "наш" — clientOrderId начинается
+    с CM_TP_.
+    """
     bx_symbol = to_bx_symbol(symbol)
     resp = _request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": bx_symbol})
     if resp.get("code") != 0:
@@ -504,6 +566,10 @@ def get_open_tp_orders(symbol: str) -> dict:
 def get_filled_tp_orders(
     symbol: str, opened_ts: int = None, trade_id: str = None
 ) -> dict:
+    """Получить исполненные TP ордера из order history.
+    trade_id — основной фильтр (через hash), opened_ts — fallback защита.
+    v2.8: читаем clientOrderId (маленькая d) — реальное имя поля в ответе BingX.
+    """
     bx_symbol = to_bx_symbol(symbol)
     resp = _request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": bx_symbol})
     if resp.get("code") != 0:
@@ -543,6 +609,7 @@ def get_filled_tp_orders(
 
 
 def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> dict:
+    """Проверить какие TP legs уже существуют (для данной сделки)."""
     result = get_open_tp_orders(symbol)
     if result.get("status") == "error":
         return {
@@ -592,10 +659,11 @@ def place_take_profit_orders(
     tp_levels: list = None,
     trade_id: str = None,
 ) -> dict:
-    """
-    Выставляет ВСЕ 3 TP ордера.
-    Каждый ордер закрытия получает минимум 1 квант (step = 10**-prec), 
-    исключая появление qty <= 0.
+    """Создать BingX TP ордера через Trigger Order API.
+    v2.7: БЕЗ reduceOnly (BingX Hedge Mode запрещает это поле).
+    Привязка к LONG через positionSide=LONG.
+    clientOrderId ≤ 40 символов (hash trade_id).
+    Atomic rollback при partial failure.
     """
     if tp_levels is None:
         return {
@@ -652,7 +720,6 @@ def place_take_profit_orders(
                 "error": f"TP close_fraction invalid: {close_fraction}",
                 "orders": [],
             }
-
     bx_symbol = to_bx_symbol(symbol)
     existing_check = get_existing_tp_legs(symbol, tp_levels, trade_id=trade_id)
     if existing_check.get("all_present"):
@@ -663,16 +730,12 @@ def place_take_profit_orders(
             "orders": [],
             "existing_qty": existing_check.get("existing_qty"),
         }
-
     missing_legs = existing_check.get("missing", [])
     existing_qty = existing_check.get("existing_qty", 0)
     c = _contracts().get(bx_symbol)
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
-
-    prec = int(c.get("quantityPrecision") or 0)
-    step = 10 ** (-prec) if prec > 0 else 1.0
-
+    prec = int(c.get("quantityPrecision") or 0) 
     available_qty = position_qty - existing_qty
     if available_qty <= 0:
         log.warning(f"[{symbol}] вся qty уже зарезервирована существующими TP")
@@ -681,74 +744,34 @@ def place_take_profit_orders(
             "legs": existing_check.get("legs"),
             "orders": [],
         }
-
-    total_quanta = int(round(position_qty / step))
-    if total_quanta <= 0:
-        return {"status": "error", "error": f"position_qty={position_qty} is 0"}
-
-    # 1. Расчет квантов: динамически считывает close_fraction, давая каждому TP минимум 1 квант
-    fractions = [float(tp.get("close_fraction") or 0.0) for tp in tp_levels]
-    ideal_quanta = [f * total_quanta for f in fractions]
-    base_quanta = [max(1, int(math.floor(round(q, 8)))) for q in ideal_quanta]
-
-    used_quanta = sum(base_quanta)
-    if used_quanta > total_quanta:
-        for i in range(len(base_quanta) - 1, -1, -1):
-            while used_quanta > total_quanta and base_quanta[i] > 1:
-                base_quanta[i] -= 1
-                used_quanta -= 1
-
-    runner_quanta = max(0, int(math.floor(round(total_quanta * (1.0 - sum(fractions)), 8))))
-    available_for_tp = total_quanta - runner_quanta
-    rem_to_give = available_for_tp - sum(base_quanta)
-
-    if rem_to_give > 0:
-        remainders = sorted(
-            [(i, ideal_quanta[i] - base_quanta[i]) for i in range(len(fractions))],
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        for idx, _ in remainders:
-            if rem_to_give > 0:
-                base_quanta[idx] += 1
-                rem_to_give -= 1
-
-    quanta_map = {
-        tp_levels[i].get("leg", f"tp{i+1}"): base_quanta[i] 
-        for i in range(len(tp_levels))
-    }
-
     orders_created = []
     orders_to_rollback = []
     remaining_qty = available_qty
-
     for i, tp in enumerate(tp_levels):
         leg = tp.get("leg", f"tp{i + 1}")
         if leg not in missing_legs:
             continue
-
-        pnl_pct = float(tp.get("pnl_pct", 0.0))
-        tp_price = avg_price * (1.0 + pnl_pct / 100.0)
-
-        tp_qty = round(quanta_map[leg] * step, prec)
+        pnl_pct = tp.get("pnl_pct", 0)
+        tp_price = avg_price * (1 + pnl_pct / 100)
+        close_fraction = float(tp.get("close_fraction", 0.0) or 0.0)
+        tp_qty = position_qty * close_fraction
+        tp_qty = _round_qty(tp_qty, prec)
+        
         if tp_qty <= 0:
-            log.warning(f"[{symbol}] {leg}: qty<=0 после квантования, пропускаем")
+            log.warning(f"[{symbol}] {leg}: qty<=0 после округления, пропускаем")
             continue
-
         remaining_qty = remaining_qty - tp_qty
         client_order_id = build_tp_client_order_id(leg, trade_id)
-        tp_qty_str = f"{Decimal(str(tp_qty)):f}"
-
         params = {
             "symbol": bx_symbol,
             "side": "SELL",
             "positionSide": "LONG",
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": str(round(tp_price, 8)),
-            "quantity": tp_qty_str,
+            "quantity": str(tp_qty),
             "clientOrderId": client_order_id,
+            # "reduceOnly" намеренно НЕ передаём для Hedge Mode
         }
-
         resp = _request("POST", ORDER_PATH, params)
         if resp.get("code") == 0:
             order = (resp.get("data") or {}).get("order") or {}
@@ -785,7 +808,7 @@ def place_take_profit_orders(
                 }
             )
             log.info(
-                f"[{symbol}] {leg} создан: orderId={oid} price={tp_price:.6f} qty={tp_qty_str}"
+                f"[{symbol}] {leg} создан: orderId={oid} price={tp_price:.6f} qty={tp_qty}"
             )
         else:
             err = f"code={resp.get('code')} msg={resp.get('msg')}"
@@ -824,10 +847,8 @@ def place_take_profit_orders(
                 "failed_leg": leg,
                 "rolled_back": len(orders_to_rollback),
             }
-
     if not orders_created:
         return {"status": "error", "error": "ни один TP не создан"}
-
     return {
         "status": "created",
         "orders": orders_created,
@@ -841,6 +862,15 @@ def place_take_profit_orders(
 
 
 def cancel_take_profit_orders(symbol: str) -> dict:
+    """Безопасно отменяет все наши открытые TP.
+    Безопасные результаты:
+      - no_orders
+      - cancelled
+    Небезопасные:
+      - partial_or_failed
+      - error
+    После DELETE обязательно выполняется повторная проверка биржи.
+    """
     bx_symbol = to_bx_symbol(symbol)
     result = get_open_tp_orders(symbol)
     if result.get("status") == "error":
@@ -896,9 +926,9 @@ def cancel_take_profit_orders(symbol: str) -> dict:
                     "type": order.get("type"),
                 }
             )
-            log.info(f"[{symbol}] TP {parsed.get('leg')} отменён orderId={oid}")
+            log.info(f"[{symbol}] TP {parsed.get('leg')} " f"отменён orderId={oid}")
         else:
-            log.warning(f"[{symbol}] отмена TP {oid} failed: {resp.get('msg')}")
+            log.warning(f"[{symbol}] отмена TP {oid} failed: " f"{resp.get('msg')}")
     verify = get_open_tp_orders(symbol)
     if verify.get("status") == "error":
         return {
@@ -932,7 +962,7 @@ def cancel_take_profit_orders(symbol: str) -> dict:
             }
             for o in remaining_orders
         ],
-        "error": f"После отмены остаются TP: {remaining_count}/{total_found}",
+        "error": (f"После отмены остаются TP: " f"{remaining_count}/{total_found}"),
     }
 
 
@@ -940,6 +970,7 @@ def cancel_take_profit_orders(symbol: str) -> dict:
 # SL ORDER QUERIES / CREATION / CANCELLATION
 # ============================================================
 def get_open_sl_orders(symbol: str) -> dict:
+    """Получить все открытые STOP_LOSS ордера для символа (только наши)."""
     bx_symbol = to_bx_symbol(symbol)
     resp = _request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": bx_symbol})
     if resp.get("code") != 0:
@@ -961,6 +992,7 @@ def get_open_sl_orders(symbol: str) -> dict:
 def get_filled_sl_orders(
     symbol: str, opened_ts: int = None, trade_id: str = None
 ) -> dict:
+    """Получить исполненные STOP_LOSS ордера из order history."""
     bx_symbol = to_bx_symbol(symbol)
     resp = _request("GET", "/openApi/swap/v2/trade/allOrders", {"symbol": bx_symbol})
     if resp.get("code") != 0:
@@ -1004,6 +1036,10 @@ def place_stop_loss_order(
     stop_loss_pct: float,
     trade_id: str = None,
 ) -> dict:
+    """Создать биржевой STOP_LOSS (STOP_MARKET) для LONG-позиции.
+    Гарантированное исполнение на бирже независимо от того, работает ли
+    программная проверка внутри monitor.py на момент прогона.
+    """
     bx_symbol = to_bx_symbol(symbol)
     if not avg_price or avg_price <= 0:
         return {"status": "error", "error": "некорректная avg_price"}
@@ -1024,21 +1060,21 @@ def place_stop_loss_order(
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
     prec = int(c.get("quantityPrecision") or 0)
-    step = 10 ** (-prec) if prec > 0 else 1.0
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     qty_r = _round_qty(qty, prec)
-    if qty_r <= 0 or qty_r < step:
-        return {"status": "error", "error": f"qty={qty_r} < step={step}"}
+    if qty_r <= 0 or qty_r < min_qty:
+        return {"status": "error", "error": f"qty={qty_r} < minQty={min_qty}"}
     stop_price = avg_price * (1 - stop_loss_pct / 100)
     client_order_id = build_sl_client_order_id(trade_id)
-    qty_str = f"{Decimal(str(qty_r)):f}"
     params = {
         "symbol": bx_symbol,
         "side": "SELL",
         "positionSide": "LONG",
         "type": "STOP_MARKET",
         "stopPrice": str(round(stop_price, 8)),
-        "quantity": qty_str,
+        "quantity": str(qty_r),
         "clientOrderId": client_order_id,
+        # "reduceOnly" намеренно НЕ передаём для Hedge Mode (как и для TP)
     }
     resp = _request("POST", ORDER_PATH, params)
     if resp.get("code") == 0:
@@ -1059,7 +1095,7 @@ def place_stop_loss_order(
             }
         )
         log.info(
-            f"[{symbol}] SL создан: orderId={oid} stopPrice={stop_price:.6f} qty={qty_str}"
+            f"[{symbol}] SL создан: orderId={oid} stopPrice={stop_price:.6f} qty={qty_r}"
         )
         return {
             "status": "created",
@@ -1086,6 +1122,11 @@ def place_stop_loss_order(
 
 
 def cancel_stop_loss_orders(symbol: str) -> dict:
+    """Безопасно отменяет все наши открытые SL.
+    Безопасные результаты: no_orders, cancelled.
+    Небезопасные: partial_or_failed, error.
+    После DELETE обязательно выполняется повторная проверка биржи.
+    """
     bx_symbol = to_bx_symbol(symbol)
     result = get_open_sl_orders(symbol)
     if result.get("status") == "error":
@@ -1178,10 +1219,14 @@ def update_stop_loss_order(
     qty: float,
     trade_id: str = None,
 ) -> dict:
+    """Обновить (затрейлить) биржевой STOP_LOSS.
+    Сначала отменяет старый SL ордер, затем выставляет новый по new_stop_price.
+    """
     bx_symbol = to_bx_symbol(symbol)
     if not new_stop_price or new_stop_price <= 0:
         return {"status": "error", "error": "некорректный new_stop_price"}
     
+    # 1. Отменить старые SL
     cancel_res = cancel_stop_loss_orders(symbol)
     if cancel_res.get("status") in ("error", "partial_or_failed"):
         log.warning(
@@ -1189,24 +1234,24 @@ def update_stop_loss_order(
             f"{cancel_res.get('status')}: {cancel_res.get('error')}"
         )
 
+    # 2. Выставить новый SL
     c = _contracts().get(bx_symbol)
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
     prec = int(c.get("quantityPrecision") or 0)
-    step = 10 ** (-prec) if prec > 0 else 1.0
+    min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
     qty_r = _round_qty(qty, prec)
-    if qty_r <= 0 or qty_r < step:
-        return {"status": "error", "error": f"qty={qty_r} < step={step}"}
+    if qty_r <= 0 or (min_qty and qty_r < min_qty):
+        return {"status": "error", "error": f"qty={qty_r} < minQty={min_qty}"}
 
     client_order_id = build_sl_client_order_id(trade_id)
-    qty_str = f"{Decimal(str(qty_r)):f}"
     params = {
         "symbol": bx_symbol,
         "side": "SELL",
         "positionSide": "LONG",
         "type": "STOP_MARKET",
         "stopPrice": str(round(new_stop_price, 8)),
-        "quantity": qty_str,
+        "quantity": str(qty_r),
         "clientOrderId": client_order_id,
     }
     resp = _request("POST", ORDER_PATH, params)
@@ -1226,7 +1271,7 @@ def update_stop_loss_order(
             }
         )
         log.info(
-            f"[{symbol}] Trailing SL обновлён: orderId={oid} stopPrice={new_stop_price:.6f} qty={qty_str}"
+            f"[{symbol}] Trailing SL обновлён: orderId={oid} stopPrice={new_stop_price:.6f} qty={qty_r}"
         )
         return {
             "status": "created",
@@ -1253,11 +1298,18 @@ def update_stop_loss_order(
 
 
 # ============================================================
-# FILL DETECTION HELPERS
+# FILL DETECTION HELPERS (чистые функции, без side-effects
+# на журналы/telegram/watchlist — это забота monitor.py)
 # ============================================================
 def compute_new_tp_fills(
     symbol: str, trade_id: str, opened_ts: int, processed_fills: dict
 ) -> dict:
+    """Сравнивает исполненные TP-ордера на бирже с уже обработанными
+    (processed_fills — словарь order_id -> executed_qty, известный вызывающей
+    стороне). Возвращает только НОВЫЕ/увеличившиеся fills. Ничего не пишет,
+    не мутирует processed_fills — коммит делает monitor.py после успешной
+    записи в журнал (crash-safety).
+    """
     result = get_filled_tp_orders(symbol, opened_ts=opened_ts, trade_id=trade_id)
     if result.get("status") != "ok":
         return {"status": "error", "error": result.get("error"), "fills": []}
@@ -1307,6 +1359,7 @@ def compute_new_tp_fills(
 def get_last_filled_sl(
     symbol: str, opened_ts: int = None, trade_id: str = None
 ) -> dict:
+    """Возвращает последний по времени исполненный STOP_LOSS ордер (или None)."""
     result = get_filled_sl_orders(symbol, opened_ts=opened_ts, trade_id=trade_id)
     if result.get("status") != "ok":
         return {
@@ -1345,7 +1398,154 @@ def _set_leverage(bx_symbol: str, leverage: int) -> bool:
     return False
 
 
+def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
+    """Открывает LONG.
+    Если LONG уже существует на бирже, новый research-entry НЕ усыновляет
+    существующую позицию. Ownership существующей позиции должен идти через
+    уже существующий local open_trade/reconcile state.
+    """
+    bx_symbol = to_bx_symbol(symbol)
+    amt = _position_amt(bx_symbol)
+    if amt > 0:
+        log.warning(
+            f"[{symbol}] EXISTING LONG detected: "
+            f"qty={amt}. New entry will NOT adopt this position."
+        )
+        _log_event(
+            {
+                "event": "open_skipped_existing_position",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "existing_qty": amt,
+                "trade_id": trade_id,
+            }
+        )
+        return {
+            "status": "foreign_position",
+            "order_id": None,
+            "qty": amt,
+            "existing_qty": amt,
+            "symbol": bx_symbol,
+            "trade_id": trade_id,
+        }
+    c = _contracts().get(bx_symbol)
+    if not c:
+        return {
+            "status": "error",
+            "error": f"контракт {bx_symbol} не найден в /quote/contracts",
+        }
+    leverage = LEVERAGE
+    qty, prec, min_qty = _qty_for(c, price, leverage)
+    if qty is None:
+        return {
+            "status": "error",
+            "error": "некорректная цена",
+        }
+    max_lev = int(c.get("maxLongLeverage") or c.get("maxLeverage") or MAX_LEVERAGE)
+    max_lev = min(max_lev, MAX_LEVERAGE)
+    if qty < min_qty and leverage < max_lev:
+        need_lev = math.ceil(
+            (min_qty * (price or 0) * float(c.get("multiplier") or 1)) / MARGIN_USDT
+        )
+        leverage = min(max(need_lev, leverage), max_lev)
+        qty, prec, min_qty = _qty_for(c, price, leverage)
+    if qty is None or qty <= 0 or qty < min_qty:
+        return {
+            "status": "error",
+            "error": (
+                f"маржа {MARGIN_USDT}$ слишком мала: "
+                f"qty={qty} < minQty={min_qty} "
+                f"(подними BINGX_LEVERAGE/BINGX_MARGIN_USDT)"
+            ),
+        }
+    _set_leverage(bx_symbol, leverage)
+    client_order_id = build_open_client_order_id(bx_symbol, trade_id)
+    params = {
+        "symbol": bx_symbol,
+        "side": "BUY",
+        "positionSide": "LONG",
+        "type": "MARKET",
+        "quantity": str(qty),
+        "clientOrderId": client_order_id,
+    }
+    log.info(
+        f"[{symbol}] OPEN DEBUG: "
+        f"bx={bx_symbol} price={price} "
+        f"margin={MARGIN_USDT} leverage={leverage} "
+        f"qty={qty} min_qty={min_qty} "
+        f"size={c.get('size')} multiplier={c.get('multiplier')} "
+        f"tradeMinUSDT={c.get('tradeMinUSDT')} "
+        f"quantityPrecision={c.get('quantityPrecision')} "
+        f"maxLongLeverage={c.get('maxLongLeverage')}"
+    )
+    resp = _request("POST", ORDER_PATH, params)
+    if resp.get("code") != 0:
+        err_msg = str(resp.get("msg", "")).lower()
+        if "positionside" in err_msg or "position side" in err_msg:
+            log.error(
+                f"[{symbol}] BingX не принимает positionSide=LONG: "
+                f"{resp.get('msg')}"
+            )
+            _log_event(
+                {
+                    "event": "open_failed",
+                    "symbol": symbol,
+                    "bx_symbol": bx_symbol,
+                    "error": f"Hedge Mode not supported: {resp.get('msg')}",
+                    "trade_id": trade_id,
+                }
+            )
+            return {
+                "status": "error",
+                "error": (
+                    f"Hedge Mode (positionSide=LONG) "
+                    f"не поддерживается: {resp.get('msg')}"
+                ),
+            }
+        err = f"code={resp.get('code')} msg={resp.get('msg')}"
+        _log_event(
+            {
+                "event": "open_failed",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "error": err,
+                "trade_id": trade_id,
+            }
+        )
+        return {
+            "status": "error",
+            "error": err,
+        }
+    order = (resp.get("data") or {}).get("order") or {}
+    oid = str(order.get("orderId", ""))
+    _log_event(
+        {
+            "event": "open",
+            "symbol": symbol,
+            "bx_symbol": bx_symbol,
+            "order_id": oid,
+            "client_order_id": client_order_id,
+            "qty": qty,
+            "price": price,
+            "leverage": leverage,
+            "margin_usdt": MARGIN_USDT,
+            "trade_id": trade_id,
+        }
+    )
+    return {
+        "status": "opened",
+        "order_id": oid,
+        "client_order_id": client_order_id,
+        "qty": qty,
+        "symbol": bx_symbol,
+        "leverage": leverage,
+        "margin_usdt": MARGIN_USDT,
+        "trade_id": trade_id,
+    }
+
+
 def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_sec: int = 30) -> dict:
+   
     refresh = _refresh_contracts()
 
     if refresh.get("status") != "ok":
@@ -1393,6 +1593,7 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
             "open": open_res,
         }
     if status not in ("opened", "already_open"):
+        # Проверяем, не открылась ли позиция на бирже, несмотря на ошибку/таймаут ответа
         pos_check = get_position(symbol)
         if pos_check.get("status") == "found" and float(pos_check.get("positionAmt", 0) or 0) > 0:
             log.warning(
@@ -1469,6 +1670,9 @@ def attach_protection(
     stop_loss_pct: float,
     trade_id: str = None,
 ) -> dict:
+    """Размещает TP-ордера и STOP_LOSS для уже открытой и подтверждённой позиции.
+    Вызывается ПОСЛЕ того как monitor.py сохранил checkpoint по open_position().
+    """
     tp_result = place_take_profit_orders(
         symbol, avg_price, qty, tp_levels, trade_id=trade_id
     )
@@ -1495,6 +1699,14 @@ def close_long(
     client_order_id: str = None,
     trade_id: str = None,
 ) -> dict:
+    """Закрывает LONG рыночным ордером.
+    cancel_tp=True:
+        Полное закрытие.
+        Перед SELL TP и SL должны быть подтверждённо удалены.
+    cancel_tp=False:
+        Частичное сокращение.
+        TP и SL НЕ отменяются.
+    """
     if not qty or float(qty) <= 0:
         return {
             "status": "error",
@@ -1513,7 +1725,13 @@ def close_long(
                 f"[{symbol}] FULL CLOSE BLOCKED: "
                 f"TP/SL cancellation not confirmed: "
                 f"tp_status={cancel_status} "
-                f"sl_status={cancel_sl_status}"
+                f"tp_cancelled={cancel_result.get('cancelled_count')} "
+                f"tp_total={cancel_result.get('total_found')} "
+                f"tp_remaining={cancel_result.get('remaining_count')} "
+                f"sl_status={cancel_sl_status} "
+                f"sl_cancelled={cancel_sl_result.get('cancelled_count')} "
+                f"sl_total={cancel_sl_result.get('total_found')} "
+                f"sl_remaining={cancel_sl_result.get('remaining_count')}"
             )
             _log_event(
                 {
@@ -1522,12 +1740,16 @@ def close_long(
                     "trade_id": trade_id,
                     "qty_requested": float(qty),
                     "tp_cancel_status": cancel_status,
+                    "tp_cancel_result": cancel_result,
                     "sl_cancel_status": cancel_sl_status,
+                    "sl_cancel_result": cancel_sl_result,
                 }
             )
             return {
                 "status": "blocked",
-                "error": "full close blocked: TP/SL cancellation not safely confirmed",
+                "error": (
+                    "full close blocked: " "TP/SL cancellation not safely confirmed"
+                ),
                 "tp_cancel_result": cancel_result,
                 "sl_cancel_result": cancel_sl_result,
             }
@@ -1566,12 +1788,14 @@ def _close_position(
     c = _contracts().get(bx_symbol)
     if c:
         prec = int(c.get("quantityPrecision") or 0)
-        step = 10 ** (-prec) if prec > 0 else 1.0
+        min_qty = float(c.get("tradeMinQuantity") or c.get("minQty") or 0)
         rounded = _round_qty(qty, prec)
         if rounded <= 0:
             log.warning(f"[{bx_symbol}] округление {qty}→0 — отправляем исходный qty")
-        elif rounded < step:
-            log.warning(f"[{bx_symbol}] qty={rounded}<step={step} — отправляем исходный qty")
+        elif min_qty and rounded < min_qty:
+            log.warning(
+                f"[{bx_symbol}] qty={rounded}<minQty={min_qty} — отправляем исходный qty"
+            )
         else:
             qty = rounded
     else:
@@ -1580,14 +1804,12 @@ def _close_position(
         )
     if qty <= 0:
         return {"status": "skipped", "error": f"qty<=0 ({qty})"}
-
-    qty_str = f"{Decimal(str(qty)):f}"
     params = {
         "symbol": bx_symbol,
         "side": "SELL",
         "positionSide": "LONG",
         "type": "MARKET",
-        "quantity": qty_str,
+        "quantity": str(qty),
     }
     if client_order_id:
         params["clientOrderId"] = client_order_id
