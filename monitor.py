@@ -103,8 +103,7 @@ ENGINE_VERSIONS = {
     "conditions": CONDITIONS_CONFIG,
 }
 HASH_VERSION = "sha256_v1"
-TRADE_TIMEOUT_MIN = 240
-TRADE_TIMEOUT_EXTENDED_MIN = 360
+TRADE_TIMEOUT_MIN = 360 
 BINGX_SKIP_NOTIFY_COOLDOWN_SEC = 4 * 3600
 FEE_PCT = 0.10
 SIGNAL_DECAY_MIN = 90
@@ -3140,12 +3139,7 @@ def manage_open_trade(
     last_signal_ts = ot.get("last_signal_ts", ot["entry_ts"])
     age_min = round((ts - ot["entry_ts"]) / 60, 1)
     signal_age_min = round((ts - last_signal_ts) / 60, 1)
-    
-    # 240m остаётся аналитическим флагом.
-    # 360m — фактический hard-exit.
     timeout_reached = age_min >= TRADE_TIMEOUT_MIN
-    timeout_exit_reached = age_min >= TRADE_TIMEOUT_EXTENDED_MIN
-
     signal_decay = ts - last_signal_ts >= SIGNAL_DECAY_MIN * 60
     discovery_missing = scrape_complete and not symbol_in_current_scrape
     data_stale = (
@@ -3171,7 +3165,7 @@ def manage_open_trade(
         "EXHAUSTION": state == "EXHAUSTION",
         "DISTRIBUTION": state == "DISTRIBUTION",
         "STOP_LOSS": is_sl_hit,
-        "TIMEOUT": timeout_exit_reached,
+        "TIMEOUT": timeout_reached,
     }
     soft_conditions = {
         "SIGNAL_DECAY": signal_decay,
@@ -3202,7 +3196,6 @@ def manage_open_trade(
             "price_age_min": price_age_min,
             "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
             "timeout_reached": timeout_reached,
-            "timeout_exit_reached": timeout_exit_reached,
             "signal_decay": signal_decay,
             "missed": missed,
             "data_stale": data_stale,
@@ -3225,8 +3218,6 @@ def manage_open_trade(
                 "position_age_min": age_min,
                 "signal_age_min": signal_age_min,
                 "pnl_pct": round(pnl_pct, 3) if pnl_pct is not None else None,
-                "timeout_reached": timeout_reached,
-                "timeout_exit_reached": timeout_exit_reached,
                 "soft_conditions": soft_conditions,
                 "hard_candidates": hard_candidates,
                 "health_status": health_status,
