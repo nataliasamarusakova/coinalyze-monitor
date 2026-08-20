@@ -10,8 +10,9 @@ from typing import Optional
 from bisect import bisect_right
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-import requests
 from statistics import median
+import ta_context
+import requests
 
 
 try:
