@@ -13,10 +13,16 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      COINALYZE_P_SID: ${{ secrets.COINALYZE_P_SID }}
+      COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      COINALYZE_URL: ${{ secrets.COINALYZE_URL }}
+      ENABLE_BINGX: "true"
       BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
       BINGX_SECRET_KEY: ${{ secrets.BINGX_SECRET_KEY }}
-      BINGX_BASE_URL: ${{ secrets.BINGX_BASE_URL }}
-
+      BINGX_MARGIN_USDT: "1"
+      BINGX_LEVERAGE: "10"          
     steps:
       - name: Checkout
         uses: actions/checkout@v4
