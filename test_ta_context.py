@@ -4,39 +4,25 @@
 """
 Standalone BingX TA Context tester.
 
-Ничего не меняет в monitor.py.
-Ничего не открывает/закрывает на BingX.
-Только:
-    1) получает OHLCV с BingX,
-    2) берёт только ЗАКРЫТЫЕ свечи,
-    3) считает TA для 1h / 4h / 1d,
-    4) печатает готовый Telegram-блок.
+Не изменяет monitor.py.
+Не открывает и не закрывает позиции.
 
-Использование:
+Получает закрытые OHLCV свечи BingX:
+    1h
+    4h
+    1d
 
-    python test_ta_context.py --symbol QTUM
+И рассчитывает:
 
-или:
-
-    python test_ta_context.py --symbol QTUM-USDT
-
-Зависимости:
-
-    pip install requests pandas pandas-ta-classic
-
-Переменные окружения:
-
-    BINGX_API_KEY
-    BINGX_SECRET_KEY
-
-Для текущей архитектуры можно использовать тот же BASE_URL,
-который уже используется в bingx_client.py:
-
-    BINGX_BASE_URL=https://open-api-vst.bingx.com
-
-Для live:
-
-    BINGX_BASE_URL=https://open-api.bingx.com
+    EMA20 / EMA50 / EMA200
+    RSI14
+    ADX14
+    +DI / -DI
+    ATR%
+    ATR percentile
+    Bollinger Width percentile
+    Bollinger %B
+    MACD histogram
 """
 
 from __future__ import annotations
@@ -48,7 +34,6 @@ import math
 import os
 import sys
 import time
-from decimal import Decimal
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -57,48 +42,45 @@ import requests
 try:
     import pandas_ta_classic as ta
 except ImportError:
-    print(
-        "ERROR: не установлен pandas-ta-classic.\n"
-        "Установите:\n"
-        "    pip install requests pandas pandas-ta-classic"
-    )
+    print("ERROR: pandas-ta-classic не установлен")
+    print("Установите:")
+    print("    pip install requests pandas pandas-ta-classic")
     sys.exit(1)
+
+
+# ============================================================
+# ENV
+# ============================================================
+
+API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
+SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
+BASE_URL = os.environ.get("BINGX_BASE_URL", "").strip().rstrip("/")
+
+if not API_KEY:
+    raise RuntimeError("BINGX_API_KEY не задан")
+
+if not SECRET_KEY:
+    raise RuntimeError("BINGX_SECRET_KEY не задан")
+
+if not BASE_URL:
+    raise RuntimeError("BINGX_BASE_URL не задан")
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
-
-if not API_KEY:
-    raise RuntimeError(
-        "Environment variable BINGX_API_KEY is not set"
-    )
-
-if not SECRET_KEY:
-    raise RuntimeError(
-        "Environment variable BINGX_SECRET_KEY is not set"
-    )
-
-if not BASE_URL:
-    raise RuntimeError(
-        "Environment variable BINGX_BASE_URL is not set"
-    )
-
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
 
 TIMEFRAMES = ("1h", "4h", "1d")
 
-# Берём больше, чем нужно для индикаторов.
 KLINE_LIMIT = 250
 
-# Сколько последних значений использовать для percentile.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
+
+SOURCE_KEY = "BX-AI-SKILL"
 
 
 # ============================================================
@@ -106,11 +88,6 @@ REQUEST_TIMEOUT = 15
 # ============================================================
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    QTUM -> QTUM-USDT
-    QTUMUSDT -> QTUM-USDT
-    QTUM-USDT -> QTUM-USDT
-    """
     s = (symbol or "").strip().upper()
 
     if not s:
@@ -128,9 +105,6 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def sign_params(params: dict) -> str:
-    """
-    BingX HMAC-SHA256 signature.
-    """
     query_string = urlencode(params)
 
     return hmac.new(
@@ -145,28 +119,26 @@ def request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
-    """
-    Выполняет signed request к BingX.
-
-    Для этого теста подписываем запрос так же,
-    как текущий bingx_client.py.
-    """
-    if not API_KEY or not SECRET_KEY:
-        raise RuntimeError(
-            "Не заданы BINGX_API_KEY / BINGX_SECRET_KEY"
-        )
 
     params = dict(params or {})
 
-    params["timestamp"] = str(int(time.time() * 1000))
+    params["timestamp"] = str(
+        int(time.time() * 1000)
+    )
 
     params["signature"] = sign_params(params)
 
     headers = {
         "X-BX-APIKEY": API_KEY,
+        "X-SOURCE-KEY": SOURCE_KEY,
     }
 
     url = BASE_URL + path
+
+    print(
+        f"    URL: {url}",
+        flush=True,
+    )
 
     response = requests.request(
         method=method,
@@ -176,14 +148,25 @@ def request_signed(
         timeout=REQUEST_TIMEOUT,
     )
 
+    print(
+        f"    HTTP: {response.status_code}",
+        flush=True,
+    )
+
     response.raise_for_status()
 
     try:
         data = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            f"BingX вернул не-JSON ответ: {response.text[:500]}"
+            "BingX вернул не-JSON:\n"
+            + response.text[:1000]
         ) from exc
+
+    print(
+        f"    API code: {data.get('code')}",
+        flush=True,
+    )
 
     if data.get("code") != 0:
         raise RuntimeError(
@@ -196,17 +179,117 @@ def request_signed(
 
 
 # ============================================================
-# KLINES
+# KLINE PARSING
 # ============================================================
+
+def parse_kline_row(
+    row,
+) -> dict | None:
+    """
+    Поддерживает:
+
+    1) обычный BingX array:
+       [openTime, open, high, low, close, volume, closeTime]
+
+    2) dict, если endpoint/окружение когда-нибудь
+       вернёт объект.
+    """
+
+    # --------------------------------------------------------
+    # ARRAY
+    # --------------------------------------------------------
+
+    if isinstance(row, (list, tuple)):
+
+        if len(row) < 7:
+            return None
+
+        try:
+            open_time = int(row[0])
+            open_price = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
+            close_time = int(row[6])
+        except (TypeError, ValueError):
+            return None
+
+        return {
+            "open_time": open_time,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "close_time": close_time,
+        }
+
+    # --------------------------------------------------------
+    # DICT
+    # --------------------------------------------------------
+
+    if isinstance(row, dict):
+
+        # Возможные варианты названий.
+        def first(*keys):
+            for key in keys:
+                if key in row and row[key] is not None:
+                    return row[key]
+            return None
+
+        try:
+            open_time = first(
+                "openTime",
+                "open_time",
+                "time",
+                "timestamp",
+            )
+
+            close_time = first(
+                "closeTime",
+                "close_time",
+                "endTime",
+            )
+
+            open_price = first("open", "openPrice")
+            high = first("high", "highPrice")
+            low = first("low", "lowPrice")
+            close = first("close", "closePrice")
+            volume = first("volume", "vol")
+
+            if None in (
+                open_time,
+                close_time,
+                open_price,
+                high,
+                low,
+                close,
+                volume,
+            ):
+                return None
+
+            return {
+                "open_time": int(open_time),
+                "open": float(open_price),
+                "high": float(high),
+                "low": float(low),
+                "close": float(close),
+                "volume": float(volume),
+                "close_time": int(close_time),
+            }
+
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
 
 def fetch_klines(
     symbol: str,
     interval: str,
     limit: int = KLINE_LIMIT,
 ) -> pd.DataFrame:
-    """
-    Получает K-lines и оставляет только закрытые свечи.
-    """
 
     data = request_signed(
         "GET",
@@ -218,104 +301,116 @@ def fetch_klines(
         },
     )
 
-    rows = data.get("data")
+    raw = data.get("data")
 
-    if not isinstance(rows, list):
+    print(
+        f"    data type: {type(raw).__name__}",
+        flush=True,
+    )
+
+    if raw is None:
         raise RuntimeError(
-            f"{symbol} {interval}: BingX data не является list"
+            f"{symbol} {interval}: data отсутствует в ответе"
+        )
+
+    if not isinstance(raw, list):
+        raise RuntimeError(
+            f"{symbol} {interval}: "
+            f"ожидался list, получен {type(raw).__name__}: "
+            f"{str(raw)[:1000]}"
+        )
+
+    print(
+        f"    raw candles: {len(raw)}",
+        flush=True,
+    )
+
+    if raw:
+        print(
+            f"    first raw candle: {str(raw[0])[:1000]}",
+            flush=True,
         )
 
     parsed = []
 
     now_ms = int(time.time() * 1000)
 
-    for row in rows:
-        if not isinstance(row, (list, tuple)):
+    for row in raw:
+
+        item = parse_kline_row(row)
+
+        if item is None:
             continue
 
-        if len(row) < 7:
+        # ----------------------------------------------------
+        # Проверяем время свечи.
+        #
+        # В нормальном BingX response это milliseconds.
+        # ----------------------------------------------------
+
+        close_time = item["close_time"]
+
+        if close_time <= 0:
             continue
 
-        try:
-            open_time = int(row[0])
-            close_time = int(row[6])
-
-            # Пропускаем ещё незакрытую свечу.
-            if close_time >= now_ms:
-                continue
-
-            parsed.append(
-                {
-                    "open_time": open_time,
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
-                    "close_time": close_time,
-                }
-            )
-
-        except (TypeError, ValueError):
+        if close_time > now_ms:
             continue
 
-    if len(parsed) < 100:
+        # ----------------------------------------------------
+        # Проверяем OHLC
+        # ----------------------------------------------------
+
+        if (
+            item["open"] <= 0
+            or item["high"] <= 0
+            or item["low"] <= 0
+            or item["close"] <= 0
+            or item["volume"] < 0
+        ):
+            continue
+
+        parsed.append(item)
+
+    print(
+        f"    parsed closed candles: {len(parsed)}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # Если всё отфильтровалось — это уже диагностическая
+    # ошибка, поэтому показываем последнюю свечу.
+    # --------------------------------------------------------
+
+    if not parsed:
+        debug = raw[-1] if raw else None
+
         raise RuntimeError(
             f"{symbol} {interval}: "
-            f"слишком мало закрытых свечей: {len(parsed)}"
+            f"после parsing/filter осталось 0 свечей.\n"
+            f"now_ms={now_ms}\n"
+            f"last_raw={debug}"
         )
 
     df = pd.DataFrame(parsed)
 
-    df = df.sort_values("close_time").drop_duplicates(
-        subset=["close_time"],
-        keep="last",
+    df = (
+        df.sort_values("close_time")
+        .drop_duplicates(
+            subset=["close_time"],
+            keep="last",
+        )
+        .reset_index(drop=True)
     )
-
-    df.reset_index(drop=True, inplace=True)
 
     return df
 
 
 # ============================================================
-# INDICATORS
+# NUMERIC HELPERS
 # ============================================================
 
-def percentile_of_last(
-    series: pd.Series,
-    window: int = PERCENTILE_WINDOW,
-) -> float | None:
-    """
-    Percentile текущего последнего значения относительно
-    предыдущих значений.
-
-    Например:
-        84.0
-    означает, что текущее значение выше примерно 84%
-    исторических значений выбранного окна.
-    """
-
-    s = pd.to_numeric(series, errors="coerce").dropna()
-
-    if len(s) < 30:
-        return None
-
-    s = s.tail(window)
-
-    if len(s) < 10:
-        return None
-
-    current = float(s.iloc[-1])
-
-    # Rank percentile.
-    rank = (s <= current).sum()
-
-    pct = (rank / len(s)) * 100.0
-
-    return round(float(pct), 1)
-
-
 def safe_float(value) -> float | None:
+
     if value is None:
         return None
 
@@ -331,12 +426,41 @@ def safe_float(value) -> float | None:
         return None
 
 
-def calculate_features(df: pd.DataFrame) -> dict:
-    """
-    Рассчитывает TA.
+def percentile_of_last(
+    series: pd.Series,
+    window: int = PERCENTILE_WINDOW,
+) -> float | None:
 
-    Ничего из этих признаков не влияет на торговое решение.
-    """
+    s = pd.to_numeric(
+        series,
+        errors="coerce",
+    ).dropna()
+
+    if len(s) < 30:
+        return None
+
+    s = s.tail(window)
+
+    if len(s) < 10:
+        return None
+
+    current = float(s.iloc[-1])
+
+    rank = (s <= current).sum()
+
+    return round(
+        rank / len(s) * 100.0,
+        1,
+    )
+
+
+# ============================================================
+# TA
+# ============================================================
+
+def calculate_features(
+    df: pd.DataFrame,
+) -> dict:
 
     work = df.copy()
 
@@ -344,9 +468,20 @@ def calculate_features(df: pd.DataFrame) -> dict:
     # EMA
     # --------------------------------------------------------
 
-    work["ema20"] = ta.ema(work["close"], length=20)
-    work["ema50"] = ta.ema(work["close"], length=50)
-    work["ema200"] = ta.ema(work["close"], length=200)
+    work["ema20"] = ta.ema(
+        work["close"],
+        length=20,
+    )
+
+    work["ema50"] = ta.ema(
+        work["close"],
+        length=50,
+    )
+
+    work["ema200"] = ta.ema(
+        work["close"],
+        length=200,
+    )
 
     # --------------------------------------------------------
     # RSI
@@ -368,32 +503,28 @@ def calculate_features(df: pd.DataFrame) -> dict:
         length=14,
     )
 
-    if adx is None or adx.empty:
+    if adx is not None and not adx.empty:
+
+        work["adx14"] = adx.get(
+            "ADX_14",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+        work["plus_di14"] = adx.get(
+            "DMP_14",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+        work["minus_di14"] = adx.get(
+            "DMN_14",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+    else:
+
         work["adx14"] = float("nan")
         work["plus_di14"] = float("nan")
         work["minus_di14"] = float("nan")
-    else:
-        adx_col = "ADX_14"
-        dmp_col = "DMP_14"
-        dmn_col = "DMN_14"
-
-        work["adx14"] = (
-            adx[adx_col]
-            if adx_col in adx.columns
-            else float("nan")
-        )
-
-        work["plus_di14"] = (
-            adx[dmp_col]
-            if dmp_col in adx.columns
-            else float("nan")
-        )
-
-        work["minus_di14"] = (
-            adx[dmn_col]
-            if dmn_col in adx.columns
-            else float("nan")
-        )
 
     # --------------------------------------------------------
     # ATR
@@ -407,23 +538,13 @@ def calculate_features(df: pd.DataFrame) -> dict:
     )
 
     work["atr_pct"] = (
-        work["atr14"] / work["close"] * 100.0
-    )
-
-    # ATR percentile
-    work["atr_pctile"] = (
-        work["atr_pct"]
-        .rolling(PERCENTILE_WINDOW, min_periods=20)
-        .apply(
-            lambda x: (
-                (x <= x[-1]).sum() / len(x) * 100.0
-            ),
-            raw=True,
-        )
+        work["atr14"]
+        / work["close"]
+        * 100.0
     )
 
     # --------------------------------------------------------
-    # Bollinger Bands
+    # Bollinger
     # --------------------------------------------------------
 
     bb = ta.bbands(
@@ -433,56 +554,46 @@ def calculate_features(df: pd.DataFrame) -> dict:
     )
 
     if bb is not None and not bb.empty:
-        lower_col = "BBL_20_2.0"
-        middle_col = "BBM_20_2.0"
-        upper_col = "BBU_20_2.0"
-        bandwidth_col = "BBB_20_2.0"
 
-        if all(
-            c in bb.columns
-            for c in (
-                lower_col,
-                middle_col,
-                upper_col,
+        lower = bb.get(
+            "BBL_20_2.0",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+        middle = bb.get(
+            "BBM_20_2.0",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+        upper = bb.get(
+            "BBU_20_2.0",
+            pd.Series(index=work.index, dtype=float),
+        )
+
+        work["bb_lower"] = lower
+        work["bb_middle"] = middle
+        work["bb_upper"] = upper
+
+        work["bb_width"] = (
+            (
+                upper - lower
             )
-        ):
-            work["bb_lower"] = bb[lower_col]
-            work["bb_middle"] = bb[middle_col]
-            work["bb_upper"] = bb[upper_col]
+            / middle
+        )
 
-        if bandwidth_col in bb.columns:
-            work["bb_width"] = bb[bandwidth_col]
-
-        else:
-            work["bb_width"] = (
-                (
-                    work["bb_upper"]
-                    - work["bb_lower"]
-                )
-                / work["bb_middle"]
+        work["bb_pctb"] = (
+            (
+                work["close"] - lower
             )
+            /
+            (
+                upper - lower
+            )
+        )
 
     else:
+
         work["bb_width"] = float("nan")
-
-    work["bb_width_pctile"] = (
-        work["bb_width"]
-        .rolling(PERCENTILE_WINDOW, min_periods=20)
-        .apply(
-            lambda x: (
-                (x <= x[-1]).sum() / len(x) * 100.0
-            ),
-            raw=True,
-        )
-    )
-
-    # %B
-    try:
-        work["bb_pctb"] = (
-            (work["close"] - work["bb_lower"])
-            / (work["bb_upper"] - work["bb_lower"])
-        )
-    except Exception:
         work["bb_pctb"] = float("nan")
 
     # --------------------------------------------------------
@@ -497,39 +608,50 @@ def calculate_features(df: pd.DataFrame) -> dict:
     )
 
     if macd is not None and not macd.empty:
-        hist_col = "MACDh_12_26_9"
 
-        if hist_col in macd.columns:
-            work["macd_hist"] = macd[hist_col]
-        else:
-            work["macd_hist"] = float("nan")
+        work["macd_hist"] = macd.get(
+            "MACDh_12_26_9",
+            pd.Series(index=work.index, dtype=float),
+        )
 
     else:
+
         work["macd_hist"] = float("nan")
 
-    # Нормированное значение:
-    # MACD histogram / price * 100
     work["macd_hist_pct"] = (
         work["macd_hist"]
-        / work["close"]
+        /
+        work["close"]
         * 100.0
     )
 
     # --------------------------------------------------------
-    # LAST CLOSED CANDLE
+    # Percentiles
+    # --------------------------------------------------------
+
+    atr_pctile = percentile_of_last(
+        work["atr_pct"]
+    )
+
+    bb_width_pctile = percentile_of_last(
+        work["bb_width"]
+    )
+
+    # --------------------------------------------------------
+    # LAST
     # --------------------------------------------------------
 
     last = work.iloc[-1]
 
-    # --------------------------------------------------------
-    # EMA STRUCTURE
-    # --------------------------------------------------------
+    ema20 = safe_float(last["ema20"])
+    ema50 = safe_float(last["ema50"])
+    ema200 = safe_float(last["ema200"])
 
-    ema20 = safe_float(last.get("ema20"))
-    ema50 = safe_float(last.get("ema50"))
-    ema200 = safe_float(last.get("ema200"))
-
-    if None in (ema20, ema50, ema200):
+    if None in (
+        ema20,
+        ema50,
+        ema200,
+    ):
         ema_structure = "N/A"
         ema_direction = "neutral"
 
@@ -545,81 +667,54 @@ def calculate_features(df: pd.DataFrame) -> dict:
         ema_structure = "mixed"
         ema_direction = "mixed"
 
-    # --------------------------------------------------------
-    # DI
-    # --------------------------------------------------------
+    adx_value = safe_float(
+        last["adx14"]
+    )
 
-    adx_value = safe_float(last.get("adx14"))
-    plus_di = safe_float(last.get("plus_di14"))
-    minus_di = safe_float(last.get("minus_di14"))
+    plus_di = safe_float(
+        last["plus_di14"]
+    )
 
-    if plus_di is None or minus_di is None:
-        di_direction = "neutral"
+    minus_di = safe_float(
+        last["minus_di14"]
+    )
 
-    elif plus_di > minus_di:
-        di_direction = "bullish"
+    rsi = safe_float(
+        last["rsi14"]
+    )
 
-    elif plus_di < minus_di:
-        di_direction = "bearish"
+    atr_pct = safe_float(
+        last["atr_pct"]
+    )
 
-    else:
-        di_direction = "neutral"
+    bb_pctb = safe_float(
+        last["bb_pctb"]
+    )
 
-    # --------------------------------------------------------
-    # MACD direction
-    # --------------------------------------------------------
+    macd_hist = safe_float(
+        last["macd_hist"]
+    )
 
-    macd_hist = safe_float(last.get("macd_hist"))
-    macd_hist_pct = safe_float(last.get("macd_hist_pct"))
+    macd_hist_pct = safe_float(
+        last["macd_hist_pct"]
+    )
 
     if macd_hist is None:
-        macd_direction = "N/A"
-
+        macd_direction = "—"
     elif macd_hist > 0:
         macd_direction = "↑"
-
     elif macd_hist < 0:
         macd_direction = "↓"
-
     else:
         macd_direction = "→"
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi = safe_float(last.get("rsi14"))
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
-
-    atr_pct = safe_float(last.get("atr_pct"))
-
-    atr_pctile = percentile_of_last(
-        work["atr_pct"],
-        PERCENTILE_WINDOW,
-    )
-
-    # --------------------------------------------------------
-    # BB
-    # --------------------------------------------------------
-
-    bb_width_pctile = percentile_of_last(
-        work["bb_width"],
-        PERCENTILE_WINDOW,
-    )
-
-    bb_pctb = safe_float(last.get("bb_pctb"))
-
     return {
-        "close": safe_float(last.get("close")),
+        "close": safe_float(last["close"]),
         "close_time": int(last["close_time"]),
 
         "ema20": ema20,
         "ema50": ema50,
         "ema200": ema200,
-
         "ema_structure": ema_structure,
         "ema_direction": ema_direction,
 
@@ -628,7 +723,6 @@ def calculate_features(df: pd.DataFrame) -> dict:
         "adx14": adx_value,
         "plus_di14": plus_di,
         "minus_di14": minus_di,
-        "di_direction": di_direction,
 
         "atr_pct": atr_pct,
         "atr_pctile": atr_pctile,
@@ -645,150 +739,119 @@ def calculate_features(df: pd.DataFrame) -> dict:
 
 
 # ============================================================
-# FORMAT
+# OUTPUT
 # ============================================================
 
-def format_number(
+def fnum(
     value,
-    decimals: int = 1,
-) -> str:
+    decimals=1,
+):
     if value is None:
         return "—"
 
     return f"{value:.{decimals}f}"
 
 
-def format_ema_direction(direction: str) -> str:
-    if direction == "bullish":
-        return "🟢"
-
-    if direction == "bearish":
-        return "🔴"
-
-    if direction == "mixed":
-        return "🟡"
-
-    return "⚪"
-
-
-def format_ta_block(
+def format_ta(
     symbol: str,
-    features: dict[str, dict],
+    features: dict,
 ) -> str:
 
-    lines = []
+    out = []
 
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("📊 Technical Context")
-    lines.append("")
+    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append("📊 Technical Context")
+    out.append("")
 
     for tf in TIMEFRAMES:
+
         f = features.get(tf)
 
-        lines.append(tf.upper())
+        out.append(tf.upper())
 
-        if f is None:
-            lines.append("ERROR: данные недоступны")
-            lines.append("")
+        if not f:
+            out.append("ERROR: нет данных")
+            out.append("")
             continue
 
-        # EMA
-        ema_icon = format_ema_direction(
-            f["ema_direction"]
-        )
+        ema_direction = f["ema_direction"]
 
-        lines.append(
+        if ema_direction == "bullish":
+            ema_icon = "🟢"
+        elif ema_direction == "bearish":
+            ema_icon = "🔴"
+        elif ema_direction == "mixed":
+            ema_icon = "🟡"
+        else:
+            ema_icon = "⚪"
+
+        out.append(
             f"EMA {f['ema_structure']} {ema_icon}"
         )
 
-        # RSI
-        lines.append(
-            f"RSI {format_number(f['rsi14'], 1)}"
+        out.append(
+            f"RSI {fnum(f['rsi14'], 1)}"
         )
 
-        # ADX + DI
-        adx = format_number(
-            f["adx14"],
-            1,
-        )
-
-        plus_di = format_number(
-            f["plus_di14"],
-            1,
-        )
-
-        minus_di = format_number(
-            f["minus_di14"],
-            1,
-        )
+        plus = f["plus_di14"]
+        minus = f["minus_di14"]
 
         if (
-            f["plus_di14"] is not None
-            and f["minus_di14"] is not None
+            plus is not None
+            and minus is not None
         ):
-            if f["plus_di14"] > f["minus_di14"]:
-                di_text = (
-                    f"+DI {plus_di} > -DI {minus_di}"
+            if plus > minus:
+                di = (
+                    f"+DI {fnum(plus)} > "
+                    f"-DI {fnum(minus)}"
                 )
-            elif f["plus_di14"] < f["minus_di14"]:
-                di_text = (
-                    f"+DI {plus_di} < -DI {minus_di}"
+            elif plus < minus:
+                di = (
+                    f"+DI {fnum(plus)} < "
+                    f"-DI {fnum(minus)}"
                 )
             else:
-                di_text = (
-                    f"+DI {plus_di} = -DI {minus_di}"
+                di = (
+                    f"+DI {fnum(plus)} = "
+                    f"-DI {fnum(minus)}"
                 )
-
         else:
-            di_text = "+DI — · -DI —"
+            di = "+DI — | -DI —"
 
-        lines.append(
-            f"ADX {adx} | {di_text}"
+        out.append(
+            f"ADX {fnum(f['adx14'])} | {di}"
         )
 
-        # ATR
-        atr = format_number(
-            f["atr_pct"],
-            2,
+        out.append(
+            f"ATR {fnum(f['atr_pct'], 2)}% | "
+            f"{fnum(f['atr_pctile'], 0)}%ile"
         )
 
-        atr_pctile = format_number(
-            f["atr_pctile"],
-            0,
+        out.append(
+            f"BB Width "
+            f"{fnum(f['bb_width_pctile'], 0)}%ile"
         )
 
-        lines.append(
-            f"ATR {atr}% | {atr_pctile}%ile"
-        )
+        macd_value = f["macd_hist_pct"]
 
-        # Bollinger
-        bb_pctile = format_number(
-            f["bb_width_pctile"],
-            0,
-        )
-
-        lines.append(
-            f"BB Width {bb_pctile}%ile"
-        )
-
-        # MACD
-        macd_arrow = f["macd_direction"]
-
-        macd_norm = f["macd_hist_pct"]
-
-        if macd_norm is None:
-            macd_line = f"MACD Hist {macd_arrow}"
+        if macd_value is None:
+            out.append(
+                f"MACD Hist {f['macd_direction']}"
+            )
         else:
-            macd_line = (
-                f"MACD Hist {macd_arrow} "
-                f"({macd_norm:+.3f}%)"
+            out.append(
+                f"MACD Hist {f['macd_direction']} "
+                f"({macd_value:+.3f}%)"
             )
 
-        lines.append(macd_line)
+        out.append("")
 
-        lines.append("")
+    out.append(
+        "ℹ️ TA — только контекст, "
+        "на торговое решение не влияет."
+    )
 
-    return "\n".join(lines).rstrip()
+    return "\n".join(out)
 
 
 # ============================================================
@@ -796,82 +859,84 @@ def format_ta_block(
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Standalone BingX TA Context tester"
-    )
+
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--symbol",
         default="QTUM",
-        help="Например QTUM или QTUM-USDT",
     )
 
     args = parser.parse_args()
 
-    symbol = normalize_symbol(args.symbol)
+    symbol = normalize_symbol(
+        args.symbol
+    )
 
     print()
     print("=" * 70)
-    print(f"BingX TA Context TEST: {symbol}")
+    print(
+        f"BingX TA Context TEST: {symbol}"
+    )
     print("=" * 70)
     print()
 
-    features = {}
+    all_features = {}
 
     for interval in TIMEFRAMES:
+
         print(
             f"[{interval}] Получение закрытых свечей...",
             flush=True,
         )
 
         try:
+
             df = fetch_klines(
                 symbol,
                 interval,
                 KLINE_LIMIT,
             )
 
-            result = calculate_features(df)
+            features = calculate_features(
+                df
+            )
 
-            features[interval] = result
+            all_features[interval] = features
 
             close_time = pd.to_datetime(
-                result["close_time"],
+                features["close_time"],
                 unit="ms",
                 utc=True,
             )
 
             print(
-                f"[{interval}] OK: "
-                f"{result['bars']} свечей | "
-                f"last close={result['close']} | "
+                f"    OK: "
+                f"{features['bars']} candles | "
+                f"close={features['close']} | "
                 f"closed={close_time}"
             )
 
         except Exception as exc:
+
             print(
                 f"[{interval}] ERROR: {exc}",
                 file=sys.stderr,
             )
 
-    if not features:
+    if not all_features:
+
         raise SystemExit(
-            "Не удалось получить TA ни для одного timeframe."
+            "\nНе удалось получить TA "
+            "ни для одного timeframe."
         )
 
     print()
     print(
-        format_ta_block(
+        format_ta(
             symbol,
-            features,
+            all_features,
         )
-    )
-    print()
-
-    print("━━━━━━━━━━━━━━━━━━")
-    print(
-        "ℹ️ TA используется только как контекст. "
-        "Торговое решение не изменяется."
     )
     print()
 
