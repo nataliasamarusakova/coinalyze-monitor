@@ -24,7 +24,7 @@ except ImportError:
 
 
 # ============================================================
-# ENV — только из environment
+# ENV
 # ============================================================
 
 API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
@@ -51,14 +51,13 @@ TIMEFRAMES = ("1h", "4h", "1d")
 
 KLINE_LIMIT = 250
 
+# Сколько ПРОШЛЫХ значений использовать для percentile.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
 
 SOURCE_KEY = "BX-AI-SKILL"
 
-
-# BingX candle interval -> milliseconds.
 TIMEFRAME_MS = {
     "1h": 60 * 60 * 1000,
     "4h": 4 * 60 * 60 * 1000,
@@ -67,7 +66,7 @@ TIMEFRAME_MS = {
 
 
 # ============================================================
-# HELPERS
+# SYMBOL / API
 # ============================================================
 
 def normalize_symbol(symbol: str) -> str:
@@ -102,6 +101,7 @@ def request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
+
     params = dict(params or {})
 
     params["timestamp"] = str(int(time.time() * 1000))
@@ -124,7 +124,10 @@ def request_signed(
         timeout=REQUEST_TIMEOUT,
     )
 
-    print(f"    HTTP: {response.status_code}", flush=True)
+    print(
+        f"    HTTP: {response.status_code}",
+        flush=True,
+    )
 
     response.raise_for_status()
 
@@ -159,32 +162,28 @@ def parse_kline_row(
     row: object,
     interval: str,
 ) -> dict | None:
-    """
-    Реальный VST response, который мы увидели:
-
-    {
-        "open": "0.7633",
-        "close": "0.7647",
-        "high": "0.7666",
-        "low": "0.7633",
-        "volume": "6776.3",
-        "time": 1787234400000
-    }
-
-    Здесь `time` = open time свечи.
-
-    close_time вычисляем как:
-        open_time + timeframe duration
-    """
 
     if interval not in TIMEFRAME_MS:
         return None
 
     # --------------------------------------------------------
-    # Dict — фактический BingX VST формат
+    # Реальный VST формат:
+    #
+    # {
+    #   "open": "...",
+    #   "close": "...",
+    #   "high": "...",
+    #   "low": "...",
+    #   "volume": "...",
+    #   "time": 1787234400000
+    # }
+    #
+    # time = начало свечи.
+    # close_time вычисляем из timeframe.
     # --------------------------------------------------------
 
     if isinstance(row, dict):
+
         try:
             open_time = int(row["time"])
 
@@ -213,10 +212,11 @@ def parse_kline_row(
         }
 
     # --------------------------------------------------------
-    # Array — fallback
+    # Fallback: array format
     # --------------------------------------------------------
 
     if isinstance(row, (list, tuple)):
+
         if len(row) < 6:
             return None
 
@@ -227,11 +227,9 @@ def parse_kline_row(
             low = float(row[3])
             close = float(row[4])
             volume = float(row[5])
-
         except (TypeError, ValueError):
             return None
 
-        # Если endpoint дал closeTime — используем его.
         if len(row) >= 7:
             try:
                 close_time = int(row[6])
@@ -323,23 +321,10 @@ def fetch_klines(
             skipped_invalid += 1
             continue
 
-        # ----------------------------------------------------
-        # ВАЖНО:
-        #
-        # `close_time` рассчитан из `time` + timeframe.
-        #
-        # Не используем просто `time < now`, потому что
-        # текущая свеча уже имеет прошлое open_time,
-        # но ещё может быть незакрыта.
-        # ----------------------------------------------------
-
+        # Последняя свеча может ещё идти.
         if item["close_time"] > now_ms:
             skipped_open += 1
             continue
-
-        # ----------------------------------------------------
-        # Basic OHLC sanity
-        # ----------------------------------------------------
 
         if (
             item["open"] <= 0
@@ -369,19 +354,20 @@ def fetch_klines(
     )
 
     if not parsed:
-        last_item = raw[-1] if raw else None
+        last_raw = raw[-1] if raw else None
 
         raise RuntimeError(
             f"{symbol} {interval}: "
             "после parsing/filter осталось 0 свечей.\n"
             f"now_ms={now_ms}\n"
-            f"last_raw={last_item}"
+            f"last_raw={last_raw}"
         )
 
     df = pd.DataFrame(parsed)
 
     df = (
-        df.sort_values("close_time")
+        df
+        .sort_values("close_time")
         .drop_duplicates(
             subset=["close_time"],
             keep="last",
@@ -389,16 +375,12 @@ def fetch_klines(
         .reset_index(drop=True)
     )
 
-    # --------------------------------------------------------
-    # Печатаем последнюю реально использованную свечу.
-    # --------------------------------------------------------
-
     last = df.iloc[-1]
 
     print(
         f"    last CLOSED candle: "
-        f"open={last['open_time']} "
-        f"close={last['close_time']} "
+        f"open={int(last['open_time'])} "
+        f"close={int(last['close_time'])} "
         f"close_price={last['close']}",
         flush=True,
     )
@@ -411,6 +393,7 @@ def fetch_klines(
 # ============================================================
 
 def safe_float(value) -> float | None:
+
     if value is None:
         return None
 
@@ -426,30 +409,47 @@ def safe_float(value) -> float | None:
         return None
 
 
-def percentile_of_last(
+def previous_history_percentile(
     series: pd.Series,
     window: int = PERCENTILE_WINDOW,
 ) -> float | None:
+    """
+    Percentile последнего значения относительно
+    ТОЛЬКО ПРЕДЫДУЩИХ значений.
+
+    Текущая точка НЕ входит в reference distribution.
+
+    Например:
+        current BB width = X
+        previous 200 BB widths = history
+
+    percentile показывает положение X
+    внутри history.
+    """
 
     s = pd.to_numeric(
         series,
         errors="coerce",
     ).dropna()
 
-    if len(s) < 30:
-        return None
-
-    s = s.tail(window)
-
-    if len(s) < 10:
+    if len(s) < 2:
         return None
 
     current = float(s.iloc[-1])
 
-    rank = (s <= current).sum()
+    history = s.iloc[:-1].tail(window)
+
+    if len(history) < 10:
+        return None
+
+    rank = (history <= current).sum()
+
+    percentile = (
+        rank / len(history) * 100.0
+    )
 
     return round(
-        rank / len(s) * 100.0,
+        float(percentile),
         1,
     )
 
@@ -493,7 +493,7 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # ADX / +DI / -DI
+    # ADX / DI
     # --------------------------------------------------------
 
     adx = ta.adx(
@@ -544,7 +544,7 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # Bollinger
+    # Bollinger Bands
     # --------------------------------------------------------
 
     bb = ta.bbands(
@@ -637,13 +637,16 @@ def calculate_features(
 
     # --------------------------------------------------------
     # Percentiles
+    #
+    # ВАЖНО:
+    # ТЕКУЩЕЕ значение НЕ входит в reference history.
     # --------------------------------------------------------
 
-    atr_pctile = percentile_of_last(
+    atr_pctile = previous_history_percentile(
         work["atr_pct"]
     )
 
-    bb_width_pctile = percentile_of_last(
+    bb_width_pctile = previous_history_percentile(
         work["bb_width"]
     )
 
@@ -657,9 +660,17 @@ def calculate_features(
     # EMA STRUCTURE
     # --------------------------------------------------------
 
-    ema20 = safe_float(last["ema20"])
-    ema50 = safe_float(last["ema50"])
-    ema200 = safe_float(last["ema200"])
+    ema20 = safe_float(
+        last["ema20"]
+    )
+
+    ema50 = safe_float(
+        last["ema50"]
+    )
+
+    ema200 = safe_float(
+        last["ema200"]
+    )
 
     if None in (
         ema20,
@@ -682,6 +693,14 @@ def calculate_features(
         ema_direction = "mixed"
 
     # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi = safe_float(
+        last["rsi14"]
+    )
+
+    # --------------------------------------------------------
     # ADX / DI
     # --------------------------------------------------------
 
@@ -698,14 +717,6 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi = safe_float(
-        last["rsi14"]
-    )
-
-    # --------------------------------------------------------
     # ATR
     # --------------------------------------------------------
 
@@ -717,14 +728,22 @@ def calculate_features(
     # BB
     # --------------------------------------------------------
 
-    bb_width_pctile = bb_width_pctile
-
     bb_pctb = safe_float(
         last["bb_pctb"]
     )
 
     # --------------------------------------------------------
     # MACD
+    #
+    # ДВА разных свойства:
+    #
+    # 1) sign:
+    #       histogram positive / negative
+    #
+    # 2) slope:
+    #       histogram increased / decreased
+    #
+    # Для Telegram стрелка означает именно SLOPE.
     # --------------------------------------------------------
 
     macd_hist = safe_float(
@@ -736,18 +755,57 @@ def calculate_features(
     )
 
     if macd_hist is None:
-        macd_direction = "—"
-    elif macd_hist > 0:
-        macd_direction = "↑"
-    elif macd_hist < 0:
-        macd_direction = "↓"
+
+        macd_sign = "unknown"
+        macd_slope = "unknown"
+
     else:
-        macd_direction = "→"
+
+        if macd_hist > 0:
+            macd_sign = "positive"
+        elif macd_hist < 0:
+            macd_sign = "negative"
+        else:
+            macd_sign = "zero"
+
+        if len(work) >= 2:
+
+            prev_macd_hist = safe_float(
+                work["macd_hist"].iloc[-2]
+            )
+
+            if prev_macd_hist is None:
+
+                macd_slope = "unknown"
+
+            elif macd_hist > prev_macd_hist:
+
+                macd_slope = "up"
+
+            elif macd_hist < prev_macd_hist:
+
+                macd_slope = "down"
+
+            else:
+
+                macd_slope = "flat"
+
+        else:
+
+            macd_slope = "unknown"
 
     return {
-        "close": safe_float(last["close"]),
-        "close_time": int(last["close_time"]),
-        "open_time": int(last["open_time"]),
+        "close": safe_float(
+            last["close"]
+        ),
+
+        "open_time": int(
+            last["open_time"]
+        ),
+
+        "close_time": int(
+            last["close_time"]
+        ),
 
         "ema20": ema20,
         "ema50": ema50,
@@ -770,7 +828,9 @@ def calculate_features(
 
         "macd_hist": macd_hist,
         "macd_hist_pct": macd_hist_pct,
-        "macd_direction": macd_direction,
+
+        "macd_sign": macd_sign,
+        "macd_slope": macd_slope,
 
         "bars": len(work),
     }
@@ -791,25 +851,70 @@ def fnum(
     return f"{value:.{decimals}f}"
 
 
+def macd_arrow(
+    slope: str,
+) -> str:
+
+    if slope == "up":
+        return "↑"
+
+    if slope == "down":
+        return "↓"
+
+    if slope == "flat":
+        return "→"
+
+    return "—"
+
+
+def macd_sign_symbol(
+    sign: str,
+) -> str:
+
+    if sign == "positive":
+        return "+"
+
+    if sign == "negative":
+        return "-"
+
+    if sign == "zero":
+        return "0"
+
+    return "—"
+
+
 def format_ta(
     features: dict,
 ) -> str:
 
     out = []
 
-    out.append("━━━━━━━━━━━━━━━━━━")
-    out.append("📊 Technical Context")
+    out.append(
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    out.append(
+        "📊 Technical Context"
+    )
+
     out.append("")
 
     for tf in TIMEFRAMES:
 
         f = features.get(tf)
 
-        out.append(tf.upper())
+        out.append(
+            tf.upper()
+        )
 
         if not f:
-            out.append("ERROR: нет данных")
+
+            out.append(
+                "ERROR: нет данных"
+            )
+
             out.append("")
+
             continue
 
         # ----------------------------------------------------
@@ -817,12 +922,19 @@ def format_ta(
         # ----------------------------------------------------
 
         if f["ema_direction"] == "bullish":
+
             ema_icon = "🟢"
+
         elif f["ema_direction"] == "bearish":
+
             ema_icon = "🔴"
+
         elif f["ema_direction"] == "mixed":
+
             ema_icon = "🟡"
+
         else:
+
             ema_icon = "⚪"
 
         out.append(
@@ -848,22 +960,30 @@ def format_ta(
             plus is not None
             and minus is not None
         ):
+
             if plus > minus:
+
                 di = (
                     f"+DI {fnum(plus)} > "
                     f"-DI {fnum(minus)}"
                 )
+
             elif plus < minus:
+
                 di = (
                     f"+DI {fnum(plus)} < "
                     f"-DI {fnum(minus)}"
                 )
+
             else:
+
                 di = (
                     f"+DI {fnum(plus)} = "
                     f"-DI {fnum(minus)}"
                 )
+
         else:
+
             di = "+DI — | -DI —"
 
         out.append(
@@ -880,7 +1000,7 @@ def format_ta(
         )
 
         # ----------------------------------------------------
-        # Bollinger
+        # BB
         # ----------------------------------------------------
 
         out.append(
@@ -890,19 +1010,37 @@ def format_ta(
 
         # ----------------------------------------------------
         # MACD
+        #
+        # Например:
+        #
+        # MACD Hist ↑ (+0.430%)
+        #
+        # ↑ = histogram растёт
+        # +0.430% = histogram выше нуля
         # ----------------------------------------------------
+
+        arrow = macd_arrow(
+            f["macd_slope"]
+        )
+
+        sign = macd_sign_symbol(
+            f["macd_sign"]
+        )
 
         macd_value = f["macd_hist_pct"]
 
         if macd_value is None:
+
             out.append(
-                f"MACD Hist {f['macd_direction']}"
+                f"MACD Hist {arrow} ({sign})"
             )
+
         else:
+
             out.append(
                 f"MACD Hist "
-                f"{f['macd_direction']} "
-                f"({macd_value:+.3f}%)"
+                f"{arrow} "
+                f"({sign}{abs(macd_value):.3f}%)"
             )
 
         out.append("")
@@ -938,11 +1076,19 @@ def main():
     )
 
     print()
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
+
     print(
         f"BingX TA Context TEST: {symbol}"
     )
-    print("=" * 70)
+
+    print(
+        "=" * 70
+    )
+
     print()
 
     all_features = {}
@@ -950,7 +1096,8 @@ def main():
     for interval in TIMEFRAMES:
 
         print(
-            f"[{interval}] Получение закрытых свечей...",
+            f"[{interval}] "
+            "Получение закрытых свечей...",
             flush=True,
         )
 
@@ -976,7 +1123,8 @@ def main():
 
             print(
                 f"[{interval}] OK: "
-                f"{result['bars']} закрытых свечей | "
+                f"{result['bars']} "
+                f"закрытых свечей | "
                 f"close={result['close']} | "
                 f"closed={close_time}",
                 flush=True,
@@ -990,15 +1138,20 @@ def main():
             )
 
     if not all_features:
+
         raise SystemExit(
             "\nНе удалось получить TA "
             "ни для одного timeframe."
         )
 
     print()
+
     print(
-        format_ta(all_features)
+        format_ta(
+            all_features
+        )
     )
+
     print()
 
 
