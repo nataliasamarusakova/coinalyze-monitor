@@ -50,7 +50,8 @@ KLINE_PATH = "/openApi/swap/v3/quote/klines"
 
 TIMEFRAMES = ("1h", "4h", "1d")
 
-# Вес таймфрейма в directional score.
+# Вес timeframe только для Telegram summary.
+# НЕ торговый параметр.
 TIMEFRAME_WEIGHTS = {
     "1h": 1,
     "4h": 2,
@@ -59,6 +60,7 @@ TIMEFRAME_WEIGHTS = {
 
 KLINE_LIMIT = 250
 
+# Reference history для percentile.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
@@ -121,7 +123,10 @@ def request_signed(
 
     url = BASE_URL + path
 
-    print(f"    URL: {url}", flush=True)
+    print(
+        f"    URL: {url}",
+        flush=True,
+    )
 
     response = requests.request(
         method=method,
@@ -173,7 +178,7 @@ def parse_kline_row(
     if interval not in TIMEFRAME_MS:
         return None
 
-    # Реальный VST формат:
+    # Фактический VST format:
     #
     # {
     #   "open": "...",
@@ -185,7 +190,7 @@ def parse_kline_row(
     # }
     #
     # time = open time.
-    # close_time вычисляем по timeframe.
+    # close_time рассчитывается по timeframe.
 
     if isinstance(row, dict):
 
@@ -292,6 +297,7 @@ def fetch_klines(
         )
 
     if not isinstance(raw, list):
+
         raise RuntimeError(
             f"{symbol} {interval}: "
             f"data имеет тип {type(raw).__name__}: "
@@ -304,6 +310,7 @@ def fetch_klines(
     )
 
     if raw:
+
         print(
             f"    first raw candle: "
             f"{str(raw[0])[:1000]}",
@@ -325,12 +332,16 @@ def fetch_klines(
         )
 
         if item is None:
+
             skipped_invalid += 1
+
             continue
 
-        # Используем только закрытые свечи.
+        # Только закрытые свечи.
         if item["close_time"] > now_ms:
+
             skipped_open += 1
+
             continue
 
         # Basic sanity.
@@ -341,23 +352,28 @@ def fetch_klines(
             or item["close"] <= 0
             or item["volume"] < 0
         ):
+
             skipped_invalid += 1
+
             continue
 
         parsed.append(item)
 
     print(
-        f"    parsed closed candles: {len(parsed)}",
+        f"    parsed closed candles: "
+        f"{len(parsed)}",
         flush=True,
     )
 
     print(
-        f"    skipped current/open candle: {skipped_open}",
+        f"    skipped current/open candle: "
+        f"{skipped_open}",
         flush=True,
     )
 
     print(
-        f"    skipped invalid: {skipped_invalid}",
+        f"    skipped invalid: "
+        f"{skipped_invalid}",
         flush=True,
     )
 
@@ -407,6 +423,7 @@ def safe_float(value) -> float | None:
         return None
 
     try:
+
         value = float(value)
 
         if not math.isfinite(value):
@@ -415,6 +432,7 @@ def safe_float(value) -> float | None:
         return value
 
     except (TypeError, ValueError):
+
         return None
 
 
@@ -424,7 +442,7 @@ def previous_history_percentile(
 ) -> float | None:
     """
     Percentile текущего значения относительно
-    только предыдущих значений.
+    только ПРЕДЫДУЩИХ значений.
 
     Текущая точка НЕ входит в reference history.
     """
@@ -665,7 +683,7 @@ def calculate_features(
     last = work.iloc[-1]
 
     # --------------------------------------------------------
-    # EMA STRUCTURE
+    # EMA structure
     # --------------------------------------------------------
 
     ema20 = safe_float(last["ema20"])
@@ -718,11 +736,6 @@ def calculate_features(
 
     # --------------------------------------------------------
     # DI normalized ratio
-    #
-    # (-1 ... +1)
-    #
-    # +DI > -DI => positive
-    # +DI < -DI => negative
     # --------------------------------------------------------
 
     if (
@@ -767,15 +780,19 @@ def calculate_features(
             )
 
             if prev_macd_hist is None:
+
                 macd_slope = "unknown"
 
             elif macd_hist > prev_macd_hist:
+
                 macd_slope = "up"
 
             elif macd_hist < prev_macd_hist:
+
                 macd_slope = "down"
 
             else:
+
                 macd_slope = "flat"
 
         else:
@@ -900,20 +917,25 @@ def classify_di(
 ) -> tuple[str, str, float | None]:
 
     if plus is None or minus is None:
+
         return "⚪", "N/A", None
 
     spread = plus - minus
 
     if spread > 5:
+
         return "🟢", "BULLISH", spread
 
     if spread > 0:
+
         return "🟢", "SLIGHT BULLISH", spread
 
     if spread < -5:
+
         return "🔴", "BEARISH", spread
 
     if spread < 0:
+
         return "🔴", "SLIGHT BEARISH", spread
 
     return "🟡", "NEUTRAL", spread
@@ -990,93 +1012,195 @@ def classify_macd(
 
 
 # ============================================================
+# TIMEFRAME DIRECTION LABEL
+# ============================================================
+
+def classify_tf_direction(
+    f: dict,
+    raw_score: int,
+) -> tuple[str, str]:
+    """
+    Важное отличие от общего Net Score.
+
+    Если конкретный TF имеет:
+        EMA bullish
+        DI bullish
+        MACD bullish
+    → BULLISH
+
+    Если конфликт:
+        EMA bearish
+        DI bullish
+        MACD bullish
+    → MIXED / RECOVERY
+
+    То есть нельзя назвать такой timeframe
+    просто BULLISH только из-за положительного score.
+    """
+
+    ema = f["ema_direction"]
+
+    plus = f.get("plus_di14")
+    minus = f.get("minus_di14")
+
+    if plus is None or minus is None:
+        di_direction = "neutral"
+    elif plus > minus:
+        di_direction = "bullish"
+    elif plus < minus:
+        di_direction = "bearish"
+    else:
+        di_direction = "neutral"
+
+    macd_sign = f["macd_sign"]
+
+    macd_direction = (
+        "bullish"
+        if macd_sign == "positive"
+        else "bearish"
+        if macd_sign == "negative"
+        else "neutral"
+    )
+
+    # --------------------------------------------------------
+    # Pure bullish
+    # --------------------------------------------------------
+
+    if (
+        ema == "bullish"
+        and di_direction == "bullish"
+        and macd_direction == "bullish"
+    ):
+        return "🟢", "BULLISH"
+
+    # --------------------------------------------------------
+    # Pure bearish
+    # --------------------------------------------------------
+
+    if (
+        ema == "bearish"
+        and di_direction == "bearish"
+        and macd_direction == "bearish"
+    ):
+        return "🔴", "BEARISH"
+
+    # --------------------------------------------------------
+    # Clear bullish majority but mixed structure
+    # --------------------------------------------------------
+
+    bullish_components = sum(
+        x == "bullish"
+        for x in (
+            ema,
+            di_direction,
+            macd_direction,
+        )
+    )
+
+    bearish_components = sum(
+        x == "bearish"
+        for x in (
+            ema,
+            di_direction,
+            macd_direction,
+        )
+    )
+
+    # --------------------------------------------------------
+    # EMA bearish, momentum bullish:
+    # special recovery state.
+    # --------------------------------------------------------
+
+    if (
+        ema == "bearish"
+        and
+        (
+            di_direction == "bullish"
+            or macd_direction == "bullish"
+        )
+        and
+        bullish_components > bearish_components
+    ):
+        return "🟡", "MIXED / RECOVERY"
+
+    # --------------------------------------------------------
+    # EMA bullish, momentum bearish:
+    # weakening bullish structure.
+    # --------------------------------------------------------
+
+    if (
+        ema == "bullish"
+        and
+        (
+            di_direction == "bearish"
+            or macd_direction == "bearish"
+        )
+        and
+        bearish_components > bullish_components
+    ):
+        return "🟡", "MIXED / WEAKENING"
+
+    # --------------------------------------------------------
+    # Simple majority.
+    # --------------------------------------------------------
+
+    if bullish_components > bearish_components:
+        return "🟡", "MIXED / BULLISH"
+
+    if bearish_components > bullish_components:
+        return "🟡", "MIXED / BEARISH"
+
+    return "🟡", "MIXED"
+
+
+# ============================================================
 # DIRECTIONAL SCORE
 # ============================================================
 
 def directional_components(
     f: dict,
 ) -> dict:
-    """
-    Возвращает три простых directional components:
 
-    EMA:
-        +1 bullish
-         0 mixed
-        -1 bearish
-
-    DI:
-        +1 bullish
-         0 neutral
-        -1 bearish
-
-    MACD histogram sign:
-        +1 positive
-         0 zero
-        -1 negative
-
-    Важно:
-    это пока только Telegram heuristic,
-    а не trading model.
-    """
-
-    # --------------------------------------------------------
     # EMA
-    # --------------------------------------------------------
-
     if f["ema_direction"] == "bullish":
         ema_score = 1
-
     elif f["ema_direction"] == "bearish":
         ema_score = -1
-
     else:
         ema_score = 0
 
-    # --------------------------------------------------------
     # DI
-    # --------------------------------------------------------
-
     plus = f.get("plus_di14")
     minus = f.get("minus_di14")
 
     if plus is None or minus is None:
-
         di_score = 0
-
     elif plus > minus:
-
         di_score = 1
-
     elif plus < minus:
-
         di_score = -1
-
     else:
-
         di_score = 0
 
-    # --------------------------------------------------------
     # MACD sign
-    # --------------------------------------------------------
-
     if f["macd_sign"] == "positive":
         macd_score = 1
-
     elif f["macd_sign"] == "negative":
         macd_score = -1
-
     else:
         macd_score = 0
+
+    raw = (
+        ema_score
+        + di_score
+        + macd_score
+    )
 
     return {
         "ema": ema_score,
         "di": di_score,
         "macd": macd_score,
-        "raw": (
-            ema_score
-            + di_score
-            + macd_score
-        ),
+        "raw": raw,
     }
 
 
@@ -1084,21 +1208,9 @@ def build_ta_direction(
     features: dict,
 ) -> dict:
     """
-    TA directional summary.
+    Telegram-only directional summary.
 
-    TF weights:
-        1H = 1
-        4H = 2
-        1D = 2
-
-    Максимум:
-        LONG evidence = 15
-        SHORT evidence = 15
-        NET = -15 ... +15
-
-    ВАЖНО:
-    Это только summary для Telegram.
-    На trading decision не влияет.
+    НЕ торговый сигнал.
     """
 
     tf_results = {}
@@ -1120,7 +1232,9 @@ def build_ta_direction(
         if not f:
             continue
 
-        components = directional_components(f)
+        components = directional_components(
+            f
+        )
 
         weight = TIMEFRAME_WEIGHTS[tf]
 
@@ -1130,10 +1244,7 @@ def build_ta_direction(
 
         weighted_net += weighted
 
-        # ----------------------------------------------------
-        # Отдельно LONG evidence
-        # ----------------------------------------------------
-
+        # LONG evidence.
         if components["ema"] > 0:
             long_evidence += weight
 
@@ -1143,10 +1254,7 @@ def build_ta_direction(
         if components["macd"] > 0:
             long_evidence += weight
 
-        # ----------------------------------------------------
-        # Отдельно SHORT evidence
-        # ----------------------------------------------------
-
+        # SHORT evidence.
         if components["ema"] < 0:
             short_evidence += weight
 
@@ -1156,6 +1264,11 @@ def build_ta_direction(
         if components["macd"] < 0:
             short_evidence += weight
 
+        tf_icon, tf_label = classify_tf_direction(
+            f,
+            raw,
+        )
+
         tf_results[tf] = {
             "weight": weight,
             "ema": components["ema"],
@@ -1163,36 +1276,31 @@ def build_ta_direction(
             "macd": components["macd"],
             "raw": raw,
             "weighted": weighted,
+            "icon": tf_icon,
+            "label": tf_label,
         }
 
     # --------------------------------------------------------
-    # Overall bias
+    # Overall Telegram label.
+    #
+    # Не используем STRONG LONG / STRONG SHORT,
+    # чтобы не создавать впечатление торгового сигнала.
     # --------------------------------------------------------
 
-    if weighted_net >= 8:
+    if weighted_net > 0:
 
         bias_icon = "🟢"
-        bias_label = "STRONG LONG"
+        bias_label = "TA LONG"
 
-    elif weighted_net >= 4:
-
-        bias_icon = "🟢"
-        bias_label = "LONG"
-
-    elif weighted_net <= -8:
+    elif weighted_net < 0:
 
         bias_icon = "🔴"
-        bias_label = "STRONG SHORT"
-
-    elif weighted_net <= -4:
-
-        bias_icon = "🔴"
-        bias_label = "SHORT"
+        bias_label = "TA SHORT"
 
     else:
 
         bias_icon = "🟡"
-        bias_label = "MIXED"
+        bias_label = "TA MIXED"
 
     return {
         "tf_results": tf_results,
@@ -1213,22 +1321,15 @@ def build_entry_timing(
     features: dict,
 ) -> dict:
     """
-    Оценивает только визуальный risk/timing context.
+    Только Telegram context.
 
-    Не является торговым фильтром.
-
-    Важный принцип:
-    несколько volatility warnings не считаются
-    независимыми trading signals.
+    Не торговый фильтр.
     """
 
     warnings = []
 
     # --------------------------------------------------------
     # RSI extension
-    #
-    # Проверяем прежде всего 1H/4H,
-    # так как это ближе к timing.
     # --------------------------------------------------------
 
     for tf in ("1h", "4h"):
@@ -1253,11 +1354,10 @@ def build_entry_timing(
             )
 
     # --------------------------------------------------------
-    # Volatility.
+    # Volatility cluster
     #
-    # ATR + BBW считаем одним volatility cluster,
-    # чтобы не считать два индикатора двумя независимыми
-    # warnings.
+    # ATR + BBW не считаются двумя независимыми warning.
+    # Берём максимальную относительную экстремальность.
     # --------------------------------------------------------
 
     volatility_levels = []
@@ -1273,7 +1373,8 @@ def build_entry_timing(
         bb_pctile = f.get("bb_width_pctile")
 
         values = [
-            x for x in (
+            x
+            for x in (
                 atr_pctile,
                 bb_pctile,
             )
@@ -1281,6 +1382,7 @@ def build_entry_timing(
         ]
 
         if values:
+
             volatility_levels.append(
                 max(values)
             )
@@ -1327,17 +1429,17 @@ def build_entry_timing(
             )
 
     # --------------------------------------------------------
-    # Classification
+    # Timing label
     # --------------------------------------------------------
 
-    warning_count = len(warnings)
+    count = len(warnings)
 
-    if warning_count == 0:
+    if count == 0:
 
         icon = "🟢"
         label = "GOOD"
 
-    elif warning_count == 1:
+    elif count == 1:
 
         icon = "🟡"
         label = "CAUTION"
@@ -1351,12 +1453,12 @@ def build_entry_timing(
         "icon": icon,
         "label": label,
         "warnings": warnings,
-        "warning_count": warning_count,
+        "warning_count": count,
     }
 
 
 # ============================================================
-# SUMMARY FORMAT
+# SUMMARY
 # ============================================================
 
 def format_direction_summary(
@@ -1415,18 +1517,11 @@ def format_direction_summary(
         if not item:
             continue
 
-        net = item["weighted"]
-
-        if net > 0:
-            icon = "🟢"
-        elif net < 0:
-            icon = "🔴"
-        else:
-            icon = "🟡"
-
         out.append(
             f"{tf.upper()} "
-            f"{net:+d} {icon}"
+            f"{item['weighted']:+d} "
+            f"{item['icon']} "
+            f"{item['label']}"
         )
 
     out.append("")
@@ -1440,7 +1535,6 @@ def format_direction_summary(
     if timing["warnings"]:
 
         out.append("")
-
         out.append("Причины:")
 
         for warning in timing["warnings"][:5]:
@@ -1453,7 +1547,7 @@ def format_direction_summary(
 
 
 # ============================================================
-# DETAILED TA FORMAT
+# DETAILED TA
 # ============================================================
 
 def fnum(
@@ -1612,20 +1706,26 @@ def format_ta_details(
         else:
 
             if f["macd_hist_pct"] >= 0:
+
                 value = (
                     f"+{abs(f['macd_hist_pct']):.3f}%"
                 )
+
             else:
+
                 value = (
                     f"-{abs(f['macd_hist_pct']):.3f}%"
                 )
 
             if f["macd_slope"] == "up":
                 arrow = "↑"
+
             elif f["macd_slope"] == "down":
                 arrow = "↓"
+
             elif f["macd_slope"] == "flat":
                 arrow = "→"
+
             else:
                 arrow = "—"
 
@@ -1641,7 +1741,7 @@ def format_ta_details(
 
 
 # ============================================================
-# FINAL TELEGRAM-LIKE OUTPUT
+# FINAL OUTPUT
 # ============================================================
 
 def format_output(
@@ -1657,7 +1757,6 @@ def format_output(
 
     out.append("")
 
-    # Сначала краткий ответ.
     out.append(
         format_direction_summary(
             features
@@ -1666,7 +1765,6 @@ def format_output(
 
     out.append("")
 
-    # Потом подробности.
     out.append(
         format_ta_details(
             features
@@ -1691,8 +1789,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Standalone BingX TA Context tester "
-            "with LONG/SHORT directional summary"
+            "Standalone BingX TA Context tester"
         )
     )
 
