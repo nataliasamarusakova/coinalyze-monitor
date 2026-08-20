@@ -4117,7 +4117,8 @@ def run():
 
                 if should_send_tg:
                     llm_res = llm_verify(sym, signal_wl, cur, hist)
-                    msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market)
+                    ta_context_data = ta_context.get_ta_context(sym)
+                    msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market, ta_context_data=ta_context_data)
                     if llm_res:
                         agree = "✅" if llm_res.get("agree") is True else "❌"
                         msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
