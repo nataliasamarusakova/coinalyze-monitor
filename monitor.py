@@ -1803,14 +1803,11 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market, ta_context_
         *([ f"ShortLiq%: {liq_share:.2%}"] if liq_share is not None else []),
         *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
-    msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
+    msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts)
     if ta_context_data:
-        ta_block = ta_context.format_ta_telegram(
-            ta_context_data
-        )
+        ta_block = ta_context.format_ta_telegram(ta_context_data)
         if ta_block:
-            msg += f"\n{ta_block}\n"
-    
+            msg += f"\n{ta_block}\n"    
     return msg
 
 def format_trade_close(rec):
