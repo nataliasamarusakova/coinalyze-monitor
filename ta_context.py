@@ -1,4 +1,3 @@
-# ta_context.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -20,9 +19,20 @@ import pandas_ta_classic as ta
 # ENV
 # ============================================================
 
-API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
+API_KEY = os.environ.get(
+    "BINGX_API_KEY",
+    "",
+).strip()
+
+SECRET_KEY = os.environ.get(
+    "BINGX_SECRET_KEY",
+    "",
+).strip()
+
+BASE_URL = os.environ.get(
+    "BINGX_BASE_URL",
+    "https://open-api-vst.bingx.com",
+).strip().rstrip("/")
 
 
 # ============================================================
@@ -31,16 +41,26 @@ BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rs
 
 KLINE_PATH = "/openApi/swap/v3/quote/klines"
 
-TIMEFRAMES = ("1h", "4h", "1d")
+TIMEFRAMES = (
+    "1h",
+    "4h",
+    "1d",
+)
 
+# Только для Telegram summary.
+# На торговое решение НЕ влияет.
 TIMEFRAME_WEIGHTS = {
     "1h": 1,
     "4h": 2,
     "1d": 2,
 }
 
+# BingX API limit.
 KLINE_LIMIT = 250
+
+# Reference history для ATR / BBW percentile.
 PERCENTILE_WINDOW = 200
+
 REQUEST_TIMEOUT = 15
 
 SOURCE_KEY = "BX-AI-SKILL"
@@ -54,9 +74,17 @@ TIMEFRAME_MS = {
 
 # ============================================================
 # PER-RUN CACHE
+# ============================================================
 #
-# Один monitor run не будет повторно получать TA
-# для одного и того же symbol.
+# Ключ = уже разрешённый BingX API symbol.
+#
+# Например:
+#   LIGHTER-USDT
+#
+# TA не занимается mapping.
+# Mapping делает bingx_client.to_bx_symbol()
+# в monitor.py.
+#
 # ============================================================
 
 _TA_CACHE: dict[str, dict] = {}
@@ -66,11 +94,23 @@ _TA_CACHE: dict[str, dict] = {}
 # HELPERS
 # ============================================================
 
-def normalize_symbol(symbol: str) -> str:
+def _normalize_symbol(symbol: str) -> str:
+    """
+    Здесь ТОЛЬКО нормализация формата.
+
+    ВАЖНО:
+    функция НЕ делает displayName -> API symbol mapping.
+
+    Ожидается уже реальный BingX symbol:
+        QTUM-USDT
+        BTC-USDT
+        LIGHTER-USDT
+    """
+
     s = (symbol or "").strip().upper()
 
     if not s:
-        raise ValueError("empty symbol")
+        raise ValueError("empty BingX symbol")
 
     s = s.replace("/", "-")
 
@@ -100,6 +140,10 @@ def _safe_float(value) -> float | None:
 
 
 def _sign_params(params: dict) -> str:
+    """
+    Binance/BingX-style HMAC-SHA256 signature.
+    """
+
     query_string = urlencode(params)
 
     return hmac.new(
@@ -114,24 +158,39 @@ def _request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
+    """
+    Выполняет BingX request.
+
+    TA использует только market-data endpoint,
+    но оставляем текущий рабочий способ запроса,
+    который уже подтвердился в test_ta_context.py.
+    """
 
     if not API_KEY:
-        raise RuntimeError("BINGX_API_KEY not configured")
+        raise RuntimeError(
+            "BINGX_API_KEY not configured"
+        )
 
     if not SECRET_KEY:
-        raise RuntimeError("BINGX_SECRET_KEY not configured")
+        raise RuntimeError(
+            "BINGX_SECRET_KEY not configured"
+        )
 
     if not BASE_URL:
-        raise RuntimeError("BINGX_BASE_URL not configured")
+        raise RuntimeError(
+            "BINGX_BASE_URL not configured"
+        )
 
-    params = dict(params or {})
+    request_params = dict(
+        params or {}
+    )
 
-    params["timestamp"] = str(
+    request_params["timestamp"] = str(
         int(time.time() * 1000)
     )
 
-    params["signature"] = _sign_params(
-        params
+    request_params["signature"] = _sign_params(
+        request_params
     )
 
     response = requests.request(
@@ -141,14 +200,14 @@ def _request_signed(
             "X-BX-APIKEY": API_KEY,
             "X-SOURCE-KEY": SOURCE_KEY,
         },
-        params=params,
+        params=request_params,
         timeout=REQUEST_TIMEOUT,
     )
 
     response.raise_for_status()
 
     try:
-        data = response.json()
+        payload = response.json()
 
     except ValueError as exc:
 
@@ -156,54 +215,85 @@ def _request_signed(
             "BingX returned non-JSON response"
         ) from exc
 
-    if data.get("code") != 0:
+    if payload.get("code") != 0:
 
         raise RuntimeError(
-            f"BingX API error: "
-            f"code={data.get('code')} "
-            f"msg={data.get('msg')}"
+            "BingX API error: "
+            f"code={payload.get('code')} "
+            f"msg={payload.get('msg')}"
         )
 
-    return data
+    return payload
 
 
 # ============================================================
-# KLINES
+# KLINE PARSING
 # ============================================================
 
 def _parse_kline_row(
     row: object,
     interval: str,
 ) -> dict | None:
+    """
+    Поддерживает фактический BingX VST dict format:
 
-    duration = TIMEFRAME_MS.get(interval)
+    {
+        "open": "...",
+        "close": "...",
+        "high": "...",
+        "low": "...",
+        "volume": "...",
+        "time": 1787234400000
+    }
+
+    time = OPEN TIME.
+
+    close_time рассчитывается самостоятельно.
+    """
+
+    duration = TIMEFRAME_MS.get(
+        interval
+    )
 
     if duration is None:
         return None
 
-    # Actual VST format observed:
-    #
-    # {
-    #   "open": "...",
-    #   "close": "...",
-    #   "high": "...",
-    #   "low": "...",
-    #   "volume": "...",
-    #   "time": 1787234400000
-    # }
+    # --------------------------------------------------------
+    # Dict format
+    # --------------------------------------------------------
 
     if isinstance(row, dict):
 
         try:
-            open_time = int(row["time"])
-            open_price = float(row["open"])
-            high = float(row["high"])
-            low = float(row["low"])
-            close = float(row["close"])
-            volume = float(row["volume"])
+            open_time = int(
+                row["time"]
+            )
 
-        except (KeyError, TypeError, ValueError):
+            open_price = float(
+                row["open"]
+            )
 
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
+
+            close = float(
+                row["close"]
+            )
+
+            volume = float(
+                row["volume"]
+            )
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             return None
 
         return {
@@ -213,44 +303,74 @@ def _parse_kline_row(
             "low": low,
             "close": close,
             "volume": volume,
-            "close_time": open_time + duration,
+            "close_time": (
+                open_time + duration
+            ),
         }
 
-    # Fallback array format.
-    if isinstance(row, (list, tuple)):
+    # --------------------------------------------------------
+    # Array fallback
+    # --------------------------------------------------------
+
+    if isinstance(
+        row,
+        (list, tuple),
+    ):
 
         if len(row) < 6:
             return None
 
         try:
-            open_time = int(row[0])
-            open_price = float(row[1])
-            high = float(row[2])
-            low = float(row[3])
-            close = float(row[4])
-            volume = float(row[5])
+            open_time = int(
+                row[0]
+            )
 
-        except (TypeError, ValueError):
+            open_price = float(
+                row[1]
+            )
 
+            high = float(
+                row[2]
+            )
+
+            low = float(
+                row[3]
+            )
+
+            close = float(
+                row[4]
+            )
+
+            volume = float(
+                row[5]
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
         if len(row) >= 7:
 
             try:
-                close_time = int(row[6])
+                close_time = int(
+                    row[6]
+                )
 
-            except (TypeError, ValueError):
+            except (
+                TypeError,
+                ValueError,
+            ):
 
                 close_time = (
-                    open_time
-                    + duration
+                    open_time + duration
                 )
 
         else:
 
             close_time = (
-                open_time
-                + duration
+                open_time + duration
             )
 
         return {
@@ -266,27 +386,45 @@ def _parse_kline_row(
     return None
 
 
+# ============================================================
+# FETCH CLOSED KLINES
+# ============================================================
+
 def _fetch_klines(
-    symbol: str,
+    bingx_symbol: str,
     interval: str,
 ) -> pd.DataFrame:
+    """
+    Получает только CLOSED candles.
+
+    Важно:
+    bingx_symbol уже должен быть разрешён monitor.py.
+
+    Например:
+        LIGHTER-USDT
+    """
 
     response = _request_signed(
         "GET",
         KLINE_PATH,
         {
-            "symbol": symbol,
+            "symbol": bingx_symbol,
             "interval": interval,
             "limit": KLINE_LIMIT,
         },
     )
 
-    raw = response.get("data")
+    raw = response.get(
+        "data"
+    )
 
-    if not isinstance(raw, list):
+    if not isinstance(
+        raw,
+        list,
+    ):
 
         raise RuntimeError(
-            f"{symbol} {interval}: "
+            f"{bingx_symbol} {interval}: "
             "invalid kline data"
         )
 
@@ -306,9 +444,16 @@ def _fetch_klines(
         if item is None:
             continue
 
-        # Только закрытые свечи.
+        # ----------------------------------------------------
+        # CLOSED ONLY
+        # ----------------------------------------------------
+
         if item["close_time"] > now_ms:
             continue
+
+        # ----------------------------------------------------
+        # Sanity
+        # ----------------------------------------------------
 
         if (
             item["open"] <= 0
@@ -319,60 +464,77 @@ def _fetch_klines(
         ):
             continue
 
-        parsed.append(item)
+        parsed.append(
+            item
+        )
 
     if not parsed:
 
         raise RuntimeError(
-            f"{symbol} {interval}: "
+            f"{bingx_symbol} {interval}: "
             "no closed candles"
         )
 
-    df = pd.DataFrame(parsed)
+    df = pd.DataFrame(
+        parsed
+    )
 
     df = (
         df
-        .sort_values("close_time")
+        .sort_values(
+            "close_time"
+        )
         .drop_duplicates(
-            subset=["close_time"],
+            subset=[
+                "close_time"
+            ],
             keep="last",
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
     if len(df) < 100:
 
         raise RuntimeError(
-            f"{symbol} {interval}: "
-            f"too few closed candles: {len(df)}"
+            f"{bingx_symbol} {interval}: "
+            f"too few closed candles: "
+            f"{len(df)}"
         )
 
     return df
 
 
 # ============================================================
-# PERCENTILE
+# HISTORICAL PERCENTILE
 # ============================================================
 
 def _previous_history_percentile(
     series: pd.Series,
     window: int = PERCENTILE_WINDOW,
 ) -> float | None:
+    """
+    Percentile последней точки относительно
+    только ПРЕДЫДУЩИХ значений.
 
-    s = pd.to_numeric(
+    Текущая точка в reference history НЕ входит.
+    """
+
+    values = pd.to_numeric(
         series,
         errors="coerce",
     ).dropna()
 
-    if len(s) < 2:
+    if len(values) < 2:
         return None
 
     current = float(
-        s.iloc[-1]
+        values.iloc[-1]
     )
 
     history = (
-        s.iloc[:-1]
+        values.iloc[:-1]
         .tail(window)
     )
 
@@ -383,8 +545,14 @@ def _previous_history_percentile(
         history <= current
     ).sum()
 
+    percentile = (
+        rank
+        / len(history)
+        * 100.0
+    )
+
     return round(
-        rank / len(history) * 100.0,
+        float(percentile),
         1,
     )
 
@@ -399,7 +567,10 @@ def _calculate_features(
 
     work = df.copy()
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
+
     work["ema20"] = ta.ema(
         work["close"],
         length=20,
@@ -415,13 +586,19 @@ def _calculate_features(
         length=200,
     )
 
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     work["rsi14"] = ta.rsi(
         work["close"],
         length=14,
     )
 
+    # --------------------------------------------------------
     # ADX / DI
+    # --------------------------------------------------------
+
     adx = ta.adx(
         work["high"],
         work["low"],
@@ -429,21 +606,33 @@ def _calculate_features(
         length=14,
     )
 
-    if adx is not None and not adx.empty:
+    if (
+        adx is not None
+        and not adx.empty
+    ):
 
         work["adx14"] = adx.get(
             "ADX_14",
-            float("nan"),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
         work["plus_di14"] = adx.get(
             "DMP_14",
-            float("nan"),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
         work["minus_di14"] = adx.get(
             "DMN_14",
-            float("nan"),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
     else:
@@ -452,7 +641,10 @@ def _calculate_features(
         work["plus_di14"] = float("nan")
         work["minus_di14"] = float("nan")
 
+    # --------------------------------------------------------
     # ATR
+    # --------------------------------------------------------
+
     work["atr14"] = ta.atr(
         work["high"],
         work["low"],
@@ -466,14 +658,20 @@ def _calculate_features(
         * 100.0
     )
 
-    # Bollinger
+    # --------------------------------------------------------
+    # Bollinger Width
+    # --------------------------------------------------------
+
     bb = ta.bbands(
         work["close"],
         length=20,
         std=2.0,
     )
 
-    if bb is not None and not bb.empty:
+    if (
+        bb is not None
+        and not bb.empty
+    ):
 
         lower = bb.get(
             "BBL_20_2.0",
@@ -508,7 +706,10 @@ def _calculate_features(
 
         work["bb_width"] = float("nan")
 
+    # --------------------------------------------------------
     # MACD
+    # --------------------------------------------------------
+
     macd = ta.macd(
         work["close"],
         fast=12,
@@ -516,7 +717,10 @@ def _calculate_features(
         signal=9,
     )
 
-    if macd is not None and not macd.empty:
+    if (
+        macd is not None
+        and not macd.empty
+    ):
 
         work["macd_hist"] = macd.get(
             "MACDh_12_26_9",
@@ -536,18 +740,32 @@ def _calculate_features(
         * 100.0
     )
 
+    # --------------------------------------------------------
     # Percentiles
-    atr_pctile = _previous_history_percentile(
-        work["atr_pct"]
+    # --------------------------------------------------------
+
+    atr_pctile = (
+        _previous_history_percentile(
+            work["atr_pct"]
+        )
     )
 
-    bb_width_pctile = _previous_history_percentile(
-        work["bb_width"]
+    bb_width_pctile = (
+        _previous_history_percentile(
+            work["bb_width"]
+        )
     )
+
+    # --------------------------------------------------------
+    # Last closed candle
+    # --------------------------------------------------------
 
     last = work.iloc[-1]
 
+    # --------------------------------------------------------
     # EMA structure
+    # --------------------------------------------------------
+
     ema20 = _safe_float(
         last["ema20"]
     )
@@ -580,6 +798,10 @@ def _calculate_features(
 
         ema_direction = "mixed"
 
+    # --------------------------------------------------------
+    # Core values
+    # --------------------------------------------------------
+
     rsi = _safe_float(
         last["rsi14"]
     )
@@ -596,6 +818,10 @@ def _calculate_features(
         last["minus_di14"]
     )
 
+    atr_pct = _safe_float(
+        last["atr_pct"]
+    )
+
     macd_hist = _safe_float(
         last["macd_hist"]
     )
@@ -603,6 +829,29 @@ def _calculate_features(
     macd_hist_pct = _safe_float(
         last["macd_hist_pct"]
     )
+
+    # --------------------------------------------------------
+    # DI normalized ratio
+    # --------------------------------------------------------
+
+    if (
+        plus_di is not None
+        and minus_di is not None
+        and (plus_di + minus_di) > 0
+    ):
+
+        di_ratio = (
+            (plus_di - minus_di)
+            / (plus_di + minus_di)
+        )
+
+    else:
+
+        di_ratio = None
+
+    # --------------------------------------------------------
+    # MACD sign + slope
+    # --------------------------------------------------------
 
     if macd_hist is None:
 
@@ -612,30 +861,39 @@ def _calculate_features(
     else:
 
         if macd_hist > 0:
+
             macd_sign = "positive"
 
         elif macd_hist < 0:
+
             macd_sign = "negative"
 
         else:
+
             macd_sign = "zero"
 
         if len(work) >= 2:
 
-            prev_hist = _safe_float(
-                work["macd_hist"].iloc[-2]
+            previous_hist = _safe_float(
+                work[
+                    "macd_hist"
+                ].iloc[-2]
             )
 
-            if prev_hist is None:
+            if previous_hist is None:
+
                 macd_slope = "unknown"
 
-            elif macd_hist > prev_hist:
+            elif macd_hist > previous_hist:
+
                 macd_slope = "up"
 
-            elif macd_hist < prev_hist:
+            elif macd_hist < previous_hist:
+
                 macd_slope = "down"
 
             else:
+
                 macd_slope = "flat"
 
         else:
@@ -644,159 +902,294 @@ def _calculate_features(
 
     return {
         "ema_direction": ema_direction,
+
         "rsi14": rsi,
+
         "adx14": adx_value,
+
         "plus_di14": plus_di,
+
         "minus_di14": minus_di,
-        "atr_pct": _safe_float(
-            last["atr_pct"]
-        ),
+
+        "di_ratio": di_ratio,
+
+        "atr_pct": atr_pct,
+
         "atr_pctile": atr_pctile,
+
         "bb_width_pctile": bb_width_pctile,
+
         "macd_hist": macd_hist,
+
         "macd_hist_pct": macd_hist_pct,
+
         "macd_sign": macd_sign,
+
         "macd_slope": macd_slope,
     }
 
 
 # ============================================================
-# TF DIRECTION
+# DIRECTIONAL COMPONENTS
 # ============================================================
 
 def _directional_components(
-    f: dict,
+    features: dict,
 ) -> dict:
+    """
+    Три directional components:
 
+        EMA  = -1 / 0 / +1
+        DI   = -1 / 0 / +1
+        MACD = -1 / 0 / +1
+
+    Это только Telegram summary.
+    """
+
+    # --------------------------------------------------------
     # EMA
-    if f["ema_direction"] == "bullish":
-        ema = 1
+    # --------------------------------------------------------
 
-    elif f["ema_direction"] == "bearish":
-        ema = -1
+    if (
+        features["ema_direction"]
+        == "bullish"
+    ):
+
+        ema_score = 1
+
+    elif (
+        features["ema_direction"]
+        == "bearish"
+    ):
+
+        ema_score = -1
 
     else:
-        ema = 0
 
+        ema_score = 0
+
+    # --------------------------------------------------------
     # DI
-    plus = f.get("plus_di14")
-    minus = f.get("minus_di14")
+    # --------------------------------------------------------
 
-    if plus is None or minus is None:
-        di = 0
+    plus = features.get(
+        "plus_di14"
+    )
+
+    minus = features.get(
+        "minus_di14"
+    )
+
+    if (
+        plus is None
+        or minus is None
+    ):
+
+        di_score = 0
 
     elif plus > minus:
-        di = 1
+
+        di_score = 1
 
     elif plus < minus:
-        di = -1
+
+        di_score = -1
 
     else:
-        di = 0
 
-    # MACD sign
-    if f["macd_sign"] == "positive":
-        macd = 1
+        di_score = 0
 
-    elif f["macd_sign"] == "negative":
-        macd = -1
+    # --------------------------------------------------------
+    # MACD histogram sign
+    # --------------------------------------------------------
+
+    if (
+        features["macd_sign"]
+        == "positive"
+    ):
+
+        macd_score = 1
+
+    elif (
+        features["macd_sign"]
+        == "negative"
+    ):
+
+        macd_score = -1
 
     else:
-        macd = 0
+
+        macd_score = 0
 
     return {
-        "ema": ema,
-        "di": di,
-        "macd": macd,
-        "raw": ema + di + macd,
+        "ema": ema_score,
+        "di": di_score,
+        "macd": macd_score,
+        "raw": (
+            ema_score
+            + di_score
+            + macd_score
+        ),
     }
 
 
+# ============================================================
+# TIMEFRAME LABEL
+# ============================================================
+
 def _classify_tf_direction(
-    f: dict,
-    raw_score: int,
+    features: dict,
 ) -> tuple[str, str]:
 
-    ema = f["ema_direction"]
+    ema = features[
+        "ema_direction"
+    ]
 
-    plus = f.get("plus_di14")
-    minus = f.get("minus_di14")
+    plus = features.get(
+        "plus_di14"
+    )
 
-    if plus is None or minus is None:
+    minus = features.get(
+        "minus_di14"
+    )
+
+    if (
+        plus is None
+        or minus is None
+    ):
+
         di_direction = "neutral"
 
     elif plus > minus:
+
         di_direction = "bullish"
 
     elif plus < minus:
+
         di_direction = "bearish"
 
     else:
+
         di_direction = "neutral"
 
-    macd_direction = (
-        "bullish"
-        if f["macd_sign"] == "positive"
-        else "bearish"
-        if f["macd_sign"] == "negative"
-        else "neutral"
+    if (
+        features["macd_sign"]
+        == "positive"
+    ):
+
+        macd_direction = "bullish"
+
+    elif (
+        features["macd_sign"]
+        == "negative"
+    ):
+
+        macd_direction = "bearish"
+
+    else:
+
+        macd_direction = "neutral"
+
+    directions = (
+        ema,
+        di_direction,
+        macd_direction,
     )
 
-    bullish = sum(
+    bullish_count = sum(
         x == "bullish"
-        for x in (
-            ema,
-            di_direction,
-            macd_direction,
-        )
+        for x in directions
     )
 
-    bearish = sum(
+    bearish_count = sum(
         x == "bearish"
-        for x in (
-            ema,
-            di_direction,
-            macd_direction,
-        )
+        for x in directions
     )
 
-    # Completely aligned bullish.
-    if bullish == 3:
-        return "🟢", "BULLISH"
+    # --------------------------------------------------------
+    # Full bullish agreement
+    # --------------------------------------------------------
 
-    # Completely aligned bearish.
-    if bearish == 3:
-        return "🔴", "BEARISH"
+    if bullish_count == 3:
 
-    # Bearish EMA + bullish momentum = recovery.
+        return (
+            "🟢",
+            "BULLISH",
+        )
+
+    # --------------------------------------------------------
+    # Full bearish agreement
+    # --------------------------------------------------------
+
+    if bearish_count == 3:
+
+        return (
+            "🔴",
+            "BEARISH",
+        )
+
+    # --------------------------------------------------------
+    # Bearish structure + bullish momentum
+    # --------------------------------------------------------
+
     if (
         ema == "bearish"
-        and bullish > bearish
+        and bullish_count > bearish_count
         and (
             di_direction == "bullish"
             or macd_direction == "bullish"
         )
     ):
-        return "🟡", "MIXED / RECOVERY"
 
-    # Bullish EMA + bearish momentum = weakening.
+        return (
+            "🟡",
+            "MIXED / RECOVERY",
+        )
+
+    # --------------------------------------------------------
+    # Bullish structure + bearish momentum
+    # --------------------------------------------------------
+
     if (
         ema == "bullish"
-        and bearish > bullish
+        and bearish_count > bullish_count
         and (
             di_direction == "bearish"
             or macd_direction == "bearish"
         )
     ):
-        return "🟡", "MIXED / WEAKENING"
 
-    if bullish > bearish:
-        return "🟡", "MIXED / BULLISH"
+        return (
+            "🟡",
+            "MIXED / WEAKENING",
+        )
 
-    if bearish > bullish:
-        return "🟡", "MIXED / BEARISH"
+    # --------------------------------------------------------
+    # Majority bullish
+    # --------------------------------------------------------
 
-    return "🟡", "MIXED"
+    if bullish_count > bearish_count:
+
+        return (
+            "🟡",
+            "MIXED / BULLISH",
+        )
+
+    # --------------------------------------------------------
+    # Majority bearish
+    # --------------------------------------------------------
+
+    if bearish_count > bullish_count:
+
+        return (
+            "🟡",
+            "MIXED / BEARISH",
+        )
+
+    return (
+        "🟡",
+        "MIXED",
+    )
 
 
 # ============================================================
@@ -804,162 +1197,294 @@ def _classify_tf_direction(
 # ============================================================
 
 def _build_entry_timing(
-    features: dict,
-) -> tuple[str, str, list[str]]:
+    features_by_tf: dict,
+) -> tuple[
+    str,
+    str,
+    list[str],
+]:
+    """
+    Только Telegram context.
+
+    Не меняет trading decision.
+    """
 
     warnings = []
 
-    for tf in ("1h", "4h"):
+    # --------------------------------------------------------
+    # RSI extension
+    # --------------------------------------------------------
 
-        f = features.get(tf)
+    for timeframe in (
+        "1h",
+        "4h",
+    ):
 
-        if not f:
+        features = features_by_tf.get(
+            timeframe
+        )
+
+        if not features:
             continue
 
-        rsi = f.get("rsi14")
+        rsi = features.get(
+            "rsi14"
+        )
 
-        if rsi is not None and rsi >= 80:
+        if (
+            rsi is not None
+            and rsi >= 80
+        ):
 
             warnings.append(
-                f"{tf.upper()} RSI extreme"
+                f"{timeframe.upper()} "
+                "RSI extreme"
             )
 
-        elif rsi is not None and rsi >= 70:
+        elif (
+            rsi is not None
+            and rsi >= 70
+        ):
 
             warnings.append(
-                f"{tf.upper()} RSI elevated"
+                f"{timeframe.upper()} "
+                "RSI elevated"
             )
 
-    # ATR + BBW = one volatility cluster.
-    volatility = []
+    # --------------------------------------------------------
+    # Volatility cluster
+    #
+    # ATR и BBW НЕ считаются двумя отдельными warning.
+    # --------------------------------------------------------
 
-    for tf in ("1h", "4h"):
+    volatility_percentiles = []
 
-        f = features.get(tf)
+    for timeframe in (
+        "1h",
+        "4h",
+    ):
 
-        if not f:
+        features = features_by_tf.get(
+            timeframe
+        )
+
+        if not features:
             continue
 
         values = [
-            x
-            for x in (
-                f.get("atr_pctile"),
-                f.get("bb_width_pctile"),
+            value
+            for value in (
+                features.get(
+                    "atr_pctile"
+                ),
+                features.get(
+                    "bb_width_pctile"
+                ),
             )
-            if x is not None
+            if value is not None
         ]
 
         if values:
-            volatility.append(
+
+            volatility_percentiles.append(
                 max(values)
             )
 
-    if volatility:
+    if volatility_percentiles:
 
-        maximum = max(volatility)
+        highest_volatility = max(
+            volatility_percentiles
+        )
 
-        if maximum >= 95:
+        if highest_volatility >= 95:
 
             warnings.append(
                 "1H/4H extreme volatility"
             )
 
-        elif maximum >= 75:
+        elif highest_volatility >= 75:
 
             warnings.append(
                 "1H/4H high volatility"
             )
 
-    # 1H MACD positive but weakening.
-    f1 = features.get("1h")
+    # --------------------------------------------------------
+    # 1H MACD weakening
+    # --------------------------------------------------------
 
-    if f1:
+    one_hour = features_by_tf.get(
+        "1h"
+    )
+
+    if one_hour:
 
         if (
-            f1.get("macd_sign") == "positive"
-            and f1.get("macd_slope") == "down"
+            one_hour.get(
+                "macd_sign"
+            ) == "positive"
+            and
+            one_hour.get(
+                "macd_slope"
+            ) == "down"
         ):
 
             warnings.append(
                 "1H bullish momentum weakening"
             )
 
-    if not warnings:
+    # --------------------------------------------------------
+    # Final label
+    # --------------------------------------------------------
 
-        return "🟢", "GOOD", []
+    warning_count = len(
+        warnings
+    )
 
-    if len(warnings) == 1:
+    if warning_count == 0:
 
-        return "🟡", "CAUTION", warnings
+        return (
+            "🟢",
+            "GOOD",
+            [],
+        )
 
-    return "🟠", "STRETCHED", warnings
+    if warning_count == 1:
+
+        return (
+            "🟡",
+            "CAUTION",
+            warnings,
+        )
+
+    return (
+        "🟠",
+        "STRETCHED",
+        warnings,
+    )
 
 
 # ============================================================
-# PUBLIC FUNCTION
+# PUBLIC API
 # ============================================================
 
 def get_ta_context(
-    symbol: str,
+    bingx_symbol: str,
 ) -> dict | None:
     """
-    Основная функция для monitor.py.
+    Главная функция, которую вызывает monitor.py.
 
-    Возвращает только Telegram summary.
+    ВАЖНО:
+        bingx_symbol должен быть уже настоящим
+        BingX API symbol.
 
-    При любой ошибке возвращает None,
-    чтобы TA никогда не ломала существующий сигнал.
+    Пример:
+
+        bingx_client.to_bx_symbol("LIT-USDT")
+            -> "LIGHTER-USDT"
+
+        get_ta_context("LIGHTER-USDT")
+
+    TA НЕ делает:
+        displayName mapping
+        contracts endpoint
+        manual symbol map
+
+    При любой ошибке возвращается None,
+    чтобы TA никогда не ломала основной сигнал.
     """
 
-    symbol = normalize_symbol(
+    symbol = _normalize_symbol(
+        bingx_symbol
+    )
+
+    # --------------------------------------------------------
+    # Per-run cache
+    # --------------------------------------------------------
+
+    cached = _TA_CACHE.get(
         symbol
     )
 
-    # Per-run cache.
-    if symbol in _TA_CACHE:
+    if cached is not None:
 
-        return _TA_CACHE[symbol]
+        return cached
 
     try:
 
-        features = {}
+        features_by_tf = {}
 
-        for interval in TIMEFRAMES:
+        # ----------------------------------------------------
+        # Получаем 1H / 4H / 1D
+        # ----------------------------------------------------
+
+        for timeframe in TIMEFRAMES:
 
             df = _fetch_klines(
                 symbol,
-                interval,
+                timeframe,
             )
 
-            features[interval] = (
-                _calculate_features(df)
+            features_by_tf[
+                timeframe
+            ] = _calculate_features(
+                df
             )
 
-        long_evidence = 0
-        short_evidence = 0
-        weighted_net = 0
-        tf_results = {}
+        # ----------------------------------------------------
+        # Directional score
+        # ----------------------------------------------------
 
-        max_possible = (
-            sum(TIMEFRAME_WEIGHTS.values())
+        max_score = (
+            sum(
+                TIMEFRAME_WEIGHTS.values()
+            )
             * 3
         )
 
-        for tf in TIMEFRAMES:
+        net_score = 0
 
-            f = features[tf]
+        long_evidence = 0
 
-            components = (
-                _directional_components(f)
+        short_evidence = 0
+
+        timeframe_results = {}
+
+        for timeframe in TIMEFRAMES:
+
+            features = (
+                features_by_tf[
+                    timeframe
+                ]
             )
 
-            weight = TIMEFRAME_WEIGHTS[tf]
+            components = (
+                _directional_components(
+                    features
+                )
+            )
 
-            raw = components["raw"]
+            weight = (
+                TIMEFRAME_WEIGHTS[
+                    timeframe
+                ]
+            )
 
-            weighted = raw * weight
+            raw_score = components[
+                "raw"
+            ]
 
-            weighted_net += weighted
+            weighted_score = (
+                raw_score
+                * weight
+            )
+
+            net_score += (
+                weighted_score
+            )
+
+            # ------------------------------------------------
+            # LONG evidence
+            # ------------------------------------------------
 
             if components["ema"] > 0:
                 long_evidence += weight
@@ -969,6 +1494,10 @@ def get_ta_context(
 
             if components["macd"] > 0:
                 long_evidence += weight
+
+            # ------------------------------------------------
+            # SHORT evidence
+            # ------------------------------------------------
 
             if components["ema"] < 0:
                 short_evidence += weight
@@ -981,27 +1510,28 @@ def get_ta_context(
 
             icon, label = (
                 _classify_tf_direction(
-                    f,
-                    raw,
+                    features
                 )
             )
 
-            tf_results[tf] = {
-                "score": weighted,
+            timeframe_results[
+                timeframe
+            ] = {
+                "score": weighted_score,
                 "icon": icon,
                 "label": label,
             }
 
-        # -----------------------------------------------
-        # Overall direction
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # Overall TA direction
+        # ----------------------------------------------------
 
-        if weighted_net > 0:
+        if net_score > 0:
 
             bias_icon = "🟢"
             bias_label = "TA LONG"
 
-        elif weighted_net < 0:
+        elif net_score < 0:
 
             bias_icon = "🔴"
             bias_label = "TA SHORT"
@@ -1011,24 +1541,37 @@ def get_ta_context(
             bias_icon = "🟡"
             bias_label = "TA MIXED"
 
-        # -----------------------------------------------
-        # Timing
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # Entry timing
+        # ----------------------------------------------------
 
-        timing_icon, timing_label, timing_reasons = (
-            _build_entry_timing(
-                features
-            )
+        (
+            timing_icon,
+            timing_label,
+            timing_reasons,
+        ) = _build_entry_timing(
+            features_by_tf
         )
 
         result = {
             "bias_icon": bias_icon,
             "bias_label": bias_label,
-            "net_score": weighted_net,
-            "max_score": max_possible,
-            "long_evidence": long_evidence,
-            "short_evidence": short_evidence,
-            "timeframes": tf_results,
+
+            "net_score": net_score,
+            "max_score": max_score,
+
+            "long_evidence": (
+                long_evidence
+            ),
+
+            "short_evidence": (
+                short_evidence
+            ),
+
+            "timeframes": (
+                timeframe_results
+            ),
+
             "entry_timing": {
                 "icon": timing_icon,
                 "label": timing_label,
@@ -1036,16 +1579,22 @@ def get_ta_context(
             },
         }
 
-        _TA_CACHE[symbol] = result
+        _TA_CACHE[
+            symbol
+        ] = result
 
         return result
 
     except Exception as exc:
 
-        # НИКОГДА не ломаем основной сигнал из-за TA.
+        # ----------------------------------------------------
+        # TA никогда не ломает основной monitor signal.
+        # ----------------------------------------------------
+
         print(
             f"[TA] {symbol}: "
-            f"technical context unavailable: {exc}"
+            f"technical context unavailable: "
+            f"{exc}"
         )
 
         return None
@@ -1058,12 +1607,18 @@ def get_ta_context(
 def format_ta_telegram(
     ta_context: dict | None,
 ) -> str:
+    """
+    Возвращает именно тот компактный блок,
+    который мы согласовали для Telegram.
+    """
 
     if not ta_context:
 
         return ""
 
-    line = "━━━━━━━━━━━━━━━━━━"
+    line = (
+        "━━━━━━━━━━━━━━━━━━"
+    )
 
     out = [
         line,
@@ -1092,21 +1647,29 @@ def format_ta_telegram(
         "",
     ]
 
-    for tf in TIMEFRAMES:
+    for timeframe in TIMEFRAMES:
 
-        item = ta_context["timeframes"].get(tf)
+        item = (
+            ta_context[
+                "timeframes"
+            ].get(timeframe)
+        )
 
         if not item:
             continue
 
         out.append(
-            f"{tf.upper()} "
+            f"{timeframe.upper()} "
             f"{item['score']:+d} "
             f"{item['icon']} "
             f"{item['label']}"
         )
 
-    timing = ta_context["entry_timing"]
+    timing = (
+        ta_context[
+            "entry_timing"
+        ]
+    )
 
     out.extend(
         [
@@ -1128,10 +1691,33 @@ def format_ta_telegram(
             ]
         )
 
-        for reason in timing["reasons"][:5]:
+        for reason in timing[
+            "reasons"
+        ][:5]:
 
             out.append(
                 f"• {reason}"
             )
 
-    return "\n".join(out)
+    return "\n".join(
+        out
+    )
+
+
+# ============================================================
+# OPTIONAL DEBUG HELPER
+# ============================================================
+
+def clear_cache() -> None:
+    """
+    Только для standalone tests.
+    """
+
+    _TA_CACHE.clear()
+
+
+__all__ = [
+    "get_ta_context",
+    "format_ta_telegram",
+    "clear_cache",
+]
