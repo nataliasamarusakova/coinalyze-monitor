@@ -50,9 +50,15 @@ KLINE_PATH = "/openApi/swap/v3/quote/klines"
 
 TIMEFRAMES = ("1h", "4h", "1d")
 
+# Вес таймфрейма в directional score.
+TIMEFRAME_WEIGHTS = {
+    "1h": 1,
+    "4h": 2,
+    "1d": 2,
+}
+
 KLINE_LIMIT = 250
 
-# Для percentile используются только ПРЕДЫДУЩИЕ значения.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
@@ -115,10 +121,7 @@ def request_signed(
 
     url = BASE_URL + path
 
-    print(
-        f"    URL: {url}",
-        flush=True,
-    )
+    print(f"    URL: {url}", flush=True)
 
     response = requests.request(
         method=method,
@@ -170,7 +173,6 @@ def parse_kline_row(
     if interval not in TIMEFRAME_MS:
         return None
 
-    # --------------------------------------------------------
     # Реальный VST формат:
     #
     # {
@@ -183,14 +185,12 @@ def parse_kline_row(
     # }
     #
     # time = open time.
-    # close_time вычисляется по timeframe.
-    # --------------------------------------------------------
+    # close_time вычисляем по timeframe.
 
     if isinstance(row, dict):
 
         try:
             open_time = int(row["time"])
-
             open_price = float(row["open"])
             high = float(row["high"])
             low = float(row["low"])
@@ -215,10 +215,7 @@ def parse_kline_row(
             "close_time": close_time,
         }
 
-    # --------------------------------------------------------
-    # Fallback: array format.
-    # --------------------------------------------------------
-
+    # Fallback array format.
     if isinstance(row, (list, tuple)):
 
         if len(row) < 6:
@@ -239,7 +236,6 @@ def parse_kline_row(
 
             try:
                 close_time = int(row[6])
-
             except (TypeError, ValueError):
                 close_time = (
                     open_time
@@ -296,7 +292,6 @@ def fetch_klines(
         )
 
     if not isinstance(raw, list):
-
         raise RuntimeError(
             f"{symbol} {interval}: "
             f"data имеет тип {type(raw).__name__}: "
@@ -309,7 +304,6 @@ def fetch_klines(
     )
 
     if raw:
-
         print(
             f"    first raw candle: "
             f"{str(raw[0])[:1000]}",
@@ -331,19 +325,15 @@ def fetch_klines(
         )
 
         if item is None:
-
             skipped_invalid += 1
-
             continue
 
-        # Не используем незакрытую свечу.
+        # Используем только закрытые свечи.
         if item["close_time"] > now_ms:
-
             skipped_open += 1
-
             continue
 
-        # Basic sanity check.
+        # Basic sanity.
         if (
             item["open"] <= 0
             or item["high"] <= 0
@@ -351,28 +341,23 @@ def fetch_klines(
             or item["close"] <= 0
             or item["volume"] < 0
         ):
-
             skipped_invalid += 1
-
             continue
 
         parsed.append(item)
 
     print(
-        f"    parsed closed candles: "
-        f"{len(parsed)}",
+        f"    parsed closed candles: {len(parsed)}",
         flush=True,
     )
 
     print(
-        f"    skipped current/open candle: "
-        f"{skipped_open}",
+        f"    skipped current/open candle: {skipped_open}",
         flush=True,
     )
 
     print(
-        f"    skipped invalid: "
-        f"{skipped_invalid}",
+        f"    skipped invalid: {skipped_invalid}",
         flush=True,
     )
 
@@ -422,7 +407,6 @@ def safe_float(value) -> float | None:
         return None
 
     try:
-
         value = float(value)
 
         if not math.isfinite(value):
@@ -431,7 +415,6 @@ def safe_float(value) -> float | None:
         return value
 
     except (TypeError, ValueError):
-
         return None
 
 
@@ -440,10 +423,10 @@ def previous_history_percentile(
     window: int = PERCENTILE_WINDOW,
 ) -> float | None:
     """
-    Percentile последнего значения относительно
-    только ПРЕДЫДУЩИХ значений.
+    Percentile текущего значения относительно
+    только предыдущих значений.
 
-    Текущая точка не входит в reference distribution.
+    Текущая точка НЕ входит в reference history.
     """
 
     s = pd.to_numeric(
@@ -531,35 +514,23 @@ def calculate_features(
 
     if adx is not None and not adx.empty:
 
-        if "ADX_14" in adx.columns:
+        work["adx14"] = (
+            adx["ADX_14"]
+            if "ADX_14" in adx.columns
+            else float("nan")
+        )
 
-            work["adx14"] = (
-                adx["ADX_14"]
-            )
+        work["plus_di14"] = (
+            adx["DMP_14"]
+            if "DMP_14" in adx.columns
+            else float("nan")
+        )
 
-        else:
-
-            work["adx14"] = float("nan")
-
-        if "DMP_14" in adx.columns:
-
-            work["plus_di14"] = (
-                adx["DMP_14"]
-            )
-
-        else:
-
-            work["plus_di14"] = float("nan")
-
-        if "DMN_14" in adx.columns:
-
-            work["minus_di14"] = (
-                adx["DMN_14"]
-            )
-
-        else:
-
-            work["minus_di14"] = float("nan")
+        work["minus_di14"] = (
+            adx["DMN_14"]
+            if "DMN_14" in adx.columns
+            else float("nan")
+        )
 
     else:
 
@@ -659,15 +630,11 @@ def calculate_features(
 
     if macd is not None and not macd.empty:
 
-        if "MACDh_12_26_9" in macd.columns:
-
-            work["macd_hist"] = (
-                macd["MACDh_12_26_9"]
-            )
-
-        else:
-
-            work["macd_hist"] = float("nan")
+        work["macd_hist"] = (
+            macd["MACDh_12_26_9"]
+            if "MACDh_12_26_9" in macd.columns
+            else float("nan")
+        )
 
     else:
 
@@ -701,17 +668,9 @@ def calculate_features(
     # EMA STRUCTURE
     # --------------------------------------------------------
 
-    ema20 = safe_float(
-        last["ema20"]
-    )
-
-    ema50 = safe_float(
-        last["ema50"]
-    )
-
-    ema200 = safe_float(
-        last["ema200"]
-    )
+    ema20 = safe_float(last["ema20"])
+    ema50 = safe_float(last["ema50"])
+    ema200 = safe_float(last["ema200"])
 
     if None in (
         ema20,
@@ -738,59 +697,52 @@ def calculate_features(
         ema_direction = "mixed"
 
     # --------------------------------------------------------
-    # RSI
+    # Core values
     # --------------------------------------------------------
 
-    rsi = safe_float(
-        last["rsi14"]
-    )
+    rsi = safe_float(last["rsi14"])
+
+    adx_value = safe_float(last["adx14"])
+
+    plus_di = safe_float(last["plus_di14"])
+
+    minus_di = safe_float(last["minus_di14"])
+
+    atr_pct = safe_float(last["atr_pct"])
+
+    bb_pctb = safe_float(last["bb_pctb"])
+
+    macd_hist = safe_float(last["macd_hist"])
+
+    macd_hist_pct = safe_float(last["macd_hist_pct"])
 
     # --------------------------------------------------------
-    # ADX / DI
-    # --------------------------------------------------------
-
-    adx_value = safe_float(
-        last["adx14"]
-    )
-
-    plus_di = safe_float(
-        last["plus_di14"]
-    )
-
-    minus_di = safe_float(
-        last["minus_di14"]
-    )
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
-
-    atr_pct = safe_float(
-        last["atr_pct"]
-    )
-
-    # --------------------------------------------------------
-    # BB
-    # --------------------------------------------------------
-
-    bb_pctb = safe_float(
-        last["bb_pctb"]
-    )
-
-    # --------------------------------------------------------
-    # MACD
+    # DI normalized ratio
     #
-    # sign = положение histogram относительно нуля
-    # slope = изменение histogram относительно прошлого бара
+    # (-1 ... +1)
+    #
+    # +DI > -DI => positive
+    # +DI < -DI => negative
     # --------------------------------------------------------
 
-    macd_hist = safe_float(
-        last["macd_hist"]
-    )
+    if (
+        plus_di is not None
+        and minus_di is not None
+        and (plus_di + minus_di) > 0
+    ):
 
-    macd_hist_pct = safe_float(
-        last["macd_hist_pct"]
-    )
+        di_ratio = (
+            (plus_di - minus_di)
+            / (plus_di + minus_di)
+        )
+
+    else:
+
+        di_ratio = None
+
+    # --------------------------------------------------------
+    # MACD sign + slope
+    # --------------------------------------------------------
 
     if macd_hist is None:
 
@@ -800,15 +752,12 @@ def calculate_features(
     else:
 
         if macd_hist > 0:
-
             macd_sign = "positive"
 
         elif macd_hist < 0:
-
             macd_sign = "negative"
 
         else:
-
             macd_sign = "zero"
 
         if len(work) >= 2:
@@ -818,19 +767,15 @@ def calculate_features(
             )
 
             if prev_macd_hist is None:
-
                 macd_slope = "unknown"
 
             elif macd_hist > prev_macd_hist:
-
                 macd_slope = "up"
 
             elif macd_hist < prev_macd_hist:
-
                 macd_slope = "down"
 
             else:
-
                 macd_slope = "flat"
 
         else:
@@ -838,9 +783,7 @@ def calculate_features(
             macd_slope = "unknown"
 
     return {
-        "close": safe_float(
-            last["close"]
-        ),
+        "close": safe_float(last["close"]),
 
         "open_time": int(
             last["open_time"]
@@ -862,6 +805,8 @@ def calculate_features(
         "adx14": adx_value,
         "plus_di14": plus_di,
         "minus_di14": minus_di,
+
+        "di_ratio": di_ratio,
 
         "atr_pct": atr_pct,
         "atr_pctile": atr_pctile,
@@ -910,7 +855,7 @@ def classify_rsi(
         return "🟠", "EXTREME"
 
     if value >= 70:
-        return "🟠", "OVERBOUGHT"
+        return "🟠", "HIGH / EXTENDED"
 
     if value >= 60:
         return "🟢", "STRONG"
@@ -1023,21 +968,17 @@ def classify_macd(
     slope: str,
 ) -> tuple[str, str]:
 
-    # Histogram выше нуля + растёт.
     if sign == "positive" and slope == "up":
-        return "🟢", "BULLISH"
+        return "🟢", "BULLISH MOMENTUM"
 
-    # Histogram выше нуля, но падает.
     if sign == "positive" and slope == "down":
-        return "🟡", "BULLISH / WEAKENING"
+        return "🟡", "MOMENTUM WEAKENING"
 
-    # Histogram ниже нуля, но растёт.
     if sign == "negative" and slope == "up":
         return "🟡", "RECOVERY"
 
-    # Histogram ниже нуля + продолжает падать.
     if sign == "negative" and slope == "down":
-        return "🔴", "BEARISH"
+        return "🔴", "BEARISH MOMENTUM"
 
     if sign == "positive":
         return "🟢", "BULLISH"
@@ -1049,7 +990,470 @@ def classify_macd(
 
 
 # ============================================================
-# TELEGRAM FORMAT
+# DIRECTIONAL SCORE
+# ============================================================
+
+def directional_components(
+    f: dict,
+) -> dict:
+    """
+    Возвращает три простых directional components:
+
+    EMA:
+        +1 bullish
+         0 mixed
+        -1 bearish
+
+    DI:
+        +1 bullish
+         0 neutral
+        -1 bearish
+
+    MACD histogram sign:
+        +1 positive
+         0 zero
+        -1 negative
+
+    Важно:
+    это пока только Telegram heuristic,
+    а не trading model.
+    """
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    if f["ema_direction"] == "bullish":
+        ema_score = 1
+
+    elif f["ema_direction"] == "bearish":
+        ema_score = -1
+
+    else:
+        ema_score = 0
+
+    # --------------------------------------------------------
+    # DI
+    # --------------------------------------------------------
+
+    plus = f.get("plus_di14")
+    minus = f.get("minus_di14")
+
+    if plus is None or minus is None:
+
+        di_score = 0
+
+    elif plus > minus:
+
+        di_score = 1
+
+    elif plus < minus:
+
+        di_score = -1
+
+    else:
+
+        di_score = 0
+
+    # --------------------------------------------------------
+    # MACD sign
+    # --------------------------------------------------------
+
+    if f["macd_sign"] == "positive":
+        macd_score = 1
+
+    elif f["macd_sign"] == "negative":
+        macd_score = -1
+
+    else:
+        macd_score = 0
+
+    return {
+        "ema": ema_score,
+        "di": di_score,
+        "macd": macd_score,
+        "raw": (
+            ema_score
+            + di_score
+            + macd_score
+        ),
+    }
+
+
+def build_ta_direction(
+    features: dict,
+) -> dict:
+    """
+    TA directional summary.
+
+    TF weights:
+        1H = 1
+        4H = 2
+        1D = 2
+
+    Максимум:
+        LONG evidence = 15
+        SHORT evidence = 15
+        NET = -15 ... +15
+
+    ВАЖНО:
+    Это только summary для Telegram.
+    На trading decision не влияет.
+    """
+
+    tf_results = {}
+
+    long_evidence = 0
+    short_evidence = 0
+
+    weighted_net = 0
+
+    max_possible = (
+        sum(TIMEFRAME_WEIGHTS.values())
+        * 3
+    )
+
+    for tf in TIMEFRAMES:
+
+        f = features.get(tf)
+
+        if not f:
+            continue
+
+        components = directional_components(f)
+
+        weight = TIMEFRAME_WEIGHTS[tf]
+
+        raw = components["raw"]
+
+        weighted = raw * weight
+
+        weighted_net += weighted
+
+        # ----------------------------------------------------
+        # Отдельно LONG evidence
+        # ----------------------------------------------------
+
+        if components["ema"] > 0:
+            long_evidence += weight
+
+        if components["di"] > 0:
+            long_evidence += weight
+
+        if components["macd"] > 0:
+            long_evidence += weight
+
+        # ----------------------------------------------------
+        # Отдельно SHORT evidence
+        # ----------------------------------------------------
+
+        if components["ema"] < 0:
+            short_evidence += weight
+
+        if components["di"] < 0:
+            short_evidence += weight
+
+        if components["macd"] < 0:
+            short_evidence += weight
+
+        tf_results[tf] = {
+            "weight": weight,
+            "ema": components["ema"],
+            "di": components["di"],
+            "macd": components["macd"],
+            "raw": raw,
+            "weighted": weighted,
+        }
+
+    # --------------------------------------------------------
+    # Overall bias
+    # --------------------------------------------------------
+
+    if weighted_net >= 8:
+
+        bias_icon = "🟢"
+        bias_label = "STRONG LONG"
+
+    elif weighted_net >= 4:
+
+        bias_icon = "🟢"
+        bias_label = "LONG"
+
+    elif weighted_net <= -8:
+
+        bias_icon = "🔴"
+        bias_label = "STRONG SHORT"
+
+    elif weighted_net <= -4:
+
+        bias_icon = "🔴"
+        bias_label = "SHORT"
+
+    else:
+
+        bias_icon = "🟡"
+        bias_label = "MIXED"
+
+    return {
+        "tf_results": tf_results,
+        "long_evidence": long_evidence,
+        "short_evidence": short_evidence,
+        "weighted_net": weighted_net,
+        "max_possible": max_possible,
+        "bias_icon": bias_icon,
+        "bias_label": bias_label,
+    }
+
+
+# ============================================================
+# ENTRY TIMING
+# ============================================================
+
+def build_entry_timing(
+    features: dict,
+) -> dict:
+    """
+    Оценивает только визуальный risk/timing context.
+
+    Не является торговым фильтром.
+
+    Важный принцип:
+    несколько volatility warnings не считаются
+    независимыми trading signals.
+    """
+
+    warnings = []
+
+    # --------------------------------------------------------
+    # RSI extension
+    #
+    # Проверяем прежде всего 1H/4H,
+    # так как это ближе к timing.
+    # --------------------------------------------------------
+
+    for tf in ("1h", "4h"):
+
+        f = features.get(tf)
+
+        if not f:
+            continue
+
+        rsi = f.get("rsi14")
+
+        if rsi is not None and rsi >= 80:
+
+            warnings.append(
+                f"{tf.upper()} RSI extreme"
+            )
+
+        elif rsi is not None and rsi >= 70:
+
+            warnings.append(
+                f"{tf.upper()} RSI elevated"
+            )
+
+    # --------------------------------------------------------
+    # Volatility.
+    #
+    # ATR + BBW считаем одним volatility cluster,
+    # чтобы не считать два индикатора двумя независимыми
+    # warnings.
+    # --------------------------------------------------------
+
+    volatility_levels = []
+
+    for tf in ("1h", "4h"):
+
+        f = features.get(tf)
+
+        if not f:
+            continue
+
+        atr_pctile = f.get("atr_pctile")
+        bb_pctile = f.get("bb_width_pctile")
+
+        values = [
+            x for x in (
+                atr_pctile,
+                bb_pctile,
+            )
+            if x is not None
+        ]
+
+        if values:
+            volatility_levels.append(
+                max(values)
+            )
+
+    max_volatility = (
+        max(volatility_levels)
+        if volatility_levels
+        else None
+    )
+
+    if (
+        max_volatility is not None
+        and max_volatility >= 95
+    ):
+
+        warnings.append(
+            "1H/4H extreme volatility"
+        )
+
+    elif (
+        max_volatility is not None
+        and max_volatility >= 75
+    ):
+
+        warnings.append(
+            "1H/4H high volatility"
+        )
+
+    # --------------------------------------------------------
+    # 1H MACD weakening
+    # --------------------------------------------------------
+
+    f1 = features.get("1h")
+
+    if f1:
+
+        if (
+            f1.get("macd_sign") == "positive"
+            and f1.get("macd_slope") == "down"
+        ):
+
+            warnings.append(
+                "1H bullish momentum weakening"
+            )
+
+    # --------------------------------------------------------
+    # Classification
+    # --------------------------------------------------------
+
+    warning_count = len(warnings)
+
+    if warning_count == 0:
+
+        icon = "🟢"
+        label = "GOOD"
+
+    elif warning_count == 1:
+
+        icon = "🟡"
+        label = "CAUTION"
+
+    else:
+
+        icon = "🟠"
+        label = "STRETCHED"
+
+    return {
+        "icon": icon,
+        "label": label,
+        "warnings": warnings,
+        "warning_count": warning_count,
+    }
+
+
+# ============================================================
+# SUMMARY FORMAT
+# ============================================================
+
+def format_direction_summary(
+    features: dict,
+) -> str:
+
+    direction = build_ta_direction(
+        features
+    )
+
+    timing = build_entry_timing(
+        features
+    )
+
+    out = []
+
+    out.append(
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    out.append(
+        "🎯 TA DIRECTION"
+    )
+
+    out.append("")
+
+    out.append(
+        f"{direction['bias_icon']} "
+        f"{direction['bias_label']}"
+    )
+
+    out.append(
+        f"Net Score: "
+        f"{direction['weighted_net']:+d}"
+        f"/{direction['max_possible']}"
+    )
+
+    out.append(
+        f"LONG evidence: "
+        f"{direction['long_evidence']}"
+        f"/{direction['max_possible']}"
+    )
+
+    out.append(
+        f"SHORT evidence: "
+        f"{direction['short_evidence']}"
+        f"/{direction['max_possible']}"
+    )
+
+    out.append("")
+
+    for tf in TIMEFRAMES:
+
+        item = direction["tf_results"].get(tf)
+
+        if not item:
+            continue
+
+        net = item["weighted"]
+
+        if net > 0:
+            icon = "🟢"
+        elif net < 0:
+            icon = "🔴"
+        else:
+            icon = "🟡"
+
+        out.append(
+            f"{tf.upper()} "
+            f"{net:+d} {icon}"
+        )
+
+    out.append("")
+
+    out.append(
+        f"Entry Timing: "
+        f"{timing['icon']} "
+        f"{timing['label']}"
+    )
+
+    if timing["warnings"]:
+
+        out.append("")
+
+        out.append("Причины:")
+
+        for warning in timing["warnings"][:5]:
+
+            out.append(
+                f"• {warning}"
+            )
+
+    return "\n".join(out)
+
+
+# ============================================================
+# DETAILED TA FORMAT
 # ============================================================
 
 def fnum(
@@ -1063,7 +1467,7 @@ def fnum(
     return f"{value:.{decimals}f}"
 
 
-def format_ta(
+def format_ta_details(
     features: dict,
 ) -> str:
 
@@ -1097,10 +1501,7 @@ def format_ta(
 
             continue
 
-        # ----------------------------------------------------
         # EMA
-        # ----------------------------------------------------
-
         ema_icon, ema_label = classify_ema(
             f["ema_direction"]
         )
@@ -1110,10 +1511,7 @@ def format_ta(
             f"{ema_icon} {ema_label}"
         )
 
-        # ----------------------------------------------------
         # RSI
-        # ----------------------------------------------------
-
         rsi_icon, rsi_label = classify_rsi(
             f["rsi14"]
         )
@@ -1123,10 +1521,7 @@ def format_ta(
             f"{rsi_icon} {rsi_label}"
         )
 
-        # ----------------------------------------------------
         # ADX
-        # ----------------------------------------------------
-
         adx_icon, adx_label = classify_adx(
             f["adx14"]
         )
@@ -1136,10 +1531,7 @@ def format_ta(
             f"{adx_icon} {adx_label}"
         )
 
-        # ----------------------------------------------------
         # DI
-        # ----------------------------------------------------
-
         di_icon, di_label, di_spread = classify_di(
             f["plus_di14"],
             f["minus_di14"],
@@ -1155,20 +1547,17 @@ def format_ta(
         ):
 
             if plus > minus:
-
-                di_relation = ">"
+                relation = ">"
 
             elif plus < minus:
-
-                di_relation = "<"
+                relation = "<"
 
             else:
-
-                di_relation = "="
+                relation = "="
 
             out.append(
                 f"+DI {fnum(plus, 1)} "
-                f"{di_relation} "
+                f"{relation} "
                 f"-DI {fnum(minus, 1)} "
                 f"{di_icon} {di_label} "
                 f"(spread {di_spread:+.1f})"
@@ -1177,16 +1566,14 @@ def format_ta(
         else:
 
             out.append(
-                "+DI — | -DI — "
-                "⚪ N/A"
+                "+DI — | -DI — ⚪ N/A"
             )
 
-        # ----------------------------------------------------
         # ATR
-        # ----------------------------------------------------
-
-        atr_icon, atr_label = classify_atr_percentile(
-            f["atr_pctile"]
+        atr_icon, atr_label = (
+            classify_atr_percentile(
+                f["atr_pctile"]
+            )
         )
 
         out.append(
@@ -1195,23 +1582,20 @@ def format_ta(
             f"{atr_icon} {atr_label}"
         )
 
-        # ----------------------------------------------------
         # BB Width
-        # ----------------------------------------------------
-
-        bb_icon, bb_label = classify_bb_width(
-            f["bb_width_pctile"]
+        bb_icon, bb_label = (
+            classify_bb_width(
+                f["bb_width_pctile"]
+            )
         )
 
         out.append(
-            f"BBW {fnum(f['bb_width_pctile'], 0)}%ile "
+            f"BBW "
+            f"{fnum(f['bb_width_pctile'], 0)}%ile "
             f"{bb_icon} {bb_label}"
         )
 
-        # ----------------------------------------------------
         # MACD
-        # ----------------------------------------------------
-
         macd_icon, macd_label = classify_macd(
             f["macd_sign"],
             f["macd_slope"],
@@ -1220,50 +1604,80 @@ def format_ta(
         if f["macd_hist_pct"] is None:
 
             out.append(
-                f"MACD {macd_icon} {macd_label}"
+                f"MACD "
+                f"{macd_icon} "
+                f"{macd_label}"
             )
 
         else:
 
             if f["macd_hist_pct"] >= 0:
-
-                macd_value = (
+                value = (
                     f"+{abs(f['macd_hist_pct']):.3f}%"
                 )
-
             else:
-
-                macd_value = (
+                value = (
                     f"-{abs(f['macd_hist_pct']):.3f}%"
                 )
 
             if f["macd_slope"] == "up":
-
                 arrow = "↑"
-
             elif f["macd_slope"] == "down":
-
                 arrow = "↓"
-
             elif f["macd_slope"] == "flat":
-
                 arrow = "→"
-
             else:
-
                 arrow = "—"
 
             out.append(
                 f"MACD {arrow} "
-                f"{macd_value} "
+                f"{value} "
                 f"{macd_icon} {macd_label}"
             )
 
         out.append("")
 
+    return "\n".join(out)
+
+
+# ============================================================
+# FINAL TELEGRAM-LIKE OUTPUT
+# ============================================================
+
+def format_output(
+    symbol: str,
+    features: dict,
+) -> str:
+
+    out = []
+
     out.append(
-        "ℹ️ TA — только контекст, "
-        "на торговое решение не влияет."
+        f"📊 {symbol} · TA CONTEXT"
+    )
+
+    out.append("")
+
+    # Сначала краткий ответ.
+    out.append(
+        format_direction_summary(
+            features
+        )
+    )
+
+    out.append("")
+
+    # Потом подробности.
+    out.append(
+        format_ta_details(
+            features
+        )
+    )
+
+    out.append("")
+
+    out.append(
+        "ℹ️ TA — только Telegram-контекст. "
+        "На торговое решение не влияет."
     )
 
     return "\n".join(out)
@@ -1277,7 +1691,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Standalone BingX TA Context tester"
+            "Standalone BingX TA Context tester "
+            "with LONG/SHORT directional summary"
         )
     )
 
@@ -1295,17 +1710,13 @@ def main():
 
     print()
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         f"BingX TA Context TEST: {symbol}"
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print()
 
@@ -1365,8 +1776,9 @@ def main():
     print()
 
     print(
-        format_ta(
-            all_features
+        format_output(
+            symbol,
+            all_features,
         )
     )
 
