@@ -19,7 +19,8 @@ try:
     import pandas_ta_classic as ta
 except ImportError:
     print("ERROR: pandas-ta-classic не установлен")
-    print("Установите: pip install requests pandas pandas-ta-classic")
+    print("Установите:")
+    print("    pip install requests pandas pandas-ta-classic")
     sys.exit(1)
 
 
@@ -51,7 +52,7 @@ TIMEFRAMES = ("1h", "4h", "1d")
 
 KLINE_LIMIT = 250
 
-# Сколько ПРОШЛЫХ значений использовать для percentile.
+# Для percentile используются только ПРЕДЫДУЩИЕ значения.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
@@ -114,7 +115,10 @@ def request_signed(
 
     url = BASE_URL + path
 
-    print(f"    URL: {url}", flush=True)
+    print(
+        f"    URL: {url}",
+        flush=True,
+    )
 
     response = requests.request(
         method=method,
@@ -155,7 +159,7 @@ def request_signed(
 
 
 # ============================================================
-# KLINE PARSING
+# KLINES
 # ============================================================
 
 def parse_kline_row(
@@ -178,8 +182,8 @@ def parse_kline_row(
     #   "time": 1787234400000
     # }
     #
-    # time = начало свечи.
-    # close_time вычисляем из timeframe.
+    # time = open time.
+    # close_time вычисляется по timeframe.
     # --------------------------------------------------------
 
     if isinstance(row, dict):
@@ -212,7 +216,7 @@ def parse_kline_row(
         }
 
     # --------------------------------------------------------
-    # Fallback: array format
+    # Fallback: array format.
     # --------------------------------------------------------
 
     if isinstance(row, (list, tuple)):
@@ -227,18 +231,23 @@ def parse_kline_row(
             low = float(row[3])
             close = float(row[4])
             volume = float(row[5])
+
         except (TypeError, ValueError):
             return None
 
         if len(row) >= 7:
+
             try:
                 close_time = int(row[6])
+
             except (TypeError, ValueError):
                 close_time = (
                     open_time
                     + TIMEFRAME_MS[interval]
                 )
+
         else:
+
             close_time = (
                 open_time
                 + TIMEFRAME_MS[interval]
@@ -263,7 +272,7 @@ def fetch_klines(
     limit: int = KLINE_LIMIT,
 ) -> pd.DataFrame:
 
-    raw_response = request_signed(
+    response = request_signed(
         "GET",
         KLINE_PATH,
         {
@@ -273,7 +282,7 @@ def fetch_klines(
         },
     )
 
-    raw = raw_response.get("data")
+    raw = response.get("data")
 
     print(
         f"    data type: {type(raw).__name__}",
@@ -287,6 +296,7 @@ def fetch_klines(
         )
 
     if not isinstance(raw, list):
+
         raise RuntimeError(
             f"{symbol} {interval}: "
             f"data имеет тип {type(raw).__name__}: "
@@ -299,14 +309,17 @@ def fetch_klines(
     )
 
     if raw:
+
         print(
-            f"    first raw candle: {str(raw[0])[:1000]}",
+            f"    first raw candle: "
+            f"{str(raw[0])[:1000]}",
             flush=True,
         )
 
     now_ms = int(time.time() * 1000)
 
     parsed = []
+
     skipped_open = 0
     skipped_invalid = 0
 
@@ -318,14 +331,19 @@ def fetch_klines(
         )
 
         if item is None:
+
             skipped_invalid += 1
+
             continue
 
-        # Последняя свеча может ещё идти.
+        # Не используем незакрытую свечу.
         if item["close_time"] > now_ms:
+
             skipped_open += 1
+
             continue
 
+        # Basic sanity check.
         if (
             item["open"] <= 0
             or item["high"] <= 0
@@ -333,27 +351,33 @@ def fetch_klines(
             or item["close"] <= 0
             or item["volume"] < 0
         ):
+
             skipped_invalid += 1
+
             continue
 
         parsed.append(item)
 
     print(
-        f"    parsed closed candles: {len(parsed)}",
+        f"    parsed closed candles: "
+        f"{len(parsed)}",
         flush=True,
     )
 
     print(
-        f"    skipped current/open candle: {skipped_open}",
+        f"    skipped current/open candle: "
+        f"{skipped_open}",
         flush=True,
     )
 
     print(
-        f"    skipped invalid: {skipped_invalid}",
+        f"    skipped invalid: "
+        f"{skipped_invalid}",
         flush=True,
     )
 
     if not parsed:
+
         last_raw = raw[-1] if raw else None
 
         raise RuntimeError(
@@ -398,6 +422,7 @@ def safe_float(value) -> float | None:
         return None
 
     try:
+
         value = float(value)
 
         if not math.isfinite(value):
@@ -406,6 +431,7 @@ def safe_float(value) -> float | None:
         return value
 
     except (TypeError, ValueError):
+
         return None
 
 
@@ -415,16 +441,9 @@ def previous_history_percentile(
 ) -> float | None:
     """
     Percentile последнего значения относительно
-    ТОЛЬКО ПРЕДЫДУЩИХ значений.
+    только ПРЕДЫДУЩИХ значений.
 
-    Текущая точка НЕ входит в reference distribution.
-
-    Например:
-        current BB width = X
-        previous 200 BB widths = history
-
-    percentile показывает положение X
-    внутри history.
+    Текущая точка не входит в reference distribution.
     """
 
     s = pd.to_numeric(
@@ -437,15 +456,22 @@ def previous_history_percentile(
 
     current = float(s.iloc[-1])
 
-    history = s.iloc[:-1].tail(window)
+    history = (
+        s.iloc[:-1]
+        .tail(window)
+    )
 
     if len(history) < 10:
         return None
 
-    rank = (history <= current).sum()
+    rank = (
+        history <= current
+    ).sum()
 
     percentile = (
-        rank / len(history) * 100.0
+        rank
+        / len(history)
+        * 100.0
     )
 
     return round(
@@ -455,7 +481,7 @@ def previous_history_percentile(
 
 
 # ============================================================
-# TA
+# TA CALCULATION
 # ============================================================
 
 def calculate_features(
@@ -506,18 +532,33 @@ def calculate_features(
     if adx is not None and not adx.empty:
 
         if "ADX_14" in adx.columns:
-            work["adx14"] = adx["ADX_14"]
+
+            work["adx14"] = (
+                adx["ADX_14"]
+            )
+
         else:
+
             work["adx14"] = float("nan")
 
         if "DMP_14" in adx.columns:
-            work["plus_di14"] = adx["DMP_14"]
+
+            work["plus_di14"] = (
+                adx["DMP_14"]
+            )
+
         else:
+
             work["plus_di14"] = float("nan")
 
         if "DMN_14" in adx.columns:
-            work["minus_di14"] = adx["DMN_14"]
+
+            work["minus_di14"] = (
+                adx["DMN_14"]
+            )
+
         else:
+
             work["minus_di14"] = float("nan")
 
     else:
@@ -544,7 +585,7 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # Bollinger Bands
+    # Bollinger
     # --------------------------------------------------------
 
     bb = ta.bbands(
@@ -619,10 +660,13 @@ def calculate_features(
     if macd is not None and not macd.empty:
 
         if "MACDh_12_26_9" in macd.columns:
+
             work["macd_hist"] = (
                 macd["MACDh_12_26_9"]
             )
+
         else:
+
             work["macd_hist"] = float("nan")
 
     else:
@@ -637,9 +681,6 @@ def calculate_features(
 
     # --------------------------------------------------------
     # Percentiles
-    #
-    # ВАЖНО:
-    # ТЕКУЩЕЕ значение НЕ входит в reference history.
     # --------------------------------------------------------
 
     atr_pctile = previous_history_percentile(
@@ -677,18 +718,22 @@ def calculate_features(
         ema50,
         ema200,
     ):
+
         ema_structure = "N/A"
         ema_direction = "neutral"
 
     elif ema20 > ema50 > ema200:
+
         ema_structure = "20>50>200"
         ema_direction = "bullish"
 
     elif ema20 < ema50 < ema200:
+
         ema_structure = "20<50<200"
         ema_direction = "bearish"
 
     else:
+
         ema_structure = "mixed"
         ema_direction = "mixed"
 
@@ -735,15 +780,8 @@ def calculate_features(
     # --------------------------------------------------------
     # MACD
     #
-    # ДВА разных свойства:
-    #
-    # 1) sign:
-    #       histogram positive / negative
-    #
-    # 2) slope:
-    #       histogram increased / decreased
-    #
-    # Для Telegram стрелка означает именно SLOPE.
+    # sign = положение histogram относительно нуля
+    # slope = изменение histogram относительно прошлого бара
     # --------------------------------------------------------
 
     macd_hist = safe_float(
@@ -762,10 +800,15 @@ def calculate_features(
     else:
 
         if macd_hist > 0:
+
             macd_sign = "positive"
+
         elif macd_hist < 0:
+
             macd_sign = "negative"
+
         else:
+
             macd_sign = "zero"
 
         if len(work) >= 2:
@@ -837,7 +880,176 @@ def calculate_features(
 
 
 # ============================================================
-# FORMAT
+# HUMAN INTERPRETATION
+# ============================================================
+
+def classify_ema(
+    direction: str,
+) -> tuple[str, str]:
+
+    if direction == "bullish":
+        return "🟢", "BULLISH"
+
+    if direction == "bearish":
+        return "🔴", "BEARISH"
+
+    if direction == "mixed":
+        return "🟡", "MIXED"
+
+    return "⚪", "NEUTRAL"
+
+
+def classify_rsi(
+    value: float | None,
+) -> tuple[str, str]:
+
+    if value is None:
+        return "⚪", "N/A"
+
+    if value >= 80:
+        return "🟠", "EXTREME"
+
+    if value >= 70:
+        return "🟠", "OVERBOUGHT"
+
+    if value >= 60:
+        return "🟢", "STRONG"
+
+    if value >= 50:
+        return "🟢", "BULLISH"
+
+    if value >= 40:
+        return "🟡", "NEUTRAL"
+
+    if value >= 30:
+        return "🟡", "WEAK"
+
+    return "🔴", "VERY WEAK"
+
+
+def classify_adx(
+    value: float | None,
+) -> tuple[str, str]:
+
+    if value is None:
+        return "⚪", "N/A"
+
+    if value >= 40:
+        return "🟢", "VERY STRONG"
+
+    if value >= 25:
+        return "🟢", "STRONG"
+
+    if value >= 20:
+        return "🟡", "DEVELOPING"
+
+    if value >= 15:
+        return "🟡", "WEAK"
+
+    return "⚪", "NO TREND"
+
+
+def classify_di(
+    plus: float | None,
+    minus: float | None,
+) -> tuple[str, str, float | None]:
+
+    if plus is None or minus is None:
+        return "⚪", "N/A", None
+
+    spread = plus - minus
+
+    if spread > 5:
+        return "🟢", "BULLISH", spread
+
+    if spread > 0:
+        return "🟢", "SLIGHT BULLISH", spread
+
+    if spread < -5:
+        return "🔴", "BEARISH", spread
+
+    if spread < 0:
+        return "🔴", "SLIGHT BEARISH", spread
+
+    return "🟡", "NEUTRAL", spread
+
+
+def classify_atr_percentile(
+    percentile: float | None,
+) -> tuple[str, str]:
+
+    if percentile is None:
+        return "⚪", "N/A"
+
+    if percentile >= 95:
+        return "🔴", "EXTREME VOL"
+
+    if percentile >= 75:
+        return "🟠", "HIGH VOL"
+
+    if percentile >= 25:
+        return "⚪", "NORMAL VOL"
+
+    if percentile >= 10:
+        return "🔵", "LOW VOL"
+
+    return "🔵", "VERY LOW VOL"
+
+
+def classify_bb_width(
+    percentile: float | None,
+) -> tuple[str, str]:
+
+    if percentile is None:
+        return "⚪", "N/A"
+
+    if percentile >= 95:
+        return "🔴", "EXTREME EXPANSION"
+
+    if percentile >= 75:
+        return "🟠", "HIGH EXPANSION"
+
+    if percentile >= 25:
+        return "⚪", "NORMAL"
+
+    if percentile >= 10:
+        return "🔵", "LOW WIDTH"
+
+    return "🔵", "VERY LOW WIDTH"
+
+
+def classify_macd(
+    sign: str,
+    slope: str,
+) -> tuple[str, str]:
+
+    # Histogram выше нуля + растёт.
+    if sign == "positive" and slope == "up":
+        return "🟢", "BULLISH"
+
+    # Histogram выше нуля, но падает.
+    if sign == "positive" and slope == "down":
+        return "🟡", "BULLISH / WEAKENING"
+
+    # Histogram ниже нуля, но растёт.
+    if sign == "negative" and slope == "up":
+        return "🟡", "RECOVERY"
+
+    # Histogram ниже нуля + продолжает падать.
+    if sign == "negative" and slope == "down":
+        return "🔴", "BEARISH"
+
+    if sign == "positive":
+        return "🟢", "BULLISH"
+
+    if sign == "negative":
+        return "🔴", "BEARISH"
+
+    return "⚪", "NEUTRAL"
+
+
+# ============================================================
+# TELEGRAM FORMAT
 # ============================================================
 
 def fnum(
@@ -849,38 +1061,6 @@ def fnum(
         return "—"
 
     return f"{value:.{decimals}f}"
-
-
-def macd_arrow(
-    slope: str,
-) -> str:
-
-    if slope == "up":
-        return "↑"
-
-    if slope == "down":
-        return "↓"
-
-    if slope == "flat":
-        return "→"
-
-    return "—"
-
-
-def macd_sign_symbol(
-    sign: str,
-) -> str:
-
-    if sign == "positive":
-        return "+"
-
-    if sign == "negative":
-        return "-"
-
-    if sign == "zero":
-        return "0"
-
-    return "—"
 
 
 def format_ta(
@@ -910,7 +1090,7 @@ def format_ta(
         if not f:
 
             out.append(
-                "ERROR: нет данных"
+                "⚠️ TA data unavailable"
             )
 
             out.append("")
@@ -921,37 +1101,49 @@ def format_ta(
         # EMA
         # ----------------------------------------------------
 
-        if f["ema_direction"] == "bullish":
-
-            ema_icon = "🟢"
-
-        elif f["ema_direction"] == "bearish":
-
-            ema_icon = "🔴"
-
-        elif f["ema_direction"] == "mixed":
-
-            ema_icon = "🟡"
-
-        else:
-
-            ema_icon = "⚪"
+        ema_icon, ema_label = classify_ema(
+            f["ema_direction"]
+        )
 
         out.append(
-            f"EMA {f['ema_structure']} {ema_icon}"
+            f"EMA {f['ema_structure']} "
+            f"{ema_icon} {ema_label}"
         )
 
         # ----------------------------------------------------
         # RSI
         # ----------------------------------------------------
 
+        rsi_icon, rsi_label = classify_rsi(
+            f["rsi14"]
+        )
+
         out.append(
-            f"RSI {fnum(f['rsi14'], 1)}"
+            f"RSI {fnum(f['rsi14'], 1)} "
+            f"{rsi_icon} {rsi_label}"
         )
 
         # ----------------------------------------------------
-        # ADX / DI
+        # ADX
         # ----------------------------------------------------
+
+        adx_icon, adx_label = classify_adx(
+            f["adx14"]
+        )
+
+        out.append(
+            f"ADX {fnum(f['adx14'], 1)} "
+            f"{adx_icon} {adx_label}"
+        )
+
+        # ----------------------------------------------------
+        # DI
+        # ----------------------------------------------------
+
+        di_icon, di_label, di_spread = classify_di(
+            f["plus_di14"],
+            f["minus_di14"],
+        )
 
         plus = f["plus_di14"]
         minus = f["minus_di14"]
@@ -959,88 +1151,112 @@ def format_ta(
         if (
             plus is not None
             and minus is not None
+            and di_spread is not None
         ):
 
             if plus > minus:
 
-                di = (
-                    f"+DI {fnum(plus)} > "
-                    f"-DI {fnum(minus)}"
-                )
+                di_relation = ">"
 
             elif plus < minus:
 
-                di = (
-                    f"+DI {fnum(plus)} < "
-                    f"-DI {fnum(minus)}"
-                )
+                di_relation = "<"
 
             else:
 
-                di = (
-                    f"+DI {fnum(plus)} = "
-                    f"-DI {fnum(minus)}"
-                )
-
-        else:
-
-            di = "+DI — | -DI —"
-
-        out.append(
-            f"ADX {fnum(f['adx14'])} | {di}"
-        )
-
-        # ----------------------------------------------------
-        # ATR
-        # ----------------------------------------------------
-
-        out.append(
-            f"ATR {fnum(f['atr_pct'], 2)}% | "
-            f"{fnum(f['atr_pctile'], 0)}%ile"
-        )
-
-        # ----------------------------------------------------
-        # BB
-        # ----------------------------------------------------
-
-        out.append(
-            f"BB Width "
-            f"{fnum(f['bb_width_pctile'], 0)}%ile"
-        )
-
-        # ----------------------------------------------------
-        # MACD
-        #
-        # Например:
-        #
-        # MACD Hist ↑ (+0.430%)
-        #
-        # ↑ = histogram растёт
-        # +0.430% = histogram выше нуля
-        # ----------------------------------------------------
-
-        arrow = macd_arrow(
-            f["macd_slope"]
-        )
-
-        sign = macd_sign_symbol(
-            f["macd_sign"]
-        )
-
-        macd_value = f["macd_hist_pct"]
-
-        if macd_value is None:
+                di_relation = "="
 
             out.append(
-                f"MACD Hist {arrow} ({sign})"
+                f"+DI {fnum(plus, 1)} "
+                f"{di_relation} "
+                f"-DI {fnum(minus, 1)} "
+                f"{di_icon} {di_label} "
+                f"(spread {di_spread:+.1f})"
             )
 
         else:
 
             out.append(
-                f"MACD Hist "
-                f"{arrow} "
-                f"({sign}{abs(macd_value):.3f}%)"
+                "+DI — | -DI — "
+                "⚪ N/A"
+            )
+
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
+
+        atr_icon, atr_label = classify_atr_percentile(
+            f["atr_pctile"]
+        )
+
+        out.append(
+            f"ATR {fnum(f['atr_pct'], 2)}% | "
+            f"{fnum(f['atr_pctile'], 0)}%ile "
+            f"{atr_icon} {atr_label}"
+        )
+
+        # ----------------------------------------------------
+        # BB Width
+        # ----------------------------------------------------
+
+        bb_icon, bb_label = classify_bb_width(
+            f["bb_width_pctile"]
+        )
+
+        out.append(
+            f"BBW {fnum(f['bb_width_pctile'], 0)}%ile "
+            f"{bb_icon} {bb_label}"
+        )
+
+        # ----------------------------------------------------
+        # MACD
+        # ----------------------------------------------------
+
+        macd_icon, macd_label = classify_macd(
+            f["macd_sign"],
+            f["macd_slope"],
+        )
+
+        if f["macd_hist_pct"] is None:
+
+            out.append(
+                f"MACD {macd_icon} {macd_label}"
+            )
+
+        else:
+
+            if f["macd_hist_pct"] >= 0:
+
+                macd_value = (
+                    f"+{abs(f['macd_hist_pct']):.3f}%"
+                )
+
+            else:
+
+                macd_value = (
+                    f"-{abs(f['macd_hist_pct']):.3f}%"
+                )
+
+            if f["macd_slope"] == "up":
+
+                arrow = "↑"
+
+            elif f["macd_slope"] == "down":
+
+                arrow = "↓"
+
+            elif f["macd_slope"] == "flat":
+
+                arrow = "→"
+
+            else:
+
+                arrow = "—"
+
+            out.append(
+                f"MACD {arrow} "
+                f"{macd_value} "
+                f"{macd_icon} {macd_label}"
             )
 
         out.append("")
@@ -1060,7 +1276,9 @@ def format_ta(
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Standalone BingX TA Context tester"
+        description=(
+            "Standalone BingX TA Context tester"
+        )
     )
 
     parser.add_argument(
