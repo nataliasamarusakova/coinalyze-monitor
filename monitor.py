@@ -1752,7 +1752,7 @@ def _retry_pending_tp_notifications():
     return changed
 
 
-def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
+def format_signal(symbol, wl, cur, snaps, reasons, warnings, market, ta_context_data=None):
     state = wl["state"]
     emoji = STATE_EMOJI.get(state, "⚪")
     action = ACTIONS.get(state, "")
@@ -1804,8 +1804,14 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market):
         *([ f"FR z-score: {fr_z:+.2f}"] if fr_z is not None else []),
     ]
     msg += f"{line}\n" f"📊 Research\n" + " · ".join(research_parts) + "\n"
+    if ta_context_data:
+        ta_block = ta_context.format_ta_telegram(
+            ta_context_data
+        )
+        if ta_block:
+            msg += f"\n{ta_block}\n"
+    
     return msg
-
 
 def format_trade_close(rec):
     pnl = rec.get("strategy_pnl_pct")
