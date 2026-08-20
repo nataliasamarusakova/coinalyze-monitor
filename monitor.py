@@ -4117,8 +4117,13 @@ def run():
 
                 if should_send_tg:
                     llm_res = llm_verify(sym, signal_wl, cur, hist)
-                    ta_context_data = ta_context.get_ta_context(sym)
-                    msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market, ta_context_data=ta_context_data)
+                    ta_data = None
+                    try:
+                        ta_bx_symbol = bingx_client.to_bx_symbol(sym)
+                        ta_data = ta_context.get_ta_context(ta_bx_symbol)
+                    except Exception as e:
+                        log.warning(f"[{sym}] TA context failed: {e}")
+                    msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market, ta_context_data=ta_data)
                     if llm_res:
                         agree = "✅" if llm_res.get("agree") is True else "❌"
                         msg += f"\n🤖 {agree} {esc(llm_res.get('risk','?'))} · {esc(llm_res.get('reason',''))}"
