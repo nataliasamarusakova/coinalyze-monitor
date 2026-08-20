@@ -5,18 +5,18 @@
     "action": "POSSIBLE_ENTRY",
     "confidence": 89,
     "score": 9,
-    "momentum": 4,
+    "momentum": 3,
     "pattern": "—",
     "name": "LayerZero",
     "first_seen": 1787183758,
-    "last_seen": 1787206864,
-    "snapshots": 6,
+    "last_seen": 1787207163,
+    "snapshots": 7,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.49,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -30,7 +30,6 @@
     ],
     "mom_tags": [
       "OI accel↓",
-      "Price accel↑",
       "Funding stable",
       "OI4h↑",
       "No divergence"
@@ -51,10 +50,10 @@
     "pattern": "Healthy Trend",
     "name": "Jupiter",
     "first_seen": 1787184971,
-    "last_seen": 1787186765,
+    "last_seen": 1787207163,
     "snapshots": 5,
-    "missed_runs": 67,
-    "neutral_runs": 1,
+    "missed_runs": 0,
+    "neutral_runs": 2,
     "entry_earliness": 0.33,
     "signal_strength": 10.0,
     "window": {
@@ -88,10 +87,10 @@
       "entry_price": 0.1823,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.182,
-      "last_price_ts": 1787186765,
+      "last_price": 0.1814,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 0.0,
-      "min_pnl_pct": -0.16456390565002454,
+      "min_pnl_pct": -0.49369171695007363,
       "peak_ts": 1787185887,
       "max_state": "CONFIRMED_TREND",
       "state_history": [
@@ -112,12 +111,18 @@
           "state": "CONFIRMED_TREND",
           "score": 8,
           "reason": "state_transition"
+        },
+        {
+          "ts": 1787207163,
+          "state": "NEUTRAL",
+          "score": 8,
+          "reason": "state_transition"
         }
       ],
-      "current_state": "CONFIRMED_TREND",
-      "current_state_start_ts": 1787186478,
+      "current_state": "NEUTRAL",
+      "current_state_start_ts": 1787207163,
       "time_in_states": {
-        "CONFIRMED_TREND": 4.7,
+        "CONFIRMED_TREND": 349.5,
         "NEUTRAL": 5.1
       },
       "idea_first_seen_ts": 1787168159,
@@ -292,9 +297,9 @@
         "missing_snapshots": 0,
         "max_price_age_min": 335.0,
         "price_unknown": false,
-        "exit_price_age_min": 335.0,
-        "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
+        "exit_price_age_min": 0.0,
+        "last_price_observation": "live",
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 67
       },
       "shadow_stops": {
@@ -393,25 +398,25 @@
       "bingx_symbol": "JUP-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
-        "status": "DATA_DEGRADED",
-        "state": null,
-        "score": 0,
-        "strength": null,
-        "age_min": 349.6,
-        "signal_age_min": 335.0,
-        "price_age_min": 335.0,
-        "pnl_pct": null,
+        "last_check_ts": 1787207163,
+        "status": "HEALTHY",
+        "state": "NEUTRAL",
+        "score": 8,
+        "strength": 0.0,
+        "age_min": 354.6,
+        "signal_age_min": 0.0,
+        "price_age_min": 0.0,
+        "pnl_pct": -0.494,
         "timeout_reached": false,
-        "signal_decay": true,
-        "missed": true,
+        "signal_decay": false,
+        "missed": false,
         "data_stale": false,
-        "discovery_missing": true,
+        "discovery_missing": false,
         "soft_conditions": {
-          "SIGNAL_DECAY": true,
-          "MISSED": true,
+          "SIGNAL_DECAY": false,
+          "MISSED": false,
           "DATA_STALE": false,
-          "DISCOVERY_MISSING": true
+          "DISCOVERY_MISSING": false
         },
         "hard_candidates": {
           "EXCHANGE_CLOSED": false,
@@ -423,8 +428,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 10.0,
-      "last_signal_ts": 1787186765
+      "last_signal_strength": 0.0,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "JUP_1787185887_b3f0f7a9",
     "state_signal": "NEUTRAL"
@@ -439,10 +444,10 @@
     "pattern": "Healthy Trend",
     "name": "Mantle",
     "first_seen": 1787185887,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 6,
     "missed_runs": 0,
-    "neutral_runs": 21,
+    "neutral_runs": 22,
     "entry_earliness": 0.37,
     "signal_strength": 10.0,
     "window": {
@@ -476,8 +481,8 @@
       "entry_price": 0.4692,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.4833,
-      "last_price_ts": 1787206864,
+      "last_price": 0.4846,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 4.347826086956516,
       "min_pnl_pct": -0.04262574595056127,
       "peak_ts": 1787196352,
@@ -700,7 +705,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -798,15 +803,15 @@
       "bingx_symbol": "MNT-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
         "score": 7,
-        "strength": 7.5,
-        "age_min": 329.9,
+        "strength": 8.5,
+        "age_min": 334.9,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 3.005,
+        "pnl_pct": 3.282,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -828,8 +833,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 7.5,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 8.5,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "MNT_1787187069_276bb94b",
     "state_signal": "NEUTRAL"
@@ -846,7 +851,7 @@
     "first_seen": 1787186170,
     "last_seen": 1787195161,
     "snapshots": 5,
-    "missed_runs": 39,
+    "missed_runs": 40,
     "neutral_runs": 13,
     "entry_earliness": 0.21,
     "signal_strength": 10.0,
@@ -1073,12 +1078,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 195.1,
+        "max_price_age_min": 200.0,
         "price_unknown": false,
-        "exit_price_age_min": 195.1,
+        "exit_price_age_min": 200.0,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 52
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 53
       },
       "shadow_stops": {
         "1.5": null,
@@ -1176,14 +1181,14 @@
       "bingx_symbol": "SXT-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 329.9,
-        "signal_age_min": 195.1,
-        "price_age_min": 195.1,
+        "age_min": 334.9,
+        "signal_age_min": 200.0,
+        "price_age_min": 200.0,
         "pnl_pct": null,
         "timeout_reached": false,
         "signal_decay": true,
@@ -1222,7 +1227,7 @@
     "pattern": "Healthy Trend",
     "name": "Sonic",
     "first_seen": 1787186478,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 2,
     "missed_runs": 0,
     "neutral_runs": 33,
@@ -1258,7 +1263,7 @@
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
       "last_price": 0.0241,
-      "last_price_ts": 1787206864,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 3.418803418803413,
       "min_pnl_pct": 0.0,
       "peak_ts": 1787198489,
@@ -1535,7 +1540,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864,
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 4
       },
       "shadow_stops": {
@@ -1634,12 +1639,12 @@
       "bingx_symbol": "S-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "CONFIRMED_TREND",
         "score": 8,
         "strength": 10.0,
-        "age_min": 339.8,
+        "age_min": 344.8,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
         "pnl_pct": 2.991,
@@ -1665,7 +1670,7 @@
       },
       "position_manager_version": 2,
       "last_signal_strength": 10.0,
-      "last_signal_ts": 1787206864
+      "last_signal_ts": 1787207163
     },
     "trade_id": "S_1787186478_05dbef90",
     "state_signal": "NEUTRAL"
@@ -1680,10 +1685,10 @@
     "pattern": "Healthy Trend",
     "name": "Bitcoin SV",
     "first_seen": 1787186478,
-    "last_seen": 1787205696,
+    "last_seen": 1787207163,
     "snapshots": 2,
-    "missed_runs": 4,
-    "neutral_runs": 36,
+    "missed_runs": 0,
+    "neutral_runs": 37,
     "entry_earliness": 0.35,
     "signal_strength": 9.6,
     "window": {
@@ -1716,8 +1721,8 @@
       "entry_price": 16.04,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 15.95,
-      "last_price_ts": 1787205696,
+      "last_price": 15.93,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 0.49875311720699406,
       "min_pnl_pct": -1.745635910224435,
       "peak_ts": 1787192469,
@@ -1950,9 +1955,9 @@
         "missing_snapshots": 0,
         "max_price_age_min": 40.0,
         "price_unknown": false,
-        "exit_price_age_min": 19.5,
-        "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
+        "exit_price_age_min": 0.0,
+        "last_price_observation": "live",
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 16
       },
       "shadow_stops": {
@@ -2055,25 +2060,25 @@
       "bingx_symbol": "BSV-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
-        "status": "DATA_DEGRADED",
-        "state": null,
-        "score": 0,
-        "strength": null,
-        "age_min": 339.8,
-        "signal_age_min": 19.5,
-        "price_age_min": 19.5,
-        "pnl_pct": null,
+        "last_check_ts": 1787207163,
+        "status": "HEALTHY",
+        "state": "NEUTRAL",
+        "score": 7,
+        "strength": 6.51,
+        "age_min": 344.8,
+        "signal_age_min": 0.0,
+        "price_age_min": 0.0,
+        "pnl_pct": -0.686,
         "timeout_reached": false,
         "signal_decay": false,
-        "missed": true,
+        "missed": false,
         "data_stale": false,
-        "discovery_missing": true,
+        "discovery_missing": false,
         "soft_conditions": {
           "SIGNAL_DECAY": false,
-          "MISSED": true,
+          "MISSED": false,
           "DATA_STALE": false,
-          "DISCOVERY_MISSING": true
+          "DISCOVERY_MISSING": false
         },
         "hard_candidates": {
           "EXCHANGE_CLOSED": false,
@@ -2085,8 +2090,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 6.86,
-      "last_signal_ts": 1787205696
+      "last_signal_strength": 6.51,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "BSV_1787186478_bc4d3d8c",
     "state_signal": "NEUTRAL"
@@ -2103,7 +2108,7 @@
     "first_seen": 1787186765,
     "last_seen": 1787194556,
     "snapshots": 2,
-    "missed_runs": 41,
+    "missed_runs": 42,
     "neutral_runs": 13,
     "entry_earliness": 0.27,
     "signal_strength": 9.6,
@@ -2334,12 +2339,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 205.1,
+        "max_price_age_min": 210.1,
         "price_unknown": false,
-        "exit_price_age_min": 205.1,
+        "exit_price_age_min": 210.1,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 54
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 55
       },
       "shadow_stops": {
         "1.5": null,
@@ -2437,14 +2442,14 @@
       "bingx_symbol": "1000BONK-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 335.0,
-        "signal_age_min": 205.1,
-        "price_age_min": 205.1,
+        "age_min": 340.0,
+        "signal_age_min": 210.1,
+        "price_age_min": 210.1,
         "pnl_pct": null,
         "timeout_reached": false,
         "signal_decay": true,
@@ -2485,7 +2490,7 @@
     "first_seen": 1787187069,
     "last_seen": 1787195161,
     "snapshots": 2,
-    "missed_runs": 39,
+    "missed_runs": 40,
     "neutral_runs": 13,
     "entry_earliness": 0.33,
     "signal_strength": 8.0,
@@ -2713,12 +2718,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 195.1,
+        "max_price_age_min": 200.0,
         "price_unknown": false,
-        "exit_price_age_min": 195.1,
+        "exit_price_age_min": 200.0,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 53
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 54
       },
       "shadow_stops": {
         "1.5": null,
@@ -2816,14 +2821,14 @@
       "bingx_symbol": "XLM-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 329.9,
-        "signal_age_min": 195.1,
-        "price_age_min": 195.1,
+        "age_min": 334.9,
+        "signal_age_min": 200.0,
+        "price_age_min": 200.0,
         "pnl_pct": null,
         "timeout_reached": false,
         "signal_decay": true,
@@ -2862,10 +2867,10 @@
     "pattern": "—",
     "name": "OVERTAKE",
     "first_seen": 1787187957,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 2,
     "missed_runs": 0,
-    "neutral_runs": 56,
+    "neutral_runs": 57,
     "entry_earliness": 0.3,
     "signal_strength": 8.0,
     "window": {
@@ -2898,8 +2903,8 @@
       "entry_price": 0.0534,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "early",
-      "last_price": 0.0541,
-      "last_price_ts": 1787206864,
+      "last_price": 0.0544,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 2.8089887640449334,
       "min_pnl_pct": -0.18726591760300162,
       "peak_ts": 1787201473,
@@ -3134,7 +3139,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864,
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 3
       },
       "shadow_stops": {
@@ -3233,15 +3238,15 @@
       "bingx_symbol": "TAKE-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
-        "score": 9,
-        "strength": 5.67,
-        "age_min": 315.1,
+        "score": 10,
+        "strength": 9.6,
+        "age_min": 320.1,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 1.311,
+        "pnl_pct": 1.873,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -3263,8 +3268,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 5.67,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 9.6,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "TAKE_1787187957_285667c6",
     "state_signal": "NEUTRAL"
@@ -3281,7 +3286,7 @@
     "first_seen": 1787190063,
     "last_seen": 1787201473,
     "snapshots": 2,
-    "missed_runs": 18,
+    "missed_runs": 19,
     "neutral_runs": 34,
     "entry_earliness": 0.37,
     "signal_strength": 10.0,
@@ -3511,12 +3516,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 89.8,
+        "max_price_age_min": 94.8,
         "price_unknown": false,
-        "exit_price_age_min": 89.8,
+        "exit_price_age_min": 94.8,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 18
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 19
       },
       "shadow_stops": {
         "1.5": {
@@ -3618,22 +3623,22 @@
       "bingx_symbol": "SKY-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 280.0,
-        "signal_age_min": 89.8,
-        "price_age_min": 89.8,
+        "age_min": 285.0,
+        "signal_age_min": 94.8,
+        "price_age_min": 94.8,
         "pnl_pct": null,
         "timeout_reached": false,
-        "signal_decay": false,
+        "signal_decay": true,
         "missed": true,
         "data_stale": false,
         "discovery_missing": true,
         "soft_conditions": {
-          "SIGNAL_DECAY": false,
+          "SIGNAL_DECAY": true,
           "MISSED": true,
           "DATA_STALE": false,
           "DISCOVERY_MISSING": true
@@ -3664,10 +3669,10 @@
     "pattern": "Healthy Trend",
     "name": "Lighter",
     "first_seen": 1787191289,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 4,
     "missed_runs": 0,
-    "neutral_runs": 6,
+    "neutral_runs": 7,
     "entry_earliness": 0.43,
     "signal_strength": 10.0,
     "window": {
@@ -3700,8 +3705,8 @@
       "entry_price": 2.65,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 2.85,
-      "last_price_ts": 1787206864,
+      "last_price": 2.84,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 8.301886792452837,
       "min_pnl_pct": 0.0,
       "peak_ts": 1787204159,
@@ -3736,12 +3741,18 @@
           "state": "CONFIRMED_TREND",
           "score": 10,
           "reason": "state_transition"
+        },
+        {
+          "ts": 1787207163,
+          "state": "NEUTRAL",
+          "score": 8,
+          "reason": "state_transition"
         }
       ],
-      "current_state": "CONFIRMED_TREND",
-      "current_state_start_ts": 1787198489,
+      "current_state": "NEUTRAL",
+      "current_state_start_ts": 1787207163,
       "time_in_states": {
-        "CONFIRMED_TREND": 80.3,
+        "CONFIRMED_TREND": 224.9,
         "NEUTRAL": 30.1
       },
       "idea_first_seen_ts": 1787168159,
@@ -3918,7 +3929,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -4019,15 +4030,15 @@
       "bingx_symbol": "LIGHTER-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
-        "state": "CONFIRMED_TREND",
+        "state": "NEUTRAL",
         "score": 8,
-        "strength": 10.0,
-        "age_min": 250.0,
+        "strength": 9.0,
+        "age_min": 255.0,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 7.547,
+        "pnl_pct": 7.17,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -4049,8 +4060,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 10.0,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 9.0,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "LIT_1787191865_08dd2be6",
     "state_signal": "NEUTRAL"
@@ -4067,7 +4078,7 @@
     "first_seen": 1787193371,
     "last_seen": 1787201473,
     "snapshots": 2,
-    "missed_runs": 18,
+    "missed_runs": 19,
     "neutral_runs": 9,
     "entry_earliness": 0.39,
     "signal_strength": 10.0,
@@ -4320,12 +4331,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 89.8,
+        "max_price_age_min": 94.8,
         "price_unknown": false,
-        "exit_price_age_min": 89.8,
+        "exit_price_age_min": 94.8,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 34
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 35
       },
       "shadow_stops": {
         "1.5": null,
@@ -4423,22 +4434,22 @@
       "bingx_symbol": "ZEC-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 224.9,
-        "signal_age_min": 89.8,
-        "price_age_min": 89.8,
+        "age_min": 229.9,
+        "signal_age_min": 94.8,
+        "price_age_min": 94.8,
         "pnl_pct": null,
         "timeout_reached": false,
-        "signal_decay": false,
+        "signal_decay": true,
         "missed": true,
         "data_stale": false,
         "discovery_missing": true,
         "soft_conditions": {
-          "SIGNAL_DECAY": false,
+          "SIGNAL_DECAY": true,
           "MISSED": true,
           "DATA_STALE": false,
           "DISCOVERY_MISSING": true
@@ -4469,10 +4480,10 @@
     "pattern": "—",
     "name": "Plasma",
     "first_seen": 1787194556,
-    "last_seen": 1787203876,
+    "last_seen": 1787207163,
     "snapshots": 2,
-    "missed_runs": 10,
-    "neutral_runs": 22,
+    "missed_runs": 0,
+    "neutral_runs": 23,
     "entry_earliness": 0.32,
     "signal_strength": 9.6,
     "window": {
@@ -4506,8 +4517,8 @@
       "entry_price": 0.0816,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.0814,
-      "last_price_ts": 1787203876,
+      "last_price": 0.0817,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 1.3480392156862622,
       "min_pnl_pct": -0.4901960784313866,
       "peak_ts": 1787199071,
@@ -4752,9 +4763,9 @@
         "missing_snapshots": 0,
         "max_price_age_min": 49.8,
         "price_unknown": false,
-        "exit_price_age_min": 49.8,
-        "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
+        "exit_price_age_min": 0.0,
+        "last_price_observation": "live",
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 11
       },
       "shadow_stops": {
@@ -4853,25 +4864,25 @@
       "bingx_symbol": "XPL-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
-        "status": "DATA_DEGRADED",
-        "state": null,
-        "score": 0,
-        "strength": null,
-        "age_min": 205.1,
-        "signal_age_min": 49.8,
-        "price_age_min": 49.8,
-        "pnl_pct": null,
+        "last_check_ts": 1787207163,
+        "status": "HEALTHY",
+        "state": "NEUTRAL",
+        "score": 10,
+        "strength": 7.0,
+        "age_min": 210.1,
+        "signal_age_min": 0.0,
+        "price_age_min": 0.0,
+        "pnl_pct": 0.123,
         "timeout_reached": false,
         "signal_decay": false,
-        "missed": true,
+        "missed": false,
         "data_stale": false,
-        "discovery_missing": true,
+        "discovery_missing": false,
         "soft_conditions": {
           "SIGNAL_DECAY": false,
-          "MISSED": true,
+          "MISSED": false,
           "DATA_STALE": false,
-          "DISCOVERY_MISSING": true
+          "DISCOVERY_MISSING": false
         },
         "hard_candidates": {
           "EXCHANGE_CLOSED": false,
@@ -4883,8 +4894,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 10.0,
-      "last_signal_ts": 1787203876
+      "last_signal_strength": 7.0,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "XPL_1787194556_70281e9f",
     "state_signal": "NEUTRAL"
@@ -4901,7 +4912,7 @@
     "first_seen": 1787195765,
     "last_seen": 1787205696,
     "snapshots": 2,
-    "missed_runs": 4,
+    "missed_runs": 5,
     "neutral_runs": 32,
     "entry_earliness": 0.51,
     "signal_strength": 10.0,
@@ -5130,12 +5141,12 @@
         "entry_price_source": "live",
         "exit_price_source": null,
         "missing_snapshots": 0,
-        "max_price_age_min": 19.5,
+        "max_price_age_min": 24.4,
         "price_unknown": false,
-        "exit_price_age_min": 19.5,
+        "exit_price_age_min": 24.4,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
-        "discovery_missing_count": 5
+        "last_price_observation_ts": 1787207163,
+        "discovery_missing_count": 6
       },
       "shadow_stops": {
         "1.5": {
@@ -5237,14 +5248,14 @@
       "bingx_symbol": "PENDLE-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 185.0,
-        "signal_age_min": 19.5,
-        "price_age_min": 19.5,
+        "age_min": 190.0,
+        "signal_age_min": 24.4,
+        "price_age_min": 24.4,
         "pnl_pct": null,
         "timeout_reached": false,
         "signal_decay": false,
@@ -5279,30 +5290,30 @@
     "action": "WATCH",
     "confidence": 64,
     "score": 4,
-    "momentum": 2,
+    "momentum": 4,
     "pattern": "—",
     "name": "USD Coin",
     "first_seen": 1787196672,
-    "last_seen": 1787206864,
-    "snapshots": 35,
+    "last_seen": 1787207163,
+    "snapshots": 36,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.14,
     "signal_strength": 9.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=100>50, FR<0.03",
+      "OI4h>0 3 снимка, CVD avg=99>50, FR<0.03",
       "Price=-0.0%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↓",
       "Funding stable",
+      "OI4h↑",
       "No divergence"
     ],
     "bingx_entry_blocked": false,
@@ -5321,10 +5332,10 @@
     "pattern": "Momentum Expansion",
     "name": "Curve DAO Token",
     "first_seen": 1787197264,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 2,
     "missed_runs": 0,
-    "neutral_runs": 9,
+    "neutral_runs": 10,
     "entry_earliness": 0.32,
     "signal_strength": 9.2,
     "window": {
@@ -5358,8 +5369,8 @@
       "entry_price": 0.2636,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "early",
-      "last_price": 0.2669,
-      "last_price_ts": 1787206864,
+      "last_price": 0.2678,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 1.820940819423379,
       "min_pnl_pct": -0.5311077389984873,
       "peak_ts": 1787203876,
@@ -5594,7 +5605,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -5692,15 +5703,15 @@
       "bingx_symbol": "CRV-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
         "score": 8,
         "strength": 9.5,
-        "age_min": 160.0,
+        "age_min": 165.0,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 1.252,
+        "pnl_pct": 1.593,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -5723,49 +5734,10 @@
       },
       "position_manager_version": 2,
       "last_signal_strength": 9.5,
-      "last_signal_ts": 1787206864
+      "last_signal_ts": 1787207163
     },
     "trade_id": "CRV_1787197264_79ae88c6",
     "state_signal": "NEUTRAL"
-  },
-  "NATGAS": {
-    "state": "ACCUMULATION",
-    "previous_state": "ACCUMULATION",
-    "action": "WATCH",
-    "confidence": 62,
-    "score": 2,
-    "momentum": 5,
-    "pattern": "—",
-    "name": "Natural Gas (Derivatives)",
-    "first_seen": 1787197264,
-    "last_seen": 1787205956,
-    "snapshots": 30,
-    "missed_runs": 3,
-    "neutral_runs": 0,
-    "entry_earliness": 0.01,
-    "signal_strength": 7.0,
-    "window": {
-      "span_min": 19.8,
-      "max_gap_min": 5.7,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "OI4h>0 3 снимка, CVD avg=95>50, FR<0.03",
-      "Price=-0.3%<5 — ещё не ушёл"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↑",
-      "Price accel↑",
-      "Funding↑",
-      "No divergence"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
   },
   "ACU": {
     "state": "CONFIRMED_TREND",
@@ -5779,7 +5751,7 @@
     "first_seen": 1787197264,
     "last_seen": 1787204770,
     "snapshots": 2,
-    "missed_runs": 7,
+    "missed_runs": 8,
     "neutral_runs": 6,
     "entry_earliness": 0.79,
     "signal_strength": 10.0,
@@ -6021,10 +5993,10 @@
         "missing_snapshots": 0,
         "max_price_age_min": 44.8,
         "price_unknown": false,
-        "exit_price_age_min": 34.9,
-        "discovery_missing_count": 21,
+        "exit_price_age_min": 39.9,
+        "discovery_missing_count": 22,
         "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -6122,14 +6094,14 @@
       "bingx_symbol": "ACU-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "DATA_DEGRADED",
         "state": null,
         "score": 0,
         "strength": null,
-        "age_min": 160.0,
-        "signal_age_min": 34.9,
-        "price_age_min": 34.9,
+        "age_min": 165.0,
+        "signal_age_min": 39.9,
+        "price_age_min": 39.9,
         "pnl_pct": null,
         "timeout_reached": false,
         "signal_decay": false,
@@ -6164,18 +6136,18 @@
     "action": "POSSIBLE_ENTRY",
     "confidence": 97,
     "score": 7,
-    "momentum": 7,
+    "momentum": 8,
     "pattern": "Healthy Trend",
     "name": "Hyperliquid",
     "first_seen": 1787198758,
-    "last_seen": 1787206864,
-    "snapshots": 28,
+    "last_seen": 1787207163,
+    "snapshots": 29,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.63,
+    "entry_earliness": 0.64,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -6187,6 +6159,7 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "OI4h↑",
       "No divergence",
@@ -6204,18 +6177,18 @@
     "action": "WATCH",
     "confidence": 64,
     "score": 4,
-    "momentum": 2,
+    "momentum": 6,
     "pattern": "—",
     "name": "CrowdStrike Holdings Inc (Derivatives)",
     "first_seen": 1787199665,
-    "last_seen": 1787206864,
-    "snapshots": 25,
+    "last_seen": 1787207163,
+    "snapshots": 26,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.09,
     "signal_strength": 9.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -6226,7 +6199,8 @@
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↓",
+      "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -6242,18 +6216,18 @@
     "action": "POSSIBLE_ENTRY",
     "confidence": 99,
     "score": 9,
-    "momentum": 5,
+    "momentum": 6,
     "pattern": "Healthy Trend",
     "name": "Convex Finance",
     "first_seen": 1787199953,
-    "last_seen": 1787206864,
-    "snapshots": 23,
+    "last_seen": 1787207163,
+    "snapshots": 24,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.36,
+    "entry_earliness": 0.37,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -6265,6 +6239,7 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -6284,10 +6259,10 @@
     "pattern": "Healthy Trend",
     "name": "Lista DAO",
     "first_seen": 1787199953,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 2,
     "missed_runs": 0,
-    "neutral_runs": 17,
+    "neutral_runs": 18,
     "entry_earliness": 0.47,
     "signal_strength": 10.0,
     "window": {
@@ -6320,11 +6295,11 @@
       "entry_price": 0.0685,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.0699,
-      "last_price_ts": 1787206864,
-      "max_pnl_pct": 2.189781021897812,
+      "last_price": 0.0701,
+      "last_price_ts": 1787207163,
+      "max_pnl_pct": 2.33576642335765,
       "min_pnl_pct": -0.1459854014598582,
-      "peak_ts": 1787205956,
+      "peak_ts": 1787207163,
       "max_state": "CONFIRMED_TREND",
       "state_history": [
         {
@@ -6532,7 +6507,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -6544,8 +6519,8 @@
       "return_30m_available": true,
       "return_60m": 0.292,
       "return_60m_available": true,
-      "return_120m": null,
-      "return_120m_available": false,
+      "return_120m": 2.044,
+      "return_120m_available": true,
       "return_240m": null,
       "return_240m_available": false,
       "return_360m": null,
@@ -6630,15 +6605,15 @@
       "bingx_symbol": "LISTA-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
         "score": 7,
-        "strength": 8.3,
-        "age_min": 115.2,
+        "strength": 7.9,
+        "age_min": 120.2,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 2.044,
+        "pnl_pct": 2.336,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -6660,8 +6635,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 8.3,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 7.9,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "LISTA_1787199953_4719d122",
     "state_signal": "NEUTRAL"
@@ -6676,10 +6651,10 @@
     "pattern": "Healthy Trend",
     "name": "Chip",
     "first_seen": 1787200552,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 3,
     "missed_runs": 0,
-    "neutral_runs": 12,
+    "neutral_runs": 13,
     "entry_earliness": 0.43,
     "signal_strength": 10.0,
     "window": {
@@ -6715,7 +6690,7 @@
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
       "last_price": 0.0295,
-      "last_price_ts": 1787206864,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 1.700680272108845,
       "min_pnl_pct": -1.0204081632653,
       "peak_ts": 1787202967,
@@ -6926,7 +6901,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -7024,12 +6999,12 @@
       "bingx_symbol": "CHIP-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
         "score": 7,
-        "strength": 8.5,
-        "age_min": 100.0,
+        "strength": 8.0,
+        "age_min": 105.0,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
         "pnl_pct": 0.34,
@@ -7054,8 +7029,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 8.5,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 8.0,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "CHIP_1787200865_a57d3b8d",
     "state_signal": "NEUTRAL"
@@ -7066,18 +7041,18 @@
     "action": "POSSIBLE_ENTRY",
     "confidence": 99,
     "score": 9,
-    "momentum": 5,
+    "momentum": 6,
     "pattern": "Healthy Trend",
     "name": "Bitcoin",
     "first_seen": 1787201177,
-    "last_seen": 1787206864,
-    "snapshots": 38,
+    "last_seen": 1787207163,
+    "snapshots": 40,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.29,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -7090,7 +7065,7 @@
     "mom_tags": [
       "OI accel↑",
       "Price accel↑",
-      "Funding↑",
+      "Funding stable",
       "No divergence"
     ],
     "bingx_entry_blocked": false,
@@ -7106,18 +7081,18 @@
     "action": "POSSIBLE_ENTRY",
     "confidence": 98,
     "score": 8,
-    "momentum": 5,
+    "momentum": 7,
     "pattern": "Healthy Trend",
     "name": "Ethereum",
     "first_seen": 1787202669,
-    "last_seen": 1787206864,
-    "snapshots": 15,
+    "last_seen": 1787207163,
+    "snapshots": 16,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.49,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -7129,7 +7104,8 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
-      "Funding↑",
+      "Price accel↑",
+      "Funding stable",
       "OI4h↑",
       "No divergence"
     ],
@@ -7149,10 +7125,10 @@
     "pattern": "—",
     "name": "Core DAO",
     "first_seen": 1787202669,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 6,
     "missed_runs": 0,
-    "neutral_runs": 1,
+    "neutral_runs": 2,
     "entry_earliness": 0.24,
     "signal_strength": 10.0,
     "window": {
@@ -7183,8 +7159,8 @@
       "entry_price": 0.0217,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.0216,
-      "last_price_ts": 1787206864,
+      "last_price": 0.0217,
+      "last_price_ts": 1787207163,
       "max_pnl_pct": 0.0,
       "min_pnl_pct": -0.46082949308755483,
       "peak_ts": 1787203876,
@@ -7383,7 +7359,7 @@
         "exit_price_age_min": 0.0,
         "discovery_missing_count": 9,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -7481,15 +7457,15 @@
       "bingx_symbol": "CORE-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "NEUTRAL",
         "score": 7,
-        "strength": 6.37,
-        "age_min": 49.8,
+        "strength": 6.44,
+        "age_min": 54.8,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": -0.461,
+        "pnl_pct": 0.0,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -7511,49 +7487,11 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 6.37,
-      "last_signal_ts": 1787206864
+      "last_signal_strength": 6.44,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "CORE_1787203876_17c47ff4",
     "state_signal": "NEUTRAL"
-  },
-  "SOXS": {
-    "state": "ACCUMULATION",
-    "previous_state": "ACCUMULATION",
-    "action": "WATCH",
-    "confidence": 62,
-    "score": 2,
-    "momentum": 2,
-    "pattern": "—",
-    "name": "Direxion Daily Semiconductor Bear 3X Shares (Derivatives)",
-    "first_seen": 1787203267,
-    "last_seen": 1787205956,
-    "snapshots": 10,
-    "missed_runs": 3,
-    "neutral_runs": 0,
-    "entry_earliness": 0.13,
-    "signal_strength": 6.1,
-    "window": {
-      "span_min": 19.8,
-      "max_gap_min": 5.7,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "OI4h>0 3 снимка, CVD avg=93>50, FR<0.03",
-      "Price=-1.6%<5 — ещё не ушёл"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↓",
-      "Funding stable",
-      "No divergence"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
   },
   "MOODENG": {
     "state": "CONFIRMED_TREND",
@@ -7565,10 +7503,10 @@
     "pattern": "Healthy Trend",
     "name": "Moo Deng",
     "first_seen": 1787203562,
-    "last_seen": 1787204461,
+    "last_seen": 1787207163,
     "snapshots": 2,
-    "missed_runs": 8,
-    "neutral_runs": 1,
+    "missed_runs": 0,
+    "neutral_runs": 2,
     "entry_earliness": 0.35,
     "signal_strength": 10.0,
     "window": {
@@ -7601,11 +7539,11 @@
       "entry_price": 0.0385,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.0384,
-      "last_price_ts": 1787204461,
-      "max_pnl_pct": 0.0,
+      "last_price": 0.0387,
+      "last_price_ts": 1787207163,
+      "max_pnl_pct": 0.5194805194805163,
       "min_pnl_pct": -0.2597402597402672,
-      "peak_ts": 1787203562,
+      "peak_ts": 1787207163,
       "max_state": "CONFIRMED_TREND",
       "state_history": [
         {
@@ -7625,12 +7563,18 @@
           "state": "CONFIRMED_TREND",
           "score": 9,
           "reason": "state_transition"
+        },
+        {
+          "ts": 1787207163,
+          "state": "NEUTRAL",
+          "score": 8,
+          "reason": "state_transition"
         }
       ],
-      "current_state": "CONFIRMED_TREND",
-      "current_state_start_ts": 1787204461,
+      "current_state": "NEUTRAL",
+      "current_state_start_ts": 1787207163,
       "time_in_states": {
-        "CONFIRMED_TREND": 9.9,
+        "CONFIRMED_TREND": 54.9,
         "NEUTRAL": 5.0
       },
       "idea_first_seen_ts": 1787153491,
@@ -7805,9 +7749,9 @@
         "missing_snapshots": 0,
         "max_price_age_min": 40.0,
         "price_unknown": false,
-        "exit_price_age_min": 40.0,
-        "last_price_observation": "discovery_missing",
-        "last_price_observation_ts": 1787206864,
+        "exit_price_age_min": 0.0,
+        "last_price_observation": "live",
+        "last_price_observation_ts": 1787207163,
         "discovery_missing_count": 8
       },
       "shadow_stops": {
@@ -7818,8 +7762,8 @@
       "shadow_schmitt_exit_ts": null,
       "return_30m": null,
       "return_30m_available": false,
-      "return_60m": null,
-      "return_60m_available": false,
+      "return_60m": 0.519,
+      "return_60m_available": true,
       "return_120m": null,
       "return_120m_available": false,
       "return_240m": null,
@@ -7906,25 +7850,25 @@
       "bingx_symbol": "MOODENG-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
-        "status": "DATA_DEGRADED",
-        "state": null,
-        "score": 0,
-        "strength": null,
-        "age_min": 55.0,
-        "signal_age_min": 40.0,
-        "price_age_min": 40.0,
-        "pnl_pct": null,
+        "last_check_ts": 1787207163,
+        "status": "HEALTHY",
+        "state": "NEUTRAL",
+        "score": 8,
+        "strength": 6.65,
+        "age_min": 60.0,
+        "signal_age_min": 0.0,
+        "price_age_min": 0.0,
+        "pnl_pct": 0.519,
         "timeout_reached": false,
         "signal_decay": false,
-        "missed": true,
+        "missed": false,
         "data_stale": false,
-        "discovery_missing": true,
+        "discovery_missing": false,
         "soft_conditions": {
           "SIGNAL_DECAY": false,
-          "MISSED": true,
+          "MISSED": false,
           "DATA_STALE": false,
-          "DISCOVERY_MISSING": true
+          "DISCOVERY_MISSING": false
         },
         "hard_candidates": {
           "EXCHANGE_CLOSED": false,
@@ -7936,8 +7880,8 @@
         }
       },
       "position_manager_version": 2,
-      "last_signal_strength": 10.0,
-      "last_signal_ts": 1787204461
+      "last_signal_strength": 6.65,
+      "last_signal_ts": 1787207163
     },
     "trade_id": "MOODENG_1787203562_dfb6255f",
     "state_signal": "NEUTRAL"
@@ -7952,7 +7896,7 @@
     "pattern": "Healthy Trend",
     "name": "Mina",
     "first_seen": 1787205068,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
     "snapshots": 4,
     "missed_runs": 0,
     "neutral_runs": 0,
@@ -7986,11 +7930,11 @@
       "entry_price": 0.0434,
       "entry_state": "CONFIRMED_TREND",
       "entry_path": "classic",
-      "last_price": 0.0441,
-      "last_price_ts": 1787206864,
-      "max_pnl_pct": 1.6129032258064497,
+      "last_price": 0.0442,
+      "last_price_ts": 1787207163,
+      "max_pnl_pct": 1.8433179723502353,
       "min_pnl_pct": 0.0,
-      "peak_ts": 1787206272,
+      "peak_ts": 1787207163,
       "max_state": "CONFIRMED_TREND",
       "state_history": [
         {
@@ -8177,7 +8121,7 @@
         "price_unknown": false,
         "exit_price_age_min": 0.0,
         "last_price_observation": "live",
-        "last_price_observation_ts": 1787206864
+        "last_price_observation_ts": 1787207163
       },
       "shadow_stops": {
         "1.5": null,
@@ -8275,15 +8219,15 @@
       "bingx_symbol": "MINA-USDT",
       "position_health": {
         "version": 2,
-        "last_check_ts": 1787206864,
+        "last_check_ts": 1787207163,
         "status": "HEALTHY",
         "state": "CONFIRMED_TREND",
         "score": 9,
         "strength": 10.0,
-        "age_min": 19.5,
+        "age_min": 24.4,
         "signal_age_min": 0.0,
         "price_age_min": 0.0,
-        "pnl_pct": 1.613,
+        "pnl_pct": 1.843,
         "timeout_reached": false,
         "signal_decay": false,
         "missed": false,
@@ -8306,7 +8250,7 @@
       },
       "position_manager_version": 2,
       "last_signal_strength": 10.0,
-      "last_signal_ts": 1787206864
+      "last_signal_ts": 1787207163
     },
     "trade_id": "MINA_1787205696_450bad87"
   },
@@ -8316,30 +8260,29 @@
     "action": "WATCH",
     "confidence": 68,
     "score": 8,
-    "momentum": 9,
+    "momentum": 4,
     "pattern": "Short Squeeze",
     "name": "Ontology Gas",
     "first_seen": 1787205696,
-    "last_seen": 1787206864,
-    "snapshots": 5,
+    "last_seen": 1787207163,
+    "snapshots": 6,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.2,
+    "entry_earliness": 0.21,
     "signal_strength": 9.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=63>50, FR<0.03",
-      "Price=3.2%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=64>50, FR<0.03",
+      "Price=3.6%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
-      "CVD mom↑",
+      "OI accel↓",
       "Price accel↑",
       "Funding stable",
       "OI4h↑",
@@ -8357,29 +8300,30 @@
     "action": "WATCH",
     "confidence": 63,
     "score": 3,
-    "momentum": 6,
+    "momentum": 4,
     "pattern": "—",
     "name": "COPPER",
     "first_seen": 1787205696,
-    "last_seen": 1787206864,
-    "snapshots": 5,
+    "last_seen": 1787207163,
+    "snapshots": 6,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.21,
     "signal_strength": 9.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
       "OI4h>0 3 снимка, CVD avg=56>50, FR<0.03",
-      "Price=0.2%<5 — ещё не ушёл"
+      "Price=0.1%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
+      "OI accel↓",
+      "Price accel↑",
       "Funding stable",
       "OI4h↑",
       "No divergence"
@@ -8396,29 +8340,30 @@
     "action": "WATCH",
     "confidence": 61,
     "score": 1,
-    "momentum": 2,
+    "momentum": 6,
     "pattern": "—",
     "name": "Eli Lilly and Company (Derivatives)",
     "first_seen": 1787205696,
-    "last_seen": 1787206864,
-    "snapshots": 5,
+    "last_seen": 1787207163,
+    "snapshots": 6,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.35,
+    "entry_earliness": 0.36,
     "signal_strength": 7.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
       "OI4h>0 3 снимка, CVD avg=53>50, FR<0.03",
-      "Price=4.4%<5 — ещё не ушёл"
+      "Price=4.5%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↓",
+      "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -8434,72 +8379,33 @@
     "action": "WATCH",
     "confidence": 63,
     "score": 3,
-    "momentum": 6,
+    "momentum": 4,
     "pattern": "—",
     "name": "Tradoor",
     "first_seen": 1787206272,
-    "last_seen": 1787206864,
-    "snapshots": 3,
+    "last_seen": 1787207163,
+    "snapshots": 4,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.07,
     "signal_strength": 5.5,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=64>50, FR<0.03",
-      "Price=-0.6%<5 — ещё не ушёл"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↑",
-      "Funding stable",
-      "OI4h↑",
-      "No divergence"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
-  },
-  "RED": {
-    "state": "EARLY_MOVE",
-    "previous_state": "EARLY_MOVE",
-    "action": "WATCH_LONG",
-    "confidence": 76,
-    "score": 1,
-    "momentum": 6,
-    "pattern": "—",
-    "name": "RedStone",
-    "first_seen": 1787206568,
-    "last_seen": 1787206864,
-    "snapshots": 2,
-    "missed_runs": 0,
-    "neutral_runs": 0,
-    "entry_earliness": 0.6,
-    "signal_strength": 7.0,
-    "window": {
-      "span_min": 19.5,
-      "max_gap_min": 5.3,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+      "OI4h>0 3 снимка, CVD avg=65>50, FR<0.03",
+      "Price=-0.5%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
       "OI accel↓",
-      "CVD mom↑",
+      "Price accel↑",
       "Funding stable",
       "OI4h↑",
-      "No divergence",
-      "OI+CVD sync↑"
+      "No divergence"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
@@ -8513,18 +8419,18 @@
     "action": "WATCH_LONG",
     "confidence": 80,
     "score": 5,
-    "momentum": 8,
+    "momentum": 4,
     "pattern": "Distribution",
     "name": "Metis Token",
     "first_seen": 1787206568,
-    "last_seen": 1787206864,
-    "snapshots": 2,
+    "last_seen": 1787207163,
+    "snapshots": 3,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.17,
     "signal_strength": 6.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8534,9 +8440,8 @@
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
+      "OI accel↓",
       "CVD mom↑",
-      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -8550,20 +8455,20 @@
     "state": "ACCUMULATION",
     "previous_state": "ACCUMULATION",
     "action": "WATCH",
-    "confidence": 65,
+    "confidence": 67,
     "score": 7,
-    "momentum": 5,
+    "momentum": 6,
     "pattern": "—",
     "name": "Palantir Technologies Inc (Derivatives)",
     "first_seen": 1787206568,
-    "last_seen": 1787206864,
-    "snapshots": 2,
+    "last_seen": 1787207163,
+    "snapshots": 3,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.06,
+    "entry_earliness": 0.07,
     "signal_strength": 8.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8575,6 +8480,7 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -8584,63 +8490,24 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "STORJ": {
-    "state": "EARLY_MOVE",
-    "previous_state": "EARLY_MOVE",
-    "action": "WATCH_LONG",
-    "confidence": 58,
-    "score": 4,
-    "momentum": 3,
-    "pattern": "—",
-    "name": "Storj",
-    "first_seen": 1787206568,
-    "last_seen": 1787206864,
-    "snapshots": 2,
-    "missed_runs": 0,
-    "neutral_runs": 0,
-    "entry_earliness": 0.1,
-    "signal_strength": 4.7,
-    "window": {
-      "span_min": 25.1,
-      "max_gap_min": 9.9,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↑",
-      "Price accel↑",
-      "Funding stable",
-      "OI4h↑",
-      "Div: price_down_oi_up"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
-  },
   "BOME": {
     "state": "CONFIRMED_TREND",
-    "previous_state": "NEUTRAL",
+    "previous_state": "CONFIRMED_TREND",
     "action": "POSSIBLE_ENTRY",
     "confidence": 95,
     "score": 5,
-    "momentum": 8,
-    "pattern": "Healthy Trend",
+    "momentum": 10,
+    "pattern": "Momentum Expansion",
     "name": "BOOK OF MEME",
     "first_seen": 1787206864,
-    "last_seen": 1787206864,
-    "snapshots": 1,
+    "last_seen": 1787207163,
+    "snapshots": 2,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.67,
+    "entry_earliness": 0.7,
     "signal_strength": 10.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8652,6 +8519,7 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
+      "CVD mom↑",
       "Price accel↑",
       "Funding stable",
       "OI4h↑",
@@ -8666,22 +8534,22 @@
   },
   "GLW": {
     "state": "ACCUMULATION",
-    "previous_state": "NEUTRAL",
+    "previous_state": "ACCUMULATION",
     "action": "WATCH",
     "confidence": 63,
     "score": 3,
-    "momentum": 7,
+    "momentum": 8,
     "pattern": "—",
     "name": "Corning Inc (Derivatives)",
     "first_seen": 1787206864,
-    "last_seen": 1787206864,
-    "snapshots": 1,
+    "last_seen": 1787207163,
+    "snapshots": 2,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.1,
-    "signal_strength": 8.6,
+    "signal_strength": 9.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8693,6 +8561,7 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
+      "Price accel↑",
       "Funding stable",
       "OI4h↑",
       "No divergence",
@@ -8706,101 +8575,24 @@
   },
   "BAT": {
     "state": "EARLY_MOVE",
-    "previous_state": "NEUTRAL",
+    "previous_state": "EARLY_MOVE",
     "action": "WATCH_LONG",
     "confidence": 79,
     "score": 4,
-    "momentum": 4,
+    "momentum": 3,
     "pattern": "Distribution",
     "name": "Basic Attention Token",
     "first_seen": 1787206864,
-    "last_seen": 1787206864,
-    "snapshots": 1,
+    "last_seen": 1787207163,
+    "snapshots": 2,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.21,
+    "entry_earliness": 0.22,
     "signal_strength": 4.2,
     "window": {
-      "span_min": 55.0,
+      "span_min": 50.0,
       "max_gap_min": 35.2,
       "dense": false,
-      "ts_count": 5
-    },
-    "reasons": [
-      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↑",
-      "Funding↑",
-      "No divergence"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
-  },
-  "AGLD": {
-    "state": "ACCUMULATION",
-    "previous_state": "NEUTRAL",
-    "action": "WATCH",
-    "confidence": 68,
-    "score": 8,
-    "momentum": 7,
-    "pattern": "—",
-    "name": "Adventure Gold",
-    "first_seen": 1787206864,
-    "last_seen": 1787206864,
-    "snapshots": 1,
-    "missed_runs": 0,
-    "neutral_runs": 0,
-    "entry_earliness": 0.18,
-    "signal_strength": 8.0,
-    "window": {
-      "span_min": 19.5,
-      "max_gap_min": 5.3,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "OI4h>0 3 снимка, CVD avg=51>50, FR<0.03",
-      "Price=4.3%<5 — ещё не ушёл"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↑",
-      "Funding stable",
-      "OI4h↑",
-      "No divergence",
-      "OI+CVD sync↑"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
-  },
-  "KUAISHOU": {
-    "state": "EARLY_MOVE",
-    "previous_state": "NEUTRAL",
-    "action": "WATCH_LONG",
-    "confidence": 75,
-    "score": 0,
-    "momentum": 3,
-    "pattern": "Stealth Accumulation",
-    "name": "Kuaishou Technology (Derivatives)",
-    "first_seen": 1787206864,
-    "last_seen": 1787206864,
-    "snapshots": 1,
-    "missed_runs": 0,
-    "neutral_runs": 0,
-    "entry_earliness": 0.33,
-    "signal_strength": 7.0,
-    "window": {
-      "span_min": 19.5,
-      "max_gap_min": 5.3,
-      "dense": true,
       "ts_count": 5
     },
     "reasons": [
@@ -8821,22 +8613,484 @@
   },
   "UP": {
     "state": "EARLY_MOVE",
-    "previous_state": "NEUTRAL",
+    "previous_state": "EARLY_MOVE",
     "action": "WATCH_LONG",
     "confidence": 82,
     "score": 7,
-    "momentum": 2,
+    "momentum": 6,
     "pattern": "—",
     "name": "Superform",
     "first_seen": 1787206864,
-    "last_seen": 1787206864,
+    "last_seen": 1787207163,
+    "snapshots": 2,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.31,
+    "signal_strength": 8.0,
+    "window": {
+      "span_min": 20.1,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "TLM": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 74,
+    "score": 3,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "Alien Worlds",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.3,
-    "signal_strength": 8.0,
+    "entry_earliness": 0.15,
+    "signal_strength": 5.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "COOKIE": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 80,
+    "score": 5,
+    "momentum": 3,
+    "pattern": "Distribution",
+    "name": "Cookie",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.36,
+    "signal_strength": 7.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "LUNA2": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 63,
+    "score": 3,
+    "momentum": 0,
+    "pattern": "—",
+    "name": "LUNA2",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.27,
+    "signal_strength": 7.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "Price accel↑",
+      "Funding stable",
+      "Div: price_up_cvd_down"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "MYX": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 79,
+    "score": 4,
+    "momentum": 7,
+    "pattern": "—",
+    "name": "MYX Finance",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.44,
+    "signal_strength": 7.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "ORCA": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 79,
+    "score": 4,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "Orca",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.2,
+    "signal_strength": 7.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "GRIFFAIN": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 84,
+    "score": 9,
+    "momentum": 7,
+    "pattern": "—",
+    "name": "GRIFFAIN",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.28,
+    "signal_strength": 5.74,
+    "window": {
+      "span_min": 30.2,
+      "max_gap_min": 15.3,
+      "dense": false,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Price accel↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "HEMI": {
+    "state": "ACCUMULATION",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH",
+    "confidence": 69,
+    "score": 9,
+    "momentum": 2,
+    "pattern": "Short Squeeze",
+    "name": "Hemi",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.27,
+    "signal_strength": 6.5,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "OI4h>0 3 снимка, CVD avg=97>50, FR<0.03",
+      "Price=4.4%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "TREE": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 78,
+    "score": 3,
+    "momentum": 5,
+    "pattern": "—",
+    "name": "Tree",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.62,
+    "signal_strength": 9.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "MET": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 77,
+    "score": 2,
+    "momentum": 4,
+    "pattern": "—",
+    "name": "Meteora",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.63,
+    "signal_strength": 9.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "GRASS": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 76,
+    "score": 1,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "Grass",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.09,
+    "signal_strength": 5.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Price accel↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "ALGO": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 77,
+    "score": 2,
+    "momentum": 5,
+    "pattern": "—",
+    "name": "Algorand",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.2,
+    "signal_strength": 6.2,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Funding stable",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "2Z": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 75,
+    "score": 0,
+    "momentum": 2,
+    "pattern": "—",
+    "name": "DoubleZero",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.37,
+    "signal_strength": 5.0,
+    "window": {
+      "span_min": 20.0,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8856,24 +9110,24 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "STBL": {
+  "1INCH": {
     "state": "EARLY_MOVE",
     "previous_state": "NEUTRAL",
     "action": "WATCH_LONG",
-    "confidence": 75,
-    "score": 4,
-    "momentum": 8,
+    "confidence": 81,
+    "score": 6,
+    "momentum": 6,
     "pattern": "—",
-    "name": "STBL",
-    "first_seen": 1787206864,
-    "last_seen": 1787206864,
+    "name": "1inch",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.53,
-    "signal_strength": 6.0,
+    "entry_earliness": 0.24,
+    "signal_strength": 8.0,
     "window": {
-      "span_min": 19.5,
+      "span_min": 20.1,
       "max_gap_min": 5.3,
       "dense": true,
       "ts_count": 5
@@ -8886,9 +9140,204 @@
       "OI accel↑",
       "Price accel↑",
       "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "HBAR": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 82,
+    "score": 7,
+    "momentum": 7,
+    "pattern": "—",
+    "name": "Hedera",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.23,
+    "signal_strength": 8.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Price accel↑",
+      "Funding stable",
       "OI4h↑",
       "No divergence",
       "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "OKB": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 79,
+    "score": 4,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "OKB",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.1,
+    "signal_strength": 5.5,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.3,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "SPY": {
+    "state": "ACCUMULATION",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH",
+    "confidence": 63,
+    "score": 5,
+    "momentum": 6,
+    "pattern": "Stealth Accumulation",
+    "name": "State Street SPDR S&P 500 ETF Trust (Derivatives)",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.01,
+    "signal_strength": 8.0,
+    "window": {
+      "span_min": 24.3,
+      "max_gap_min": 9.9,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "OI4h>0 3 снимка, CVD avg=99>50, FR<0.03",
+      "Price=0.5%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "ICX": {
+    "state": "ACCUMULATION",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH",
+    "confidence": 55,
+    "score": 5,
+    "momentum": 8,
+    "pattern": "Momentum Expansion",
+    "name": "Icon",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.18,
+    "signal_strength": 5.3,
+    "window": {
+      "span_min": 24.3,
+      "max_gap_min": 9.5,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "OI4h>0 3 снимка, CVD avg=62>50, FR<0.03",
+      "Price=-9.8%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "CVD mom↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "SYRUP": {
+    "state": "ACCUMULATION",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH",
+    "confidence": 52,
+    "score": 6,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "Maple Finance",
+    "first_seen": 1787207163,
+    "last_seen": 1787207163,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.22,
+    "signal_strength": 0.0,
+    "window": {
+      "span_min": 9.9,
+      "max_gap_min": 5.0,
+      "dense": true,
+      "ts_count": 3
+    },
+    "reasons": [
+      "OI4h>0 3 снимка, CVD avg=87>50, FR<0.03",
+      "Price=4.7%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
