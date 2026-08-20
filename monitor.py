@@ -398,18 +398,13 @@ def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
         lls = 100.0
 
     if (oi24 >= 10.0 and oi4h >= 10.0 and cvd >= 80.0 and lls < 30.0):
-        tp_r1, tp_r2, tp_r3 = 1.50, 2.75, 4.50
+        tp_r1, tp_r2, tp_r3 = 1.45, 2.70, 4.45
 
-    elif (
-        oi24 >= 5.0
-        and oi4h >= 5.0
-        and cvd >= 70.0
-        and lls < 35.0
-    ):
-        tp_r1, tp_r2, tp_r3 = 1.35, 2.50, 4.00
+    elif (oi24 >= 5.0 and oi4h >= 5.0 and cvd >= 70.0 and lls < 35.0):
+        tp_r1, tp_r2, tp_r3 = 1.30, 2.45, 3.95
 
     else:
-        tp_r1, tp_r2, tp_r3 = 1.25, 2.25, 3.50
+        tp_r1, tp_r2, tp_r3 = 1.20, 2.20, 3.45
 
     tp1 = sl_pct * tp_r1
     tp2 = sl_pct * tp_r2
