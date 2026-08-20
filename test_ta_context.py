@@ -1,30 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Standalone BingX TA Context tester.
-
-Не изменяет monitor.py.
-Не открывает и не закрывает позиции.
-
-Получает закрытые OHLCV свечи BingX:
-    1h
-    4h
-    1d
-
-И рассчитывает:
-
-    EMA20 / EMA50 / EMA200
-    RSI14
-    ADX14
-    +DI / -DI
-    ATR%
-    ATR percentile
-    Bollinger Width percentile
-    Bollinger %B
-    MACD histogram
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -43,13 +19,12 @@ try:
     import pandas_ta_classic as ta
 except ImportError:
     print("ERROR: pandas-ta-classic не установлен")
-    print("Установите:")
-    print("    pip install requests pandas pandas-ta-classic")
+    print("Установите: pip install requests pandas pandas-ta-classic")
     sys.exit(1)
 
 
 # ============================================================
-# ENV
+# ENV — только из environment
 # ============================================================
 
 API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
@@ -81,6 +56,14 @@ PERCENTILE_WINDOW = 200
 REQUEST_TIMEOUT = 15
 
 SOURCE_KEY = "BX-AI-SKILL"
+
+
+# BingX candle interval -> milliseconds.
+TIMEFRAME_MS = {
+    "1h": 60 * 60 * 1000,
+    "4h": 4 * 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+}
 
 
 # ============================================================
@@ -119,13 +102,9 @@ def request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
-
     params = dict(params or {})
 
-    params["timestamp"] = str(
-        int(time.time() * 1000)
-    )
-
+    params["timestamp"] = str(int(time.time() * 1000))
     params["signature"] = sign_params(params)
 
     headers = {
@@ -135,10 +114,7 @@ def request_signed(
 
     url = BASE_URL + path
 
-    print(
-        f"    URL: {url}",
-        flush=True,
-    )
+    print(f"    URL: {url}", flush=True)
 
     response = requests.request(
         method=method,
@@ -148,10 +124,7 @@ def request_signed(
         timeout=REQUEST_TIMEOUT,
     )
 
-    print(
-        f"    HTTP: {response.status_code}",
-        flush=True,
-    )
+    print(f"    HTTP: {response.status_code}", flush=True)
 
     response.raise_for_status()
 
@@ -183,37 +156,51 @@ def request_signed(
 # ============================================================
 
 def parse_kline_row(
-    row,
+    row: object,
+    interval: str,
 ) -> dict | None:
     """
-    Поддерживает:
+    Реальный VST response, который мы увидели:
 
-    1) обычный BingX array:
-       [openTime, open, high, low, close, volume, closeTime]
+    {
+        "open": "0.7633",
+        "close": "0.7647",
+        "high": "0.7666",
+        "low": "0.7633",
+        "volume": "6776.3",
+        "time": 1787234400000
+    }
 
-    2) dict, если endpoint/окружение когда-нибудь
-       вернёт объект.
+    Здесь `time` = open time свечи.
+
+    close_time вычисляем как:
+        open_time + timeframe duration
     """
 
+    if interval not in TIMEFRAME_MS:
+        return None
+
     # --------------------------------------------------------
-    # ARRAY
+    # Dict — фактический BingX VST формат
     # --------------------------------------------------------
 
-    if isinstance(row, (list, tuple)):
-
-        if len(row) < 7:
-            return None
-
+    if isinstance(row, dict):
         try:
-            open_time = int(row[0])
-            open_price = float(row[1])
-            high = float(row[2])
-            low = float(row[3])
-            close = float(row[4])
-            volume = float(row[5])
-            close_time = int(row[6])
-        except (TypeError, ValueError):
+            open_time = int(row["time"])
+
+            open_price = float(row["open"])
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+            volume = float(row["volume"])
+
+        except (KeyError, TypeError, ValueError):
             return None
+
+        close_time = (
+            open_time
+            + TIMEFRAME_MS[interval]
+        )
 
         return {
             "open_time": open_time,
@@ -226,61 +213,48 @@ def parse_kline_row(
         }
 
     # --------------------------------------------------------
-    # DICT
+    # Array — fallback
     # --------------------------------------------------------
 
-    if isinstance(row, dict):
-
-        # Возможные варианты названий.
-        def first(*keys):
-            for key in keys:
-                if key in row and row[key] is not None:
-                    return row[key]
+    if isinstance(row, (list, tuple)):
+        if len(row) < 6:
             return None
 
         try:
-            open_time = first(
-                "openTime",
-                "open_time",
-                "time",
-                "timestamp",
-            )
-
-            close_time = first(
-                "closeTime",
-                "close_time",
-                "endTime",
-            )
-
-            open_price = first("open", "openPrice")
-            high = first("high", "highPrice")
-            low = first("low", "lowPrice")
-            close = first("close", "closePrice")
-            volume = first("volume", "vol")
-
-            if None in (
-                open_time,
-                close_time,
-                open_price,
-                high,
-                low,
-                close,
-                volume,
-            ):
-                return None
-
-            return {
-                "open_time": int(open_time),
-                "open": float(open_price),
-                "high": float(high),
-                "low": float(low),
-                "close": float(close),
-                "volume": float(volume),
-                "close_time": int(close_time),
-            }
+            open_time = int(row[0])
+            open_price = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
 
         except (TypeError, ValueError):
             return None
+
+        # Если endpoint дал closeTime — используем его.
+        if len(row) >= 7:
+            try:
+                close_time = int(row[6])
+            except (TypeError, ValueError):
+                close_time = (
+                    open_time
+                    + TIMEFRAME_MS[interval]
+                )
+        else:
+            close_time = (
+                open_time
+                + TIMEFRAME_MS[interval]
+            )
+
+        return {
+            "open_time": open_time,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "close_time": close_time,
+        }
 
     return None
 
@@ -291,7 +265,7 @@ def fetch_klines(
     limit: int = KLINE_LIMIT,
 ) -> pd.DataFrame:
 
-    data = request_signed(
+    raw_response = request_signed(
         "GET",
         KLINE_PATH,
         {
@@ -301,7 +275,7 @@ def fetch_klines(
         },
     )
 
-    raw = data.get("data")
+    raw = raw_response.get("data")
 
     print(
         f"    data type: {type(raw).__name__}",
@@ -310,13 +284,14 @@ def fetch_klines(
 
     if raw is None:
         raise RuntimeError(
-            f"{symbol} {interval}: data отсутствует в ответе"
+            f"{symbol} {interval}: "
+            "data отсутствует в API response"
         )
 
     if not isinstance(raw, list):
         raise RuntimeError(
             f"{symbol} {interval}: "
-            f"ожидался list, получен {type(raw).__name__}: "
+            f"data имеет тип {type(raw).__name__}: "
             f"{str(raw)[:1000]}"
         )
 
@@ -331,33 +306,39 @@ def fetch_klines(
             flush=True,
         )
 
-    parsed = []
-
     now_ms = int(time.time() * 1000)
+
+    parsed = []
+    skipped_open = 0
+    skipped_invalid = 0
 
     for row in raw:
 
-        item = parse_kline_row(row)
+        item = parse_kline_row(
+            row,
+            interval,
+        )
 
         if item is None:
+            skipped_invalid += 1
             continue
 
         # ----------------------------------------------------
-        # Проверяем время свечи.
+        # ВАЖНО:
         #
-        # В нормальном BingX response это milliseconds.
+        # `close_time` рассчитан из `time` + timeframe.
+        #
+        # Не используем просто `time < now`, потому что
+        # текущая свеча уже имеет прошлое open_time,
+        # но ещё может быть незакрыта.
         # ----------------------------------------------------
 
-        close_time = item["close_time"]
-
-        if close_time <= 0:
-            continue
-
-        if close_time > now_ms:
+        if item["close_time"] > now_ms:
+            skipped_open += 1
             continue
 
         # ----------------------------------------------------
-        # Проверяем OHLC
+        # Basic OHLC sanity
         # ----------------------------------------------------
 
         if (
@@ -367,6 +348,7 @@ def fetch_klines(
             or item["close"] <= 0
             or item["volume"] < 0
         ):
+            skipped_invalid += 1
             continue
 
         parsed.append(item)
@@ -376,19 +358,24 @@ def fetch_klines(
         flush=True,
     )
 
-    # --------------------------------------------------------
-    # Если всё отфильтровалось — это уже диагностическая
-    # ошибка, поэтому показываем последнюю свечу.
-    # --------------------------------------------------------
+    print(
+        f"    skipped current/open candle: {skipped_open}",
+        flush=True,
+    )
+
+    print(
+        f"    skipped invalid: {skipped_invalid}",
+        flush=True,
+    )
 
     if not parsed:
-        debug = raw[-1] if raw else None
+        last_item = raw[-1] if raw else None
 
         raise RuntimeError(
             f"{symbol} {interval}: "
-            f"после parsing/filter осталось 0 свечей.\n"
+            "после parsing/filter осталось 0 свечей.\n"
             f"now_ms={now_ms}\n"
-            f"last_raw={debug}"
+            f"last_raw={last_item}"
         )
 
     df = pd.DataFrame(parsed)
@@ -402,15 +389,28 @@ def fetch_klines(
         .reset_index(drop=True)
     )
 
+    # --------------------------------------------------------
+    # Печатаем последнюю реально использованную свечу.
+    # --------------------------------------------------------
+
+    last = df.iloc[-1]
+
+    print(
+        f"    last CLOSED candle: "
+        f"open={last['open_time']} "
+        f"close={last['close_time']} "
+        f"close_price={last['close']}",
+        flush=True,
+    )
+
     return df
 
 
 # ============================================================
-# NUMERIC HELPERS
+# NUMERIC
 # ============================================================
 
 def safe_float(value) -> float | None:
-
     if value is None:
         return None
 
@@ -493,7 +493,7 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # ADX / DI
+    # ADX / +DI / -DI
     # --------------------------------------------------------
 
     adx = ta.adx(
@@ -505,20 +505,20 @@ def calculate_features(
 
     if adx is not None and not adx.empty:
 
-        work["adx14"] = adx.get(
-            "ADX_14",
-            pd.Series(index=work.index, dtype=float),
-        )
+        if "ADX_14" in adx.columns:
+            work["adx14"] = adx["ADX_14"]
+        else:
+            work["adx14"] = float("nan")
 
-        work["plus_di14"] = adx.get(
-            "DMP_14",
-            pd.Series(index=work.index, dtype=float),
-        )
+        if "DMP_14" in adx.columns:
+            work["plus_di14"] = adx["DMP_14"]
+        else:
+            work["plus_di14"] = float("nan")
 
-        work["minus_di14"] = adx.get(
-            "DMN_14",
-            pd.Series(index=work.index, dtype=float),
-        )
+        if "DMN_14" in adx.columns:
+            work["minus_di14"] = adx["DMN_14"]
+        else:
+            work["minus_di14"] = float("nan")
 
     else:
 
@@ -557,17 +557,26 @@ def calculate_features(
 
         lower = bb.get(
             "BBL_20_2.0",
-            pd.Series(index=work.index, dtype=float),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
         middle = bb.get(
             "BBM_20_2.0",
-            pd.Series(index=work.index, dtype=float),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
         upper = bb.get(
             "BBU_20_2.0",
-            pd.Series(index=work.index, dtype=float),
+            pd.Series(
+                index=work.index,
+                dtype=float,
+            ),
         )
 
         work["bb_lower"] = lower
@@ -575,19 +584,19 @@ def calculate_features(
         work["bb_upper"] = upper
 
         work["bb_width"] = (
-            (
-                upper - lower
-            )
+            (upper - lower)
             / middle
         )
 
+        denominator = (
+            upper - lower
+        )
+
         work["bb_pctb"] = (
-            (
-                work["close"] - lower
-            )
-            /
-            (
-                upper - lower
+            (work["close"] - lower)
+            / denominator.replace(
+                0,
+                float("nan"),
             )
         )
 
@@ -609,10 +618,12 @@ def calculate_features(
 
     if macd is not None and not macd.empty:
 
-        work["macd_hist"] = macd.get(
-            "MACDh_12_26_9",
-            pd.Series(index=work.index, dtype=float),
-        )
+        if "MACDh_12_26_9" in macd.columns:
+            work["macd_hist"] = (
+                macd["MACDh_12_26_9"]
+            )
+        else:
+            work["macd_hist"] = float("nan")
 
     else:
 
@@ -620,8 +631,7 @@ def calculate_features(
 
     work["macd_hist_pct"] = (
         work["macd_hist"]
-        /
-        work["close"]
+        / work["close"]
         * 100.0
     )
 
@@ -638,10 +648,14 @@ def calculate_features(
     )
 
     # --------------------------------------------------------
-    # LAST
+    # LAST CLOSED CANDLE
     # --------------------------------------------------------
 
     last = work.iloc[-1]
+
+    # --------------------------------------------------------
+    # EMA STRUCTURE
+    # --------------------------------------------------------
 
     ema20 = safe_float(last["ema20"])
     ema50 = safe_float(last["ema50"])
@@ -667,6 +681,10 @@ def calculate_features(
         ema_structure = "mixed"
         ema_direction = "mixed"
 
+    # --------------------------------------------------------
+    # ADX / DI
+    # --------------------------------------------------------
+
     adx_value = safe_float(
         last["adx14"]
     )
@@ -679,17 +697,35 @@ def calculate_features(
         last["minus_di14"]
     )
 
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
     rsi = safe_float(
         last["rsi14"]
     )
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
 
     atr_pct = safe_float(
         last["atr_pct"]
     )
 
+    # --------------------------------------------------------
+    # BB
+    # --------------------------------------------------------
+
+    bb_width_pctile = bb_width_pctile
+
     bb_pctb = safe_float(
         last["bb_pctb"]
     )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
 
     macd_hist = safe_float(
         last["macd_hist"]
@@ -711,10 +747,12 @@ def calculate_features(
     return {
         "close": safe_float(last["close"]),
         "close_time": int(last["close_time"]),
+        "open_time": int(last["open_time"]),
 
         "ema20": ema20,
         "ema50": ema50,
         "ema200": ema200,
+
         "ema_structure": ema_structure,
         "ema_direction": ema_direction,
 
@@ -739,13 +777,14 @@ def calculate_features(
 
 
 # ============================================================
-# OUTPUT
+# FORMAT
 # ============================================================
 
 def fnum(
     value,
-    decimals=1,
-):
+    decimals: int = 1,
+) -> str:
+
     if value is None:
         return "—"
 
@@ -753,7 +792,6 @@ def fnum(
 
 
 def format_ta(
-    symbol: str,
     features: dict,
 ) -> str:
 
@@ -774,13 +812,15 @@ def format_ta(
             out.append("")
             continue
 
-        ema_direction = f["ema_direction"]
+        # ----------------------------------------------------
+        # EMA
+        # ----------------------------------------------------
 
-        if ema_direction == "bullish":
+        if f["ema_direction"] == "bullish":
             ema_icon = "🟢"
-        elif ema_direction == "bearish":
+        elif f["ema_direction"] == "bearish":
             ema_icon = "🔴"
-        elif ema_direction == "mixed":
+        elif f["ema_direction"] == "mixed":
             ema_icon = "🟡"
         else:
             ema_icon = "⚪"
@@ -789,9 +829,17 @@ def format_ta(
             f"EMA {f['ema_structure']} {ema_icon}"
         )
 
+        # ----------------------------------------------------
+        # RSI
+        # ----------------------------------------------------
+
         out.append(
             f"RSI {fnum(f['rsi14'], 1)}"
         )
+
+        # ----------------------------------------------------
+        # ADX / DI
+        # ----------------------------------------------------
 
         plus = f["plus_di14"]
         minus = f["minus_di14"]
@@ -822,15 +870,27 @@ def format_ta(
             f"ADX {fnum(f['adx14'])} | {di}"
         )
 
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
+
         out.append(
             f"ATR {fnum(f['atr_pct'], 2)}% | "
             f"{fnum(f['atr_pctile'], 0)}%ile"
         )
 
+        # ----------------------------------------------------
+        # Bollinger
+        # ----------------------------------------------------
+
         out.append(
             f"BB Width "
             f"{fnum(f['bb_width_pctile'], 0)}%ile"
         )
+
+        # ----------------------------------------------------
+        # MACD
+        # ----------------------------------------------------
 
         macd_value = f["macd_hist_pct"]
 
@@ -840,7 +900,8 @@ def format_ta(
             )
         else:
             out.append(
-                f"MACD Hist {f['macd_direction']} "
+                f"MACD Hist "
+                f"{f['macd_direction']} "
                 f"({macd_value:+.3f}%)"
             )
 
@@ -860,11 +921,14 @@ def format_ta(
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Standalone BingX TA Context tester"
+    )
 
     parser.add_argument(
         "--symbol",
         default="QTUM",
+        help="Например QTUM или QTUM-USDT",
     )
 
     args = parser.parse_args()
@@ -898,23 +962,24 @@ def main():
                 KLINE_LIMIT,
             )
 
-            features = calculate_features(
+            result = calculate_features(
                 df
             )
 
-            all_features[interval] = features
+            all_features[interval] = result
 
             close_time = pd.to_datetime(
-                features["close_time"],
+                result["close_time"],
                 unit="ms",
                 utc=True,
             )
 
             print(
-                f"    OK: "
-                f"{features['bars']} candles | "
-                f"close={features['close']} | "
-                f"closed={close_time}"
+                f"[{interval}] OK: "
+                f"{result['bars']} закрытых свечей | "
+                f"close={result['close']} | "
+                f"closed={close_time}",
+                flush=True,
             )
 
         except Exception as exc:
@@ -925,7 +990,6 @@ def main():
             )
 
     if not all_features:
-
         raise SystemExit(
             "\nНе удалось получить TA "
             "ни для одного timeframe."
@@ -933,10 +997,7 @@ def main():
 
     print()
     print(
-        format_ta(
-            symbol,
-            all_features,
-        )
+        format_ta(all_features)
     )
     print()
 
