@@ -71,7 +71,7 @@ except ImportError:
 
 API_KEY = os.environ.get("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-BASE_URL = os.environ.get("BINGX_BASE_URL", "").strip().rstrip("/")
+BASE_URL = os.environ.get("BINGX_BASE_URL", "https://open-api-vst.bingx.com").rstrip("/")
 
 if not API_KEY:
     raise RuntimeError(
