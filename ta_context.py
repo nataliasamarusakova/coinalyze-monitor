@@ -1308,39 +1308,20 @@ def get_ta_context(
 # TELEGRAM FORMAT
 # ============================================================
 
-def format_ta_telegram(
-    ta_context: dict | None,
-) -> str:
+def format_ta_telegram(ta_context: dict | None) -> str:
     """
-    Финальный компактный Telegram-блок.
+    Компактный финальный Telegram-блок.
 
-    Формат:
-
-    🎯 TA DIRECTION
-
-    Strength: +9/15
-
-    LONG evidence: 11/15
-    SHORT evidence: 2/15
-
-    1H +3 🟢 BULLISH
-    4H +4 🟡 MIXED / BULLISH
-    1D +2 🟡 MIXED / RECOVERY
-
-    TA RESULT: 🟢 LONG
+    Формат без пустых строк между каждой строкой.
     """
 
     if not ta_context:
-
         return ""
 
-    line = (
-        "━━━━━━━━━━━━━━━━━━"
-    )
+    line = "━━━━━━━━━━━━━━━━━━"
 
     out = [
         line,
-        "",
         "🎯 TA DIRECTION",
         "",
         (
@@ -1348,28 +1329,20 @@ def format_ta_telegram(
             f"{ta_context['net_score']:+d}/"
             f"{ta_context['max_score']}"
         ),
-        "",
         (
             f"LONG evidence: "
             f"{ta_context['long_evidence']}/"
             f"{ta_context['max_score']}"
         ),
-        "",
         (
             f"SHORT evidence: "
             f"{ta_context['short_evidence']}/"
             f"{ta_context['max_score']}"
         ),
-        "",
     ]
 
     for timeframe in TIMEFRAMES:
-
-        item = (
-            ta_context[
-                "timeframes"
-            ].get(timeframe)
-        )
+        item = ta_context["timeframes"].get(timeframe)
 
         if not item:
             continue
@@ -1381,17 +1354,18 @@ def format_ta_telegram(
             f"{item['label']}"
         )
 
-        out.append("")
-
-    out.append(
-        "TA RESULT: "
-        f"{ta_context['result_icon']} "
-        f"{ta_context['result_label']}"
+    out.extend(
+        [
+            "",
+            (
+                "TA RESULT: "
+                f"{ta_context['result_icon']} "
+                f"{ta_context['result_label']}"
+            ),
+        ]
     )
 
-    return "\n".join(
-        out
-    )
+    return "\n".join(out)
 
 
 # ============================================================
