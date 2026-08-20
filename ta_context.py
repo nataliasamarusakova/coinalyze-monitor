@@ -47,18 +47,16 @@ TIMEFRAMES = (
     "1d",
 )
 
-# Только для Telegram summary.
-# На торговое решение НЕ влияет.
+# Вес timeframe только для TA Telegram summary.
+# НЕ влияет на trading decision.
 TIMEFRAME_WEIGHTS = {
     "1h": 1,
     "4h": 2,
     "1d": 2,
 }
 
-# BingX API limit.
 KLINE_LIMIT = 250
 
-# Reference history для ATR / BBW percentile.
 PERCENTILE_WINDOW = 200
 
 REQUEST_TIMEOUT = 15
@@ -75,17 +73,6 @@ TIMEFRAME_MS = {
 # ============================================================
 # PER-RUN CACHE
 # ============================================================
-#
-# Ключ = уже разрешённый BingX API symbol.
-#
-# Например:
-#   LIGHTER-USDT
-#
-# TA не занимается mapping.
-# Mapping делает bingx_client.to_bx_symbol()
-# в monitor.py.
-#
-# ============================================================
 
 _TA_CACHE: dict[str, dict] = {}
 
@@ -96,15 +83,14 @@ _TA_CACHE: dict[str, dict] = {}
 
 def _normalize_symbol(symbol: str) -> str:
     """
-    Здесь ТОЛЬКО нормализация формата.
+    Только нормализация формата.
 
-    ВАЖНО:
-    функция НЕ делает displayName -> API symbol mapping.
+    Mapping displayName -> real BingX API symbol
+    выполняется в monitor.py через:
 
-    Ожидается уже реальный BingX symbol:
-        QTUM-USDT
-        BTC-USDT
-        LIGHTER-USDT
+        bingx_client.to_bx_symbol(symbol)
+
+    В этот модуль должен приходить уже реальный API symbol.
     """
 
     s = (symbol or "").strip().upper()
@@ -140,10 +126,6 @@ def _safe_float(value) -> float | None:
 
 
 def _sign_params(params: dict) -> str:
-    """
-    Binance/BingX-style HMAC-SHA256 signature.
-    """
-
     query_string = urlencode(params)
 
     return hmac.new(
@@ -158,13 +140,6 @@ def _request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
-    """
-    Выполняет BingX request.
-
-    TA использует только market-data endpoint,
-    но оставляем текущий рабочий способ запроса,
-    который уже подтвердился в test_ta_context.py.
-    """
 
     if not API_KEY:
         raise RuntimeError(
@@ -234,22 +209,6 @@ def _parse_kline_row(
     row: object,
     interval: str,
 ) -> dict | None:
-    """
-    Поддерживает фактический BingX VST dict format:
-
-    {
-        "open": "...",
-        "close": "...",
-        "high": "...",
-        "low": "...",
-        "volume": "...",
-        "time": 1787234400000
-    }
-
-    time = OPEN TIME.
-
-    close_time рассчитывается самостоятельно.
-    """
 
     duration = TIMEFRAME_MS.get(
         interval
@@ -259,12 +218,13 @@ def _parse_kline_row(
         return None
 
     # --------------------------------------------------------
-    # Dict format
+    # BingX VST dict format
     # --------------------------------------------------------
 
     if isinstance(row, dict):
 
         try:
+
             open_time = int(
                 row["time"]
             )
@@ -294,6 +254,7 @@ def _parse_kline_row(
             TypeError,
             ValueError,
         ):
+
             return None
 
         return {
@@ -321,6 +282,7 @@ def _parse_kline_row(
             return None
 
         try:
+
             open_time = int(
                 row[0]
             )
@@ -349,6 +311,7 @@ def _parse_kline_row(
             TypeError,
             ValueError,
         ):
+
             return None
 
         if len(row) >= 7:
@@ -394,15 +357,6 @@ def _fetch_klines(
     bingx_symbol: str,
     interval: str,
 ) -> pd.DataFrame:
-    """
-    Получает только CLOSED candles.
-
-    Важно:
-    bingx_symbol уже должен быть разрешён monitor.py.
-
-    Например:
-        LIGHTER-USDT
-    """
 
     response = _request_signed(
         "GET",
@@ -444,17 +398,11 @@ def _fetch_klines(
         if item is None:
             continue
 
-        # ----------------------------------------------------
-        # CLOSED ONLY
-        # ----------------------------------------------------
-
+        # Только закрытые свечи.
         if item["close_time"] > now_ms:
             continue
 
-        # ----------------------------------------------------
-        # Sanity
-        # ----------------------------------------------------
-
+        # Sanity.
         if (
             item["open"] <= 0
             or item["high"] <= 0
@@ -462,6 +410,7 @@ def _fetch_klines(
             or item["close"] <= 0
             or item["volume"] < 0
         ):
+
             continue
 
         parsed.append(
@@ -514,12 +463,6 @@ def _previous_history_percentile(
     series: pd.Series,
     window: int = PERCENTILE_WINDOW,
 ) -> float | None:
-    """
-    Percentile последней точки относительно
-    только ПРЕДЫДУЩИХ значений.
-
-    Текущая точка в reference history НЕ входит.
-    """
 
     values = pd.to_numeric(
         series,
@@ -831,7 +774,7 @@ def _calculate_features(
     )
 
     # --------------------------------------------------------
-    # DI normalized ratio
+    # Normalized DI ratio
     # --------------------------------------------------------
 
     if (
@@ -902,29 +845,17 @@ def _calculate_features(
 
     return {
         "ema_direction": ema_direction,
-
         "rsi14": rsi,
-
         "adx14": adx_value,
-
         "plus_di14": plus_di,
-
         "minus_di14": minus_di,
-
         "di_ratio": di_ratio,
-
         "atr_pct": atr_pct,
-
         "atr_pctile": atr_pctile,
-
         "bb_width_pctile": bb_width_pctile,
-
         "macd_hist": macd_hist,
-
         "macd_hist_pct": macd_hist_pct,
-
         "macd_sign": macd_sign,
-
         "macd_slope": macd_slope,
     }
 
@@ -936,15 +867,6 @@ def _calculate_features(
 def _directional_components(
     features: dict,
 ) -> dict:
-    """
-    Три directional components:
-
-        EMA  = -1 / 0 / +1
-        DI   = -1 / 0 / +1
-        MACD = -1 / 0 / +1
-
-    Это только Telegram summary.
-    """
 
     # --------------------------------------------------------
     # EMA
@@ -1106,10 +1028,7 @@ def _classify_tf_direction(
         for x in directions
     )
 
-    # --------------------------------------------------------
-    # Full bullish agreement
-    # --------------------------------------------------------
-
+    # 3/3 bullish.
     if bullish_count == 3:
 
         return (
@@ -1117,10 +1036,7 @@ def _classify_tf_direction(
             "BULLISH",
         )
 
-    # --------------------------------------------------------
-    # Full bearish agreement
-    # --------------------------------------------------------
-
+    # 3/3 bearish.
     if bearish_count == 3:
 
         return (
@@ -1128,10 +1044,7 @@ def _classify_tf_direction(
             "BEARISH",
         )
 
-    # --------------------------------------------------------
-    # Bearish structure + bullish momentum
-    # --------------------------------------------------------
-
+    # Bearish structure + bullish momentum.
     if (
         ema == "bearish"
         and bullish_count > bearish_count
@@ -1146,10 +1059,7 @@ def _classify_tf_direction(
             "MIXED / RECOVERY",
         )
 
-    # --------------------------------------------------------
-    # Bullish structure + bearish momentum
-    # --------------------------------------------------------
-
+    # Bullish structure + bearish momentum.
     if (
         ema == "bullish"
         and bearish_count > bullish_count
@@ -1164,20 +1074,12 @@ def _classify_tf_direction(
             "MIXED / WEAKENING",
         )
 
-    # --------------------------------------------------------
-    # Majority bullish
-    # --------------------------------------------------------
-
     if bullish_count > bearish_count:
 
         return (
             "🟡",
             "MIXED / BULLISH",
         )
-
-    # --------------------------------------------------------
-    # Majority bearish
-    # --------------------------------------------------------
 
     if bearish_count > bullish_count:
 
@@ -1193,177 +1095,6 @@ def _classify_tf_direction(
 
 
 # ============================================================
-# ENTRY TIMING
-# ============================================================
-
-def _build_entry_timing(
-    features_by_tf: dict,
-) -> tuple[
-    str,
-    str,
-    list[str],
-]:
-    """
-    Только Telegram context.
-
-    Не меняет trading decision.
-    """
-
-    warnings = []
-
-    # --------------------------------------------------------
-    # RSI extension
-    # --------------------------------------------------------
-
-    for timeframe in (
-        "1h",
-        "4h",
-    ):
-
-        features = features_by_tf.get(
-            timeframe
-        )
-
-        if not features:
-            continue
-
-        rsi = features.get(
-            "rsi14"
-        )
-
-        if (
-            rsi is not None
-            and rsi >= 80
-        ):
-
-            warnings.append(
-                f"{timeframe.upper()} "
-                "RSI extreme"
-            )
-
-        elif (
-            rsi is not None
-            and rsi >= 70
-        ):
-
-            warnings.append(
-                f"{timeframe.upper()} "
-                "RSI elevated"
-            )
-
-    # --------------------------------------------------------
-    # Volatility cluster
-    #
-    # ATR и BBW НЕ считаются двумя отдельными warning.
-    # --------------------------------------------------------
-
-    volatility_percentiles = []
-
-    for timeframe in (
-        "1h",
-        "4h",
-    ):
-
-        features = features_by_tf.get(
-            timeframe
-        )
-
-        if not features:
-            continue
-
-        values = [
-            value
-            for value in (
-                features.get(
-                    "atr_pctile"
-                ),
-                features.get(
-                    "bb_width_pctile"
-                ),
-            )
-            if value is not None
-        ]
-
-        if values:
-
-            volatility_percentiles.append(
-                max(values)
-            )
-
-    if volatility_percentiles:
-
-        highest_volatility = max(
-            volatility_percentiles
-        )
-
-        if highest_volatility >= 95:
-
-            warnings.append(
-                "1H/4H extreme volatility"
-            )
-
-        elif highest_volatility >= 75:
-
-            warnings.append(
-                "1H/4H high volatility"
-            )
-
-    # --------------------------------------------------------
-    # 1H MACD weakening
-    # --------------------------------------------------------
-
-    one_hour = features_by_tf.get(
-        "1h"
-    )
-
-    if one_hour:
-
-        if (
-            one_hour.get(
-                "macd_sign"
-            ) == "positive"
-            and
-            one_hour.get(
-                "macd_slope"
-            ) == "down"
-        ):
-
-            warnings.append(
-                "1H bullish momentum weakening"
-            )
-
-    # --------------------------------------------------------
-    # Final label
-    # --------------------------------------------------------
-
-    warning_count = len(
-        warnings
-    )
-
-    if warning_count == 0:
-
-        return (
-            "🟢",
-            "GOOD",
-            [],
-        )
-
-    if warning_count == 1:
-
-        return (
-            "🟡",
-            "CAUTION",
-            warnings,
-        )
-
-    return (
-        "🟠",
-        "STRETCHED",
-        warnings,
-    )
-
-
-# ============================================================
 # PUBLIC API
 # ============================================================
 
@@ -1371,26 +1102,20 @@ def get_ta_context(
     bingx_symbol: str,
 ) -> dict | None:
     """
-    Главная функция, которую вызывает monitor.py.
+    Главная функция для monitor.py.
 
-    ВАЖНО:
-        bingx_symbol должен быть уже настоящим
-        BingX API symbol.
+    Вход:
+        реальный BingX API symbol.
 
     Пример:
+        LIGHTER-USDT
 
-        bingx_client.to_bx_symbol("LIT-USDT")
-            -> "LIGHTER-USDT"
+    Mapping должен быть сделан ДО вызова:
+        bingx_client.to_bx_symbol(sym)
 
-        get_ta_context("LIGHTER-USDT")
-
-    TA НЕ делает:
-        displayName mapping
-        contracts endpoint
-        manual symbol map
-
-    При любой ошибке возвращается None,
-    чтобы TA никогда не ломала основной сигнал.
+    TA не загружает contracts.
+    TA не знает displayName.
+    TA не меняет trading logic.
     """
 
     symbol = _normalize_symbol(
@@ -1398,7 +1123,7 @@ def get_ta_context(
     )
 
     # --------------------------------------------------------
-    # Per-run cache
+    # Cache внутри одного monitor run.
     # --------------------------------------------------------
 
     cached = _TA_CACHE.get(
@@ -1414,7 +1139,7 @@ def get_ta_context(
         features_by_tf = {}
 
         # ----------------------------------------------------
-        # Получаем 1H / 4H / 1D
+        # 1H / 4H / 1D
         # ----------------------------------------------------
 
         for timeframe in TIMEFRAMES:
@@ -1431,7 +1156,7 @@ def get_ta_context(
             )
 
         # ----------------------------------------------------
-        # Directional score
+        # Direction score
         # ----------------------------------------------------
 
         max_score = (
@@ -1523,39 +1248,27 @@ def get_ta_context(
             }
 
         # ----------------------------------------------------
-        # Overall TA direction
+        # Overall result
         # ----------------------------------------------------
 
         if net_score > 0:
 
-            bias_icon = "🟢"
-            bias_label = "TA LONG"
+            result_icon = "🟢"
+            result_label = "LONG"
 
         elif net_score < 0:
 
-            bias_icon = "🔴"
-            bias_label = "TA SHORT"
+            result_icon = "🔴"
+            result_label = "SHORT"
 
         else:
 
-            bias_icon = "🟡"
-            bias_label = "TA MIXED"
-
-        # ----------------------------------------------------
-        # Entry timing
-        # ----------------------------------------------------
-
-        (
-            timing_icon,
-            timing_label,
-            timing_reasons,
-        ) = _build_entry_timing(
-            features_by_tf
-        )
+            result_icon = "🟡"
+            result_label = "MIXED"
 
         result = {
-            "bias_icon": bias_icon,
-            "bias_label": bias_label,
+            "result_icon": result_icon,
+            "result_label": result_label,
 
             "net_score": net_score,
             "max_score": max_score,
@@ -1571,12 +1284,6 @@ def get_ta_context(
             "timeframes": (
                 timeframe_results
             ),
-
-            "entry_timing": {
-                "icon": timing_icon,
-                "label": timing_label,
-                "reasons": timing_reasons,
-            },
         }
 
         _TA_CACHE[
@@ -1587,10 +1294,7 @@ def get_ta_context(
 
     except Exception as exc:
 
-        # ----------------------------------------------------
-        # TA никогда не ломает основной monitor signal.
-        # ----------------------------------------------------
-
+        # TA никогда не ломает основной сигнал.
         print(
             f"[TA] {symbol}: "
             f"technical context unavailable: "
@@ -1608,8 +1312,22 @@ def format_ta_telegram(
     ta_context: dict | None,
 ) -> str:
     """
-    Возвращает именно тот компактный блок,
-    который мы согласовали для Telegram.
+    Финальный компактный Telegram-блок.
+
+    Формат:
+
+    🎯 TA DIRECTION
+
+    Strength: +9/15
+
+    LONG evidence: 11/15
+    SHORT evidence: 2/15
+
+    1H +3 🟢 BULLISH
+    4H +4 🟡 MIXED / BULLISH
+    1D +2 🟡 MIXED / RECOVERY
+
+    TA RESULT: 🟢 LONG
     """
 
     if not ta_context:
@@ -1622,12 +1340,9 @@ def format_ta_telegram(
 
     out = [
         line,
+        "",
         "🎯 TA DIRECTION",
         "",
-        (
-            f"{ta_context['bias_icon']} "
-            f"{ta_context['bias_label']}"
-        ),
         (
             f"Strength: "
             f"{ta_context['net_score']:+d}/"
@@ -1639,6 +1354,7 @@ def format_ta_telegram(
             f"{ta_context['long_evidence']}/"
             f"{ta_context['max_score']}"
         ),
+        "",
         (
             f"SHORT evidence: "
             f"{ta_context['short_evidence']}/"
@@ -1665,39 +1381,13 @@ def format_ta_telegram(
             f"{item['label']}"
         )
 
-    timing = (
-        ta_context[
-            "entry_timing"
-        ]
+        out.append("")
+
+    out.append(
+        "TA RESULT: "
+        f"{ta_context['result_icon']} "
+        f"{ta_context['result_label']}"
     )
-
-    out.extend(
-        [
-            "",
-            (
-                f"Entry Timing: "
-                f"{timing['icon']} "
-                f"{timing['label']}"
-            ),
-        ]
-    )
-
-    if timing["reasons"]:
-
-        out.extend(
-            [
-                "",
-                "Причины:",
-            ]
-        )
-
-        for reason in timing[
-            "reasons"
-        ][:5]:
-
-            out.append(
-                f"• {reason}"
-            )
 
     return "\n".join(
         out
@@ -1705,14 +1395,10 @@ def format_ta_telegram(
 
 
 # ============================================================
-# OPTIONAL DEBUG HELPER
+# OPTIONAL TEST HELPER
 # ============================================================
 
 def clear_cache() -> None:
-    """
-    Только для standalone tests.
-    """
-
     _TA_CACHE.clear()
 
 
