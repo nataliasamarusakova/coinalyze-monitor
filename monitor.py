@@ -1808,6 +1808,9 @@ def format_signal(symbol, wl, cur, snaps, reasons, warnings, market, ta_context_
         ta_block = ta_context.format_ta_telegram(ta_context_data)
         if ta_block:
             msg += f"\n{ta_block}\n"    
+        market_block = (ta_context.format_market_context_telegram(ta_context_data))
+        if market_block:
+            msg += f"\n{market_block}\n"
     return msg
 
 def format_trade_close(rec):
