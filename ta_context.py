@@ -1322,20 +1322,19 @@ def format_ta_telegram(ta_context: dict | None) -> str:
 
     out = [
         line,
-        "🎯 TA DIRECTION",
-        "",
+        "🎯 TA DIRECTION",        
         (
             f"Strength: "
             f"{ta_context['net_score']:+d}/"
             f"{ta_context['max_score']}"
         ),
         (
-            f"LONG evidence: "
+            f"LONG: "
             f"{ta_context['long_evidence']}/"
             f"{ta_context['max_score']}"
         ),
         (
-            f"SHORT evidence: "
+            f"SHORT: "
             f"{ta_context['short_evidence']}/"
             f"{ta_context['max_score']}"
         ),
@@ -1356,7 +1355,6 @@ def format_ta_telegram(ta_context: dict | None) -> str:
 
     out.extend(
         [
-            "",
             (
                 "TA RESULT: "
                 f"{ta_context['result_icon']} "
