@@ -77,7 +77,7 @@ MIN_SNAPS_LIFECYCLE = 5
 MISS_EXIT_RUNS = 2
 MISS_REMOVE_RUNS = 4
 NEUTRAL_HYSTERESIS = 2
-TRADE_SCHEMA_VERSION = 4
+TRADE_SCHEMA_VERSION = 5
 SIGNAL_LOGIC_VERSION = 3
 LIFECYCLE_ENGINE_VERSION = 4
 POSITION_MANAGER_VERSION = 2
@@ -1945,6 +1945,8 @@ def open_trade_record(
     strength=None,
     shadow=None,
     hist=None,
+    ta_direction=None,
+    market_context=None,
 ):
     if state == "CONFIRMED_TREND":
         trigger = f"confirmed_trend_{path}_path"
@@ -1956,6 +1958,11 @@ def open_trade_record(
         "timestamp": ts,
         "price": price,
         "symbol": r.get("symbol"),
+        # Immutable market-context snapshot captured only for an entry candidate.
+        # TA DIRECTION and MARKET CONTEXT are descriptive/research data only;
+        # they do not participate in the trading decision.
+        "ta_direction": dict(ta_direction) if isinstance(ta_direction, dict) else None,
+        "market_context": dict(market_context) if isinstance(market_context, dict) else None,
         "features": {
             "price_chg24": r.get("price_chg24"),
             "oi_chg24": r.get("oi_chg24_pct"),
@@ -3595,6 +3602,8 @@ def run():
                 f"[{sym}] ENTRY BLOCKED BY QUALITY GUARD: price_chg24={entry_pc24:.1f}% lls24={entry_lls:.1f} vol={entry_vol}"
             )
 
+        ta_data = None
+
         if (new_ot is None and not bingx_entry_blocked and state in ENTRY_STATES and sig["price"] and entry_quality_ok):
             info = lifecycle_state.get(sym, {})
             last_exit_p = info.get("last_exit_price")
@@ -3616,6 +3625,47 @@ def run():
             else:
                 idea_ts = info.get("idea_first_seen_ts") or ts
                 new_tid = _new_trade_id(sym, ts)
+
+                # --------------------------------------------------------
+                # TA DIRECTION + MARKET CONTEXT are fetched only after
+                # the existing entry gates have passed. They are stored
+                # as an immutable entry snapshot and do NOT affect the
+                # trading decision. If TA is unavailable, the existing
+                # entry logic continues unchanged.
+                # --------------------------------------------------------
+                try:
+                    ta_bx_symbol = bingx_client.to_bx_symbol(sym)
+                    ta_data = ta_context.get_ta_context(ta_bx_symbol)
+                    if ta_data:
+                        log.info(
+                            f"[{sym}] TA snapshot captured for entry: "
+                            f"direction={ta_data.get('result_label')} "
+                            f"score={ta_data.get('net_score')}/{ta_data.get('max_score')}"
+                        )
+                except Exception as e:
+                    ta_data = None
+                    log.warning(f"[{sym}] TA entry snapshot failed: {e}")
+
+                ta_direction_snapshot = None
+                market_context_snapshot = None
+                if ta_data:
+                    ta_direction_snapshot = {
+                        "result_label": ta_data.get("result_label"),
+                        "result_icon": ta_data.get("result_icon"),
+                        "net_score": ta_data.get("net_score"),
+                        "max_score": ta_data.get("max_score"),
+                        "long_evidence": ta_data.get("long_evidence"),
+                        "short_evidence": ta_data.get("short_evidence"),
+                        "timeframes": {
+                            k: dict(v) for k, v in (ta_data.get("timeframes") or {}).items()
+                            if isinstance(v, dict)
+                        },
+                    }
+                    market_context_snapshot = {
+                        k: dict(v) for k, v in (ta_data.get("market_context") or {}).items()
+                        if isinstance(v, dict)
+                    }
+
                 new_ot = open_trade_record(
                     r,
                     ts,
@@ -3637,6 +3687,8 @@ def run():
                     strength=sig["strength"],
                     shadow=sig["shadow"],
                     hist=sig["hist"],
+                    ta_direction=ta_direction_snapshot,
+                    market_context=market_context_snapshot,
                 )
                 new_ot["trade_id_full"] = new_tid
                 new_ot["opened_ts"] = ts
@@ -4115,12 +4167,18 @@ def run():
 
                 if should_send_tg:
                     llm_res = llm_verify(sym, signal_wl, cur, hist)
-                    ta_data = None
-                    try:
-                        ta_bx_symbol = bingx_client.to_bx_symbol(sym)
-                        ta_data = ta_context.get_ta_context(ta_bx_symbol)
-                    except Exception as e:
-                        log.warning(f"[{sym}] TA context failed: {e}")
+                    # For an entry candidate, ta_data was already fetched
+                    # after all existing entry gates and is reused here.
+                    # For non-entry Telegram states, fetch TA here only once
+                    # after lifecycle classification; this preserves the
+                    # existing informational Telegram behavior without
+                    # exposing TA to the trading decision.
+                    if ta_data is None:
+                        try:
+                            ta_bx_symbol = bingx_client.to_bx_symbol(sym)
+                            ta_data = ta_context.get_ta_context(ta_bx_symbol)
+                        except Exception as e:
+                            log.warning(f"[{sym}] TA context failed: {e}")
                     msg = format_signal(sym, signal_wl, cur, hist, sig["reasons"], sig["warnings"], market, ta_context_data=ta_data)
                     if llm_res:
                         agree = "✅" if llm_res.get("agree") is True else "❌"
