@@ -1262,90 +1262,130 @@ def _directional_components(
     features: dict,
 ) -> dict:
     """
-    TA Direction состоит только из:
+    TA Direction is built from 3 directional blocks.
 
-        EMA
-        DI
-        MACD histogram sign
+    The previous implementation gave one independent vote to
+    EMA, DI and MACD.  That over-counted closely related trend
+    information.  We keep the public score range (/15) intact,
+    but aggregate the indicators into blocks:
 
-    RSI / ADX / ATR / BBW
-    НЕ дают directional points.
+        Trend    = EMA structure + DI agreement
+        Momentum = MACD sign + MACD histogram slope
+        State    = RSI relative to 50
+
+    Each block contributes at most -1 / 0 / +1 per timeframe.
+
+    ADX / ATR / Bollinger percentiles remain descriptive context;
+    they are deliberately not turned into directional votes here.
     """
 
-    # EMA
-    if (
-        features["ema_direction"]
-        == "bullish"
-    ):
+    # --------------------------------------------------------
+    # Trend block: EMA structure + DI direction
+    # --------------------------------------------------------
 
-        ema_score = 1
+    ema_direction = features.get(
+        "ema_direction",
+        "neutral",
+    )
 
-    elif (
-        features["ema_direction"]
-        == "bearish"
-    ):
-
-        ema_score = -1
-
+    if ema_direction == "bullish":
+        ema_vote = 1
+    elif ema_direction == "bearish":
+        ema_vote = -1
     else:
+        ema_vote = 0
 
-        ema_score = 0
-
-    # DI
     plus = features.get(
         "plus_di14"
     )
-
     minus = features.get(
         "minus_di14"
     )
 
-    if (
-        plus is None
-        or minus is None
-    ):
-
-        di_score = 0
-
+    if plus is None or minus is None:
+        di_vote = 0
     elif plus > minus:
-
-        di_score = 1
-
+        di_vote = 1
     elif plus < minus:
-
-        di_score = -1
-
+        di_vote = -1
     else:
+        di_vote = 0
 
-        di_score = 0
+    if ema_vote != 0 and ema_vote == di_vote:
+        trend_score = ema_vote
+    elif ema_vote == 0 and di_vote != 0:
+        trend_score = di_vote
+    else:
+        trend_score = 0
 
-    # MACD histogram sign
+    # --------------------------------------------------------
+    # Momentum block: MACD sign + histogram slope
+    # --------------------------------------------------------
+
+    macd_sign = features.get(
+        "macd_sign",
+        "unknown",
+    )
+
+    if macd_sign == "positive":
+        macd_sign_vote = 1
+    elif macd_sign == "negative":
+        macd_sign_vote = -1
+    else:
+        macd_sign_vote = 0
+
+    macd_slope = features.get(
+        "macd_slope",
+        "unknown",
+    )
+
+    if macd_slope == "up":
+        macd_slope_vote = 1
+    elif macd_slope == "down":
+        macd_slope_vote = -1
+    else:
+        macd_slope_vote = 0
+
     if (
-        features["macd_sign"]
-        == "positive"
+        macd_sign_vote != 0
+        and macd_sign_vote == macd_slope_vote
     ):
-
-        macd_score = 1
-
-    elif (
-        features["macd_sign"]
-        == "negative"
-    ):
-
-        macd_score = -1
-
+        momentum_score = macd_sign_vote
+    elif macd_sign_vote == 0 and macd_slope_vote != 0:
+        momentum_score = macd_slope_vote
     else:
+        momentum_score = 0
 
-        macd_score = 0
+    # --------------------------------------------------------
+    # State block: RSI relative to its midpoint.
+    # RSI is not treated as overbought/oversold here; it is only
+    # a broad momentum-state discriminator around 50.
+    # --------------------------------------------------------
+
+    rsi = features.get(
+        "rsi14"
+    )
+
+    if rsi is None:
+        rsi_score = 0
+    elif rsi > 50.0:
+        rsi_score = 1
+    elif rsi < 50.0:
+        rsi_score = -1
+    else:
+        rsi_score = 0
 
     return {
-        "ema": ema_score,
-        "di": di_score,
-        "macd": macd_score,
+        "trend": trend_score,
+        "momentum": momentum_score,
+        "state": rsi_score,
+        "ema": ema_vote,
+        "di": di_vote,
+        "macd": macd_sign_vote,
         "raw": (
-            ema_score
-            + di_score
-            + macd_score
+            trend_score
+            + momentum_score
+            + rsi_score
         ),
     }
 
@@ -1358,143 +1398,74 @@ def _classify_tf_direction(
     features: dict,
 ) -> tuple[str, str]:
     """
-    Визуальная классификация timeframe.
+    Визуальная классификация timeframe на тех же 3 блоках,
+    которые формируют TA Direction score:
 
-    Важный момент:
-    positive score сам по себе не означает
-    полностью bullish structure.
+        Trend / Momentum / State.
 
-    Например:
-
-        EMA bearish
-        DI bullish
-        MACD bullish
-
-    -> MIXED / RECOVERY
+    Это исключает ситуацию, когда Strength рассчитывается по одной
+    логике, а подпись 1H/4H/1D — по другой.
     """
 
-    ema = features[
-        "ema_direction"
-    ]
-
-    plus = features.get(
-        "plus_di14"
+    components = _directional_components(
+        features
     )
-
-    minus = features.get(
-        "minus_di14"
-    )
-
-    if (
-        plus is None
-        or minus is None
-    ):
-
-        di_direction = "neutral"
-
-    elif plus > minus:
-
-        di_direction = "bullish"
-
-    elif plus < minus:
-
-        di_direction = "bearish"
-
-    else:
-
-        di_direction = "neutral"
-
-    if (
-        features["macd_sign"]
-        == "positive"
-    ):
-
-        macd_direction = "bullish"
-
-    elif (
-        features["macd_sign"]
-        == "negative"
-    ):
-
-        macd_direction = "bearish"
-
-    else:
-
-        macd_direction = "neutral"
 
     directions = (
-        ema,
-        di_direction,
-        macd_direction,
+        components["trend"],
+        components["momentum"],
+        components["state"],
     )
 
     bullish_count = sum(
-        x == "bullish"
-        for x in directions
+        value > 0
+        for value in directions
     )
 
     bearish_count = sum(
-        x == "bearish"
-        for x in directions
+        value < 0
+        for value in directions
     )
 
-    # Full bullish.
+    # Полное согласованное направление всех блоков.
     if bullish_count == 3:
-
         return (
             "🟢",
             "BULLISH",
         )
 
-    # Full bearish.
     if bearish_count == 3:
-
         return (
             "🔴",
             "BEARISH",
         )
 
-    # Bearish structure + bullish recovery.
+    # Структурный тренд против остальных блоков = recovery/weakening.
     if (
-        ema == "bearish"
+        components["trend"] < 0
         and bullish_count > bearish_count
-        and (
-            di_direction == "bullish"
-            or macd_direction == "bullish"
-        )
     ):
-
         return (
             "🟡",
             "MIXED / RECOVERY",
         )
 
-    # Bullish structure + bearish weakening.
     if (
-        ema == "bullish"
+        components["trend"] > 0
         and bearish_count > bullish_count
-        and (
-            di_direction == "bearish"
-            or macd_direction == "bearish"
-        )
     ):
-
         return (
             "🟡",
             "MIXED / WEAKENING",
         )
 
-    # Majority bullish.
     if bullish_count > bearish_count:
-
         return (
             "🟡",
             "MIXED / BULLISH",
         )
 
-    # Majority bearish.
     if bearish_count > bullish_count:
-
         return (
             "🟡",
             "MIXED / BEARISH",
@@ -1699,30 +1670,23 @@ def get_ta_context(
             )
 
             # ------------------------------------------------
-            # LONG evidence
+            # LONG / SHORT evidence
             # ------------------------------------------------
+            # Evidence is counted per block, matching Strength.
 
-            if components["ema"] > 0:
-                long_evidence += weight
+            for block in (
+                "trend",
+                "momentum",
+                "state",
+            ):
 
-            if components["di"] > 0:
-                long_evidence += weight
+                value = components[block]
 
-            if components["macd"] > 0:
-                long_evidence += weight
+                if value > 0:
+                    long_evidence += weight
 
-            # ------------------------------------------------
-            # SHORT evidence
-            # ------------------------------------------------
-
-            if components["ema"] < 0:
-                short_evidence += weight
-
-            if components["di"] < 0:
-                short_evidence += weight
-
-            if components["macd"] < 0:
-                short_evidence += weight
+                elif value < 0:
+                    short_evidence += weight
 
             icon, label = (
                 _classify_tf_direction(
