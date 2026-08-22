@@ -635,6 +635,8 @@ def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> 
     result = get_open_tp_orders(symbol)
     if result.get("status") == "error":
         return {
+            "status": "error",
+            "error": result.get("error", "TP query failed"),
             "legs": {tp.get("leg"): False for tp in tp_levels},
             "missing": [tp.get("leg") for tp in tp_levels],
             "all_present": False,
@@ -1605,18 +1607,16 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
         final_pos = get_position(symbol)
         if final_pos.get("status") == "found" and final_pos.get("positionAmt"):
             confirmed_qty = float(final_pos["positionAmt"])
-            log.info(
-                f"[{symbol}] позиция подтверждена после timeout: positionAmt={confirmed_qty}"
-            )
+            log.info(f"[{symbol}] позиция подтверждена после timeout: positionAmt={confirmed_qty}")
             return {
                 "status": "found",
                 "symbol": bx_symbol,
                 "asset_class": asset_class,
                 "open": open_res,
-                "position": pos,
-                "avg_price": pos.get("avgPrice"),
-                "qty_initial": pos.get("positionAmt"),
-                "qty_remaining": pos.get("positionAmt"),
+                "position": final_pos,
+                "avg_price": final_pos.get("avgPrice"),
+                "qty_initial": final_pos.get("positionAmt"),
+                "qty_remaining": final_pos.get("positionAmt"),
             }
         qty_opened = float(open_res.get("qty") or 0.0)
         log.warning(
