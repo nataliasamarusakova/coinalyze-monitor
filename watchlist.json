@@ -11,7 +11,7 @@
     "first_seen": 1787428293,
     "last_seen": 1787431879,
     "snapshots": 11,
-    "missed_runs": 0,
+    "missed_runs": 1,
     "neutral_runs": 0,
     "entry_earliness": 0.22,
     "signal_strength": 7.0,
@@ -43,25 +43,101 @@
     "action": "WATCH",
     "confidence": 64,
     "score": 4,
-    "momentum": 8,
+    "momentum": 3,
     "pattern": "—",
     "name": "Bedrock",
     "first_seen": 1787429487,
-    "last_seen": 1787431879,
-    "snapshots": 9,
+    "last_seen": 1787432172,
+    "snapshots": 10,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.27,
-    "signal_strength": 6.2,
+    "entry_earliness": 0.26,
+    "signal_strength": 5.1,
     "window": {
-      "span_min": 19.8,
+      "span_min": 20.0,
       "max_gap_min": 5.2,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=56>50, FR<0.03",
-      "Price=3.7%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=55>50, FR<0.03",
+      "Price=3.5%<5 — ещё не ушёл"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "CROSS": {
+    "state": "EARLY_MOVE",
+    "previous_state": "EARLY_MOVE",
+    "action": "WATCH_LONG",
+    "confidence": 56,
+    "score": 0,
+    "momentum": 3,
+    "pattern": "Distribution",
+    "name": "Cross",
+    "first_seen": 1787431879,
+    "last_seen": 1787432172,
+    "snapshots": 2,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.43,
+    "signal_strength": 4.5,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "CVD mom↑",
+      "Funding stable",
+      "Div: price_up_oi_down"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "LIT": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 80,
+    "score": 5,
+    "momentum": 8,
+    "pattern": "—",
+    "name": "Lighter",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.3,
+    "signal_strength": 5.4,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
     ],
     "warnings": [],
     "mom_tags": [
@@ -78,24 +154,66 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "CROSS": {
-    "state": "EARLY_MOVE",
+  "STX": {
+    "state": "CONFIRMED_TREND",
     "previous_state": "NEUTRAL",
-    "action": "WATCH_LONG",
-    "confidence": 54,
-    "score": 0,
-    "momentum": 1,
-    "pattern": "Distribution",
-    "name": "Cross",
-    "first_seen": 1787431879,
-    "last_seen": 1787431879,
+    "action": "POSSIBLE_ENTRY",
+    "confidence": 82,
+    "score": 2,
+    "momentum": 4,
+    "pattern": "—",
+    "name": "Blockstack",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.41,
-    "signal_strength": 4.9,
+    "entry_earliness": 0.61,
+    "signal_strength": 9.6,
     "window": {
-      "span_min": 19.8,
+      "span_min": 20.0,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "5 снимков: OI>5 CVD>55 LLS<40 OI4h>0 P↑ FR<0.05",
+      "OI и CVD не снижаются (шагово и по тренду)"
+    ],
+    "warnings": [
+      "OI не ускоряется"
+    ],
+    "mom_tags": [
+      "OI accel↓",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "ZRO": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 80,
+    "score": 5,
+    "momentum": 9,
+    "pattern": "—",
+    "name": "LayerZero",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.67,
+    "signal_strength": 9.0,
+    "window": {
+      "span_min": 20.0,
       "max_gap_min": 5.2,
       "dense": true,
       "ts_count": 5
@@ -106,10 +224,169 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
-      "CVD mom↓",
+      "CVD mom↑",
       "Price accel↑",
       "Funding stable",
-      "Div: price_up_oi_down"
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "XVG": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 78,
+    "score": 3,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "Verge",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.73,
+    "signal_strength": 7.8,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "FF": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 82,
+    "score": 7,
+    "momentum": 9,
+    "pattern": "—",
+    "name": "Falcon Finance",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.34,
+    "signal_strength": 9.0,
+    "window": {
+      "span_min": 20.0,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "CVD mom↑",
+      "Funding stable",
+      "OI4h↑",
+      "No divergence",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "AKE": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 55,
+    "score": 5,
+    "momentum": 2,
+    "pattern": "—",
+    "name": "AKEDO",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.19,
+    "signal_strength": 4.62,
+    "window": {
+      "span_min": 64.8,
+      "max_gap_min": 34.8,
+      "dense": false,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "CVD mom↑",
+      "Price accel↑",
+      "Funding stable",
+      "Div: price_down_oi_up",
+      "OI+CVD sync↑"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "TAC": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 69,
+    "score": 4,
+    "momentum": 6,
+    "pattern": "—",
+    "name": "TAC",
+    "first_seen": 1787432172,
+    "last_seen": 1787432172,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.18,
+    "signal_strength": 2.59,
+    "window": {
+      "span_min": 29.9,
+      "max_gap_min": 14.8,
+      "dense": false,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding stable",
+      "No divergence"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
