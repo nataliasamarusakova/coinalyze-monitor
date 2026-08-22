@@ -5,29 +5,30 @@
     "action": "WATCH",
     "confidence": 65,
     "score": 5,
-    "momentum": 5,
+    "momentum": 3,
     "pattern": "—",
     "name": "Brent Oil (Derivatives)",
     "first_seen": 1787438785,
-    "last_seen": 1787440581,
-    "snapshots": 7,
+    "last_seen": 1787440881,
+    "snapshots": 8,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.0,
     "signal_strength": 8.0,
     "window": {
-      "span_min": 20.2,
-      "max_gap_min": 5.7,
+      "span_min": 19.6,
+      "max_gap_min": 5.2,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
       "OI4h>0 3 снимка, CVD avg=93>50, FR<0.03",
-      "Price=0.0%<5 — ещё не ушёл"
+      "Price=0.1%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
+      "OI accel↓",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -49,7 +50,7 @@
     "first_seen": 1787440283,
     "last_seen": 1787440283,
     "snapshots": 1,
-    "missed_runs": 1,
+    "missed_runs": 2,
     "neutral_runs": 0,
     "entry_earliness": 0.15,
     "signal_strength": 5.7,
@@ -76,25 +77,62 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "BABA": {
+  "TAC": {
     "state": "EARLY_MOVE",
     "previous_state": "NEUTRAL",
     "action": "WATCH_LONG",
-    "confidence": 75,
-    "score": 0,
-    "momentum": 4,
-    "pattern": "Stealth Accumulation",
-    "name": "Alibaba Group Holding Limited (Derivatives)",
-    "first_seen": 1787440581,
-    "last_seen": 1787440581,
+    "confidence": 79,
+    "score": 4,
+    "momentum": 2,
+    "pattern": "—",
+    "name": "TAC",
+    "first_seen": 1787440881,
+    "last_seen": 1787440881,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.02,
-    "signal_strength": 5.0,
+    "entry_earliness": 0.14,
+    "signal_strength": 6.5,
     "window": {
-      "span_min": 20.2,
-      "max_gap_min": 5.7,
+      "span_min": 19.6,
+      "max_gap_min": 5.2,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↓",
+      "Funding stable",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "AKE": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 67,
+    "score": 7,
+    "momentum": 0,
+    "pattern": "Short Squeeze",
+    "name": "AKEDO",
+    "first_seen": 1787440881,
+    "last_seen": 1787440881,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.24,
+    "signal_strength": 8.2,
+    "window": {
+      "span_min": 19.6,
+      "max_gap_min": 5.2,
       "dense": true,
       "ts_count": 5
     },
@@ -106,48 +144,8 @@
       "OI accel↓",
       "Price accel↑",
       "Funding stable",
-      "No divergence",
-      "OI+CVD sync↑"
-    ],
-    "bingx_entry_blocked": false,
-    "bingx_entry_block_reason": null,
-    "bingx_entry_block_symbol": null,
-    "bingx_skip_notify_reason": null,
-    "bingx_skip_notify_ts": null
-  },
-  "PYTH": {
-    "state": "EARLY_MOVE",
-    "previous_state": "NEUTRAL",
-    "action": "WATCH_LONG",
-    "confidence": 70,
-    "score": 3,
-    "momentum": 6,
-    "pattern": "—",
-    "name": "Pyth Network",
-    "first_seen": 1787440581,
-    "last_seen": 1787440581,
-    "snapshots": 1,
-    "missed_runs": 0,
-    "neutral_runs": 0,
-    "entry_earliness": 0.27,
-    "signal_strength": 7.0,
-    "window": {
-      "span_min": 20.2,
-      "max_gap_min": 5.7,
-      "dense": true,
-      "ts_count": 5
-    },
-    "reasons": [
-      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
-    ],
-    "warnings": [],
-    "mom_tags": [
-      "OI accel↓",
-      "CVD mom↑",
-      "Funding stable",
       "OI4h↑",
-      "No divergence",
-      "OI+CVD sync↑"
+      "Div: price_up_cvd_down"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
