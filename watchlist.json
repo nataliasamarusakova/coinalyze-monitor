@@ -5,29 +5,31 @@
     "action": "WATCH",
     "confidence": 65,
     "score": 5,
-    "momentum": 5,
+    "momentum": 2,
     "pattern": "—",
     "name": "Brent Oil (Derivatives)",
     "first_seen": 1787438785,
-    "last_seen": 1787442382,
-    "snapshots": 13,
+    "last_seen": 1787442685,
+    "snapshots": 14,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.0,
-    "signal_strength": 8.0,
+    "entry_earliness": 0.01,
+    "signal_strength": 7.5,
     "window": {
-      "span_min": 20.1,
-      "max_gap_min": 5.4,
+      "span_min": 19.8,
+      "max_gap_min": 5.1,
       "dense": true,
       "ts_count": 5
     },
     "reasons": [
-      "OI4h>0 3 снимка, CVD avg=92>50, FR<0.03",
-      "Price=-0.0%<5 — ещё не ушёл"
+      "OI4h>0 3 снимка, CVD avg=90>50, FR<0.03",
+      "Price=0.1%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
+      "OI accel↓",
+      "CVD mom↓",
+      "Price accel↑",
       "Funding stable",
       "No divergence"
     ],
@@ -37,25 +39,64 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "KLAC": {
+  "UP": {
     "state": "EARLY_MOVE",
     "previous_state": "NEUTRAL",
     "action": "WATCH_LONG",
-    "confidence": 75,
-    "score": 0,
-    "momentum": 3,
-    "pattern": "—",
-    "name": "KLA Corp (Derivatives)",
-    "first_seen": 1787442382,
-    "last_seen": 1787442382,
+    "confidence": 76,
+    "score": 1,
+    "momentum": 6,
+    "pattern": "Late Trend",
+    "name": "Superform",
+    "first_seen": 1787442685,
+    "last_seen": 1787442685,
     "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.03,
-    "signal_strength": 3.9,
+    "entry_earliness": 0.54,
+    "signal_strength": 5.0,
     "window": {
-      "span_min": 20.1,
-      "max_gap_min": 5.4,
+      "span_min": 19.8,
+      "max_gap_min": 5.1,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Price accel↑",
+      "Funding↑",
+      "OI4h↑",
+      "No divergence"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "PYTH": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 63,
+    "score": 3,
+    "momentum": 0,
+    "pattern": "—",
+    "name": "Pyth Network",
+    "first_seen": 1787442685,
+    "last_seen": 1787442685,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.29,
+    "signal_strength": 6.5,
+    "window": {
+      "span_min": 25.2,
+      "max_gap_min": 9.7,
       "dense": true,
       "ts_count": 5
     },
@@ -65,9 +106,11 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↓",
+      "CVD mom↓",
       "Price accel↑",
       "Funding stable",
-      "No divergence"
+      "OI4h↑",
+      "Div: price_up_cvd_down"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
