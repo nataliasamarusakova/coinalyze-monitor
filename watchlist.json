@@ -5,18 +5,18 @@
     "action": "WATCH",
     "confidence": 65,
     "score": 5,
-    "momentum": 6,
+    "momentum": 2,
     "pattern": "—",
     "name": "Brent Oil (Derivatives)",
     "first_seen": 1787438785,
-    "last_seen": 1787443885,
-    "snapshots": 18,
+    "last_seen": 1787444176,
+    "snapshots": 19,
     "missed_runs": 0,
     "neutral_runs": 0,
     "entry_earliness": 0.01,
     "signal_strength": 8.0,
     "window": {
-      "span_min": 20.0,
+      "span_min": 20.1,
       "max_gap_min": 5.8,
       "dense": true,
       "ts_count": 5
@@ -27,8 +27,7 @@
     ],
     "warnings": [],
     "mom_tags": [
-      "OI accel↑",
-      "Price accel↑",
+      "OI accel↓",
       "Funding stable",
       "No divergence"
     ],
@@ -38,24 +37,24 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "XMR": {
+  "TUT": {
     "state": "EARLY_MOVE",
-    "previous_state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
     "action": "WATCH_LONG",
-    "confidence": 77,
-    "score": 2,
-    "momentum": 7,
-    "pattern": "—",
-    "name": "Monero",
-    "first_seen": 1787443577,
-    "last_seen": 1787443885,
-    "snapshots": 2,
+    "confidence": 60,
+    "score": 0,
+    "momentum": 1,
+    "pattern": "Late Trend",
+    "name": "Tutorial",
+    "first_seen": 1787444176,
+    "last_seen": 1787444176,
+    "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.52,
-    "signal_strength": 6.0,
+    "entry_earliness": 0.86,
+    "signal_strength": 7.0,
     "window": {
-      "span_min": 20.0,
+      "span_min": 20.1,
       "max_gap_min": 5.8,
       "dense": true,
       "ts_count": 5
@@ -66,9 +65,44 @@
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
-      "Price accel↑",
       "Funding stable",
-      "OI4h↑",
+      "Div: price_up_cvd_down"
+    ],
+    "bingx_entry_blocked": false,
+    "bingx_entry_block_reason": null,
+    "bingx_entry_block_symbol": null,
+    "bingx_skip_notify_reason": null,
+    "bingx_skip_notify_ts": null
+  },
+  "FF": {
+    "state": "EARLY_MOVE",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH_LONG",
+    "confidence": 82,
+    "score": 7,
+    "momentum": 5,
+    "pattern": "—",
+    "name": "Falcon Finance",
+    "first_seen": 1787444176,
+    "last_seen": 1787444176,
+    "snapshots": 1,
+    "missed_runs": 0,
+    "neutral_runs": 0,
+    "entry_earliness": 0.29,
+    "signal_strength": 9.0,
+    "window": {
+      "span_min": 20.1,
+      "max_gap_min": 5.8,
+      "dense": true,
+      "ts_count": 5
+    },
+    "reasons": [
+      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+    ],
+    "warnings": [],
+    "mom_tags": [
+      "OI accel↑",
+      "Funding stable",
       "No divergence"
     ],
     "bingx_entry_blocked": false,
@@ -77,39 +111,38 @@
     "bingx_skip_notify_reason": null,
     "bingx_skip_notify_ts": null
   },
-  "ANTHROPIC": {
-    "state": "EARLY_MOVE",
-    "previous_state": "EARLY_MOVE",
-    "action": "WATCH_LONG",
-    "confidence": 75,
-    "score": 0,
-    "momentum": 9,
-    "pattern": "Stealth Accumulation",
-    "name": "Anthropic (Derivatives)",
-    "first_seen": 1787443577,
-    "last_seen": 1787443885,
-    "snapshots": 2,
+  "BR": {
+    "state": "ACCUMULATION",
+    "previous_state": "NEUTRAL",
+    "action": "WATCH",
+    "confidence": 59,
+    "score": 3,
+    "momentum": 7,
+    "pattern": "—",
+    "name": "Bedrock",
+    "first_seen": 1787444176,
+    "last_seen": 1787444176,
+    "snapshots": 1,
     "missed_runs": 0,
     "neutral_runs": 0,
-    "entry_earliness": 0.08,
-    "signal_strength": 5.0,
+    "entry_earliness": 0.21,
+    "signal_strength": 3.5,
     "window": {
-      "span_min": 20.0,
-      "max_gap_min": 5.8,
-      "dense": true,
+      "span_min": 74.5,
+      "max_gap_min": 49.7,
+      "dense": false,
       "ts_count": 5
     },
     "reasons": [
-      "3 снимка: Price↑ OI↑ CVD↑ Vol↑"
+      "OI4h>0 3 снимка, CVD avg=51>50, FR<0.03",
+      "Price=3.9%<5 — ещё не ушёл"
     ],
     "warnings": [],
     "mom_tags": [
       "OI accel↑",
       "CVD mom↑",
       "Funding stable",
-      "OI4h↑",
-      "No divergence",
-      "OI+CVD sync↑"
+      "No divergence"
     ],
     "bingx_entry_blocked": false,
     "bingx_entry_block_reason": null,
