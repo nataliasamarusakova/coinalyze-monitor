@@ -69,12 +69,14 @@ TIMEFRAME_MS = {
     "1d": 24 * 60 * 60 * 1000,
 }
 
+STALE_TIMEFRAME_MULTIPLIER = 2.0
+
 
 # ============================================================
 # MARKET CONTEXT CONFIG
 # ============================================================
 
-# Resistance ищем только для 1H / 4H.
+# Resistance / Divergence ищем только для 1H / 4H.
 RESISTANCE_LOOKBACK = {
     "1h": 60,
     "4h": 30,
@@ -90,6 +92,15 @@ BREAKOUT_VOLUME_STRONG = 1.50
 
 BREAKOUT_CLOSE_GOOD = 0.60
 BREAKOUT_CLOSE_STRONG = 0.70
+
+# Squeeze
+SQUEEZE_LOOKBACK_MAX = 50
+
+# Divergence
+DIV_MIN_BARS = 5
+DIV_MAX_BARS = 40
+DIV_MIN_PRICE_DIFF_PCT = 0.20  # >= 0.20% Higher High
+DIV_NEAR_RESISTANCE_ATR = 1.0
 
 
 # ============================================================
@@ -109,23 +120,6 @@ _BTC_KLINE_CACHE: dict[str, pd.DataFrame] = {}
 # ============================================================
 
 def _normalize_symbol(symbol: str) -> str:
-    """
-    Только нормализация.
-
-    ВАЖНО:
-    displayName -> real BingX API symbol mapping
-    выполняется в monitor.py:
-
-        bingx_client.to_bx_symbol(sym)
-
-    В этот модуль должен приходить уже реальный
-    BingX API symbol, например:
-
-        BTC-USDT
-        QTUM-USDT
-        LIGHTER-USDT
-    """
-
     s = (symbol or "").strip().upper()
 
     if not s:
@@ -173,38 +167,18 @@ def _request_signed(
     path: str,
     params: dict | None = None,
 ) -> dict:
-    """
-    Запрос к BingX.
-
-    TA использует только market-data endpoint.
-    """
-
     if not API_KEY:
-        raise RuntimeError(
-            "BINGX_API_KEY not configured"
-        )
+        raise RuntimeError("BINGX_API_KEY not configured")
 
     if not SECRET_KEY:
-        raise RuntimeError(
-            "BINGX_SECRET_KEY not configured"
-        )
+        raise RuntimeError("BINGX_SECRET_KEY not configured")
 
     if not BASE_URL:
-        raise RuntimeError(
-            "BINGX_BASE_URL not configured"
-        )
+        raise RuntimeError("BINGX_BASE_URL not configured")
 
-    request_params = dict(
-        params or {}
-    )
-
-    request_params["timestamp"] = str(
-        int(time.time() * 1000)
-    )
-
-    request_params["signature"] = _sign_params(
-        request_params
-    )
+    request_params = dict(params or {})
+    request_params["timestamp"] = str(int(time.time() * 1000))
+    request_params["signature"] = _sign_params(request_params)
 
     response = requests.request(
         method=method,
@@ -221,17 +195,12 @@ def _request_signed(
 
     try:
         payload = response.json()
-
     except ValueError as exc:
-        raise RuntimeError(
-            "BingX returned non-JSON response"
-        ) from exc
+        raise RuntimeError("BingX returned non-JSON response") from exc
 
     if payload.get("code") != 0:
         raise RuntimeError(
-            "BingX API error: "
-            f"code={payload.get('code')} "
-            f"msg={payload.get('msg')}"
+            f"BingX API error: code={payload.get('code')} msg={payload.get('msg')}"
         )
 
     return payload
@@ -245,50 +214,20 @@ def _parse_kline_row(
     row: object,
     interval: str,
 ) -> dict | None:
-
-    duration = TIMEFRAME_MS.get(
-        interval
-    )
+    duration = TIMEFRAME_MS.get(interval)
 
     if duration is None:
         return None
 
-    # --------------------------------------------------------
-    # BingX VST dict format
-    # --------------------------------------------------------
-
     if isinstance(row, dict):
-
         try:
-            open_time = int(
-                row["time"]
-            )
-
-            open_price = float(
-                row["open"]
-            )
-
-            high = float(
-                row["high"]
-            )
-
-            low = float(
-                row["low"]
-            )
-
-            close = float(
-                row["close"]
-            )
-
-            volume = float(
-                row["volume"]
-            )
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
+            open_time = int(row["time"])
+            open_price = float(row["open"])
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+            volume = float(row["volume"])
+        except (KeyError, TypeError, ValueError):
             return None
 
         return {
@@ -298,72 +237,30 @@ def _parse_kline_row(
             "low": low,
             "close": close,
             "volume": volume,
-            "close_time": (
-                open_time + duration
-            ),
+            "close_time": open_time + duration,
         }
 
-    # --------------------------------------------------------
-    # Array fallback
-    # --------------------------------------------------------
-
     if isinstance(row, (list, tuple)):
-
         if len(row) < 6:
             return None
 
         try:
-            open_time = int(
-                row[0]
-            )
-
-            open_price = float(
-                row[1]
-            )
-
-            high = float(
-                row[2]
-            )
-
-            low = float(
-                row[3]
-            )
-
-            close = float(
-                row[4]
-            )
-
-            volume = float(
-                row[5]
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
+            open_time = int(row[0])
+            open_price = float(row[1])
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            volume = float(row[5])
+        except (TypeError, ValueError):
             return None
 
         if len(row) >= 7:
-
             try:
-                close_time = int(
-                    row[6]
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                close_time = (
-                    open_time + duration
-                )
-
+                close_time = int(row[6])
+            except (TypeError, ValueError):
+                close_time = open_time + duration
         else:
-
-            close_time = (
-                open_time + duration
-            )
+            close_time = open_time + duration
 
         return {
             "open_time": open_time,
@@ -386,10 +283,6 @@ def _fetch_klines(
     bingx_symbol: str,
     interval: str,
 ) -> pd.DataFrame:
-    """
-    Только закрытые свечи.
-    """
-
     response = _request_signed(
         "GET",
         KLINE_PATH,
@@ -403,28 +296,17 @@ def _fetch_klines(
     raw = response.get("data")
 
     if not isinstance(raw, list):
-        raise RuntimeError(
-            f"{bingx_symbol} {interval}: "
-            "invalid kline data"
-        )
+        raise RuntimeError(f"{bingx_symbol} {interval}: invalid kline data")
 
-    now_ms = int(
-        time.time() * 1000
-    )
-
+    now_ms = int(time.time() * 1000)
     parsed = []
 
     for row in raw:
-
-        item = _parse_kline_row(
-            row,
-            interval,
-        )
-
+        item = _parse_kline_row(row, interval)
         if item is None:
             continue
 
-        # Только полностью закрытые свечи.
+        # Только полностью закрытые свечи
         if item["close_time"] > now_ms:
             continue
 
@@ -440,27 +322,19 @@ def _fetch_klines(
         parsed.append(item)
 
     if not parsed:
-        raise RuntimeError(
-            f"{bingx_symbol} {interval}: "
-            "no closed candles"
-        )
+        raise RuntimeError(f"{bingx_symbol} {interval}: no closed candles")
 
     df = pd.DataFrame(parsed)
 
     df = (
-        df
-        .sort_values("close_time")
-        .drop_duplicates(
-            subset=["close_time"],
-            keep="last",
-        )
+        df.sort_values("close_time")
+        .drop_duplicates(subset=["close_time"], keep="last")
         .reset_index(drop=True)
     )
 
     if len(df) < 100:
         raise RuntimeError(
-            f"{bingx_symbol} {interval}: "
-            f"too few closed candles: {len(df)}"
+            f"{bingx_symbol} {interval}: too few closed candles: {len(df)}"
         )
 
     return df
@@ -474,47 +348,21 @@ def _previous_history_percentile(
     series: pd.Series,
     window: int = PERCENTILE_WINDOW,
 ) -> float | None:
-    """
-    Percentile текущего значения только относительно
-    предыдущей истории.
-
-    Текущая точка не входит в reference set.
-    """
-
-    values = pd.to_numeric(
-        series,
-        errors="coerce",
-    ).dropna()
+    values = pd.to_numeric(series, errors="coerce").dropna()
 
     if len(values) < 2:
         return None
 
-    current = float(
-        values.iloc[-1]
-    )
-
-    history = (
-        values.iloc[:-1]
-        .tail(window)
-    )
+    current = float(values.iloc[-1])
+    history = values.iloc[:-1].tail(window)
 
     if len(history) < 10:
         return None
 
-    rank = (
-        history <= current
-    ).sum()
+    rank = (history <= current).sum()
+    percentile = rank / len(history) * 100.0
 
-    percentile = (
-        rank
-        / len(history)
-        * 100.0
-    )
-
-    return round(
-        float(percentile),
-        1,
-    )
+    return round(float(percentile), 1)
 
 
 # ============================================================
@@ -524,79 +372,30 @@ def _previous_history_percentile(
 def _calculate_features(
     df: pd.DataFrame,
 ) -> dict:
-
     work = df.copy()
 
     # --------------------------------------------------------
     # EMA
     # --------------------------------------------------------
-
-    work["ema20"] = ta.ema(
-        work["close"],
-        length=20,
-    )
-
-    work["ema50"] = ta.ema(
-        work["close"],
-        length=50,
-    )
-
-    work["ema200"] = ta.ema(
-        work["close"],
-        length=200,
-    )
+    work["ema20"] = ta.ema(work["close"], length=20)
+    work["ema50"] = ta.ema(work["close"], length=50)
+    work["ema200"] = ta.ema(work["close"], length=200)
 
     # --------------------------------------------------------
     # RSI
     # --------------------------------------------------------
-
-    work["rsi14"] = ta.rsi(
-        work["close"],
-        length=14,
-    )
+    work["rsi14"] = ta.rsi(work["close"], length=14)
 
     # --------------------------------------------------------
     # ADX / DI
     # --------------------------------------------------------
+    adx = ta.adx(work["high"], work["low"], work["close"], length=14)
 
-    adx = ta.adx(
-        work["high"],
-        work["low"],
-        work["close"],
-        length=14,
-    )
-
-    if (
-        adx is not None
-        and not adx.empty
-    ):
-
-        work["adx14"] = adx.get(
-            "ADX_14",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
-        work["plus_di14"] = adx.get(
-            "DMP_14",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
-        work["minus_di14"] = adx.get(
-            "DMN_14",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
+    if adx is not None and not adx.empty:
+        work["adx14"] = adx.get("ADX_14", pd.Series(index=work.index, dtype=float))
+        work["plus_di14"] = adx.get("DMP_14", pd.Series(index=work.index, dtype=float))
+        work["minus_di14"] = adx.get("DMN_14", pd.Series(index=work.index, dtype=float))
     else:
-
         work["adx14"] = float("nan")
         work["plus_di14"] = float("nan")
         work["minus_di14"] = float("nan")
@@ -604,267 +403,212 @@ def _calculate_features(
     # --------------------------------------------------------
     # ATR
     # --------------------------------------------------------
-
-    work["atr14"] = ta.atr(
-        work["high"],
-        work["low"],
-        work["close"],
-        length=14,
-    )
-
-    work["atr_pct"] = (
-        work["atr14"]
-        / work["close"]
-        * 100.0
-    )
+    work["atr14"] = ta.atr(work["high"], work["low"], work["close"], length=14)
+    work["atr_pct"] = work["atr14"] / work["close"] * 100.0
 
     # --------------------------------------------------------
-    # Bollinger Width
+    # Bollinger Bands
     # --------------------------------------------------------
+    bb = ta.bbands(work["close"], length=20, std=2.0)
 
-    bb = ta.bbands(
-        work["close"],
-        length=20,
-        std=2.0,
-    )
+    if bb is not None and not bb.empty:
+        bbl = bb.get("BBL_20_2.0", pd.Series(index=work.index, dtype=float))
+        bbm = bb.get("BBM_20_2.0", pd.Series(index=work.index, dtype=float))
+        bbu = bb.get("BBU_20_2.0", pd.Series(index=work.index, dtype=float))
 
-    if (
-        bb is not None
-        and not bb.empty
-    ):
-
-        lower = bb.get(
-            "BBL_20_2.0",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
-        middle = bb.get(
-            "BBM_20_2.0",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
-        upper = bb.get(
-            "BBU_20_2.0",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
-        work["bb_width"] = (
-            (upper - lower)
-            / middle
-        )
-
+        work["bb_lower"] = bbl
+        work["bb_middle"] = bbm
+        work["bb_upper"] = bbu
+        work["bb_width"] = (bbu - bbl) / bbm
     else:
-
+        work["bb_lower"] = float("nan")
+        work["bb_middle"] = float("nan")
+        work["bb_upper"] = float("nan")
         work["bb_width"] = float("nan")
+
+    # --------------------------------------------------------
+    # Keltner Channels (20, 1.5) for Squeeze
+    # --------------------------------------------------------
+    kc = ta.kc(work["high"], work["low"], work["close"], length=20, scalar=1.5)
+
+    if kc is not None and not kc.empty:
+        kcl_col = [c for c in kc.columns if c.startswith("KCL")]
+        kcu_col = [c for c in kc.columns if c.startswith("KCU")]
+
+        work["kc_lower"] = kc[kcl_col[0]] if kcl_col else float("nan")
+        work["kc_upper"] = kc[kcu_col[0]] if kcu_col else float("nan")
+    else:
+        work["kc_lower"] = float("nan")
+        work["kc_upper"] = float("nan")
 
     # --------------------------------------------------------
     # MACD
     # --------------------------------------------------------
+    macd = ta.macd(work["close"], fast=12, slow=26, signal=9)
 
-    macd = ta.macd(
-        work["close"],
-        fast=12,
-        slow=26,
-        signal=9,
-    )
-
-    if (
-        macd is not None
-        and not macd.empty
-    ):
-
-        work["macd_hist"] = macd.get(
-            "MACDh_12_26_9",
-            pd.Series(
-                index=work.index,
-                dtype=float,
-            ),
-        )
-
+    if macd is not None and not macd.empty:
+        work["macd_hist"] = macd.get("MACDh_12_26_9", pd.Series(index=work.index, dtype=float))
     else:
-
         work["macd_hist"] = float("nan")
 
-    work["macd_hist_pct"] = (
-        work["macd_hist"]
-        / work["close"]
-        * 100.0
-    )
+    work["macd_hist_pct"] = work["macd_hist"] / work["close"] * 100.0
 
     # --------------------------------------------------------
-    # Percentiles
+    # Choppiness Index (14)
     # --------------------------------------------------------
-
-    atr_pctile = (
-        _previous_history_percentile(
-            work["atr_pct"]
-        )
-    )
-
-    bb_width_pctile = (
-        _previous_history_percentile(
-            work["bb_width"]
-        )
-    )
-
-    # --------------------------------------------------------
-    # Last closed candle
-    # --------------------------------------------------------
-
-    last = work.iloc[-1]
-
-    # --------------------------------------------------------
-    # EMA structure
-    # --------------------------------------------------------
-
-    ema20 = _safe_float(
-        last["ema20"]
-    )
-
-    ema50 = _safe_float(
-        last["ema50"]
-    )
-
-    ema200 = _safe_float(
-        last["ema200"]
-    )
-
-    if None in (
-        ema20,
-        ema50,
-        ema200,
-    ):
-
-        ema_direction = "neutral"
-
-    elif ema20 > ema50 > ema200:
-
-        ema_direction = "bullish"
-
-    elif ema20 < ema50 < ema200:
-
-        ema_direction = "bearish"
-
+    chop_series = ta.chop(work["high"], work["low"], work["close"], length=14)
+    if chop_series is not None and not chop_series.empty:
+        work["chop14"] = chop_series
     else:
-
-        ema_direction = "mixed"
-
-    # --------------------------------------------------------
-    # Core values
-    # --------------------------------------------------------
-
-    rsi = _safe_float(
-        last["rsi14"]
-    )
-
-    adx_value = _safe_float(
-        last["adx14"]
-    )
-
-    plus_di = _safe_float(
-        last["plus_di14"]
-    )
-
-    minus_di = _safe_float(
-        last["minus_di14"]
-    )
-
-    atr_value = _safe_float(
-        last["atr14"]
-    )
-
-    atr_pct = _safe_float(
-        last["atr_pct"]
-    )
-
-    macd_hist = _safe_float(
-        last["macd_hist"]
-    )
-
-    macd_hist_pct = _safe_float(
-        last["macd_hist_pct"]
-    )
+        work["chop14"] = float("nan")
 
     # --------------------------------------------------------
-    # Normalized DI ratio
+    # Percentiles (Strictly previous history)
     # --------------------------------------------------------
+    atr_pctile = _previous_history_percentile(work["atr_pct"])
+    bb_width_pctile = _previous_history_percentile(work["bb_width"])
+    chop_pctile = _previous_history_percentile(work["chop14"])
+
+    # --------------------------------------------------------
+    # Squeeze Lifecycle State Machine
+    # --------------------------------------------------------
+    squeeze_series = (work["bb_lower"] >= work["kc_lower"]) & (work["bb_upper"] <= work["kc_upper"])
+
+    current_squeeze_on = bool(squeeze_series.iloc[-1]) if not squeeze_series.empty else False
+
+    squeeze_duration = 0
+    if current_squeeze_on:
+        for val in reversed(squeeze_series.tolist()):
+            if val:
+                squeeze_duration += 1
+            else:
+                break
+
+    if len(squeeze_series) >= 2:
+        squeeze_fired = bool(squeeze_series.iloc[-2]) and not current_squeeze_on
+    else:
+        squeeze_fired = False
+
+    bars_since_fire = None
+    if squeeze_fired:
+        bars_since_fire = 0
+    elif not current_squeeze_on and len(squeeze_series) >= 2:
+        lookback_sq = squeeze_series.tail(SQUEEZE_LOOKBACK_MAX).tolist()
+        for idx in range(len(lookback_sq) - 1, 0, -1):
+            if lookback_sq[idx - 1] and not lookback_sq[idx]:
+                bars_since_fire = len(lookback_sq) - 1 - idx
+                break
+
+    # Consensus Release Direction (Strictly on release candle)
+    if squeeze_fired and len(work) >= 2:
+        close_curr = float(work["close"].iloc[-1])
+        close_prev = float(work["close"].iloc[-2])
+        m_hist_curr = _safe_float(work["macd_hist"].iloc[-1])
+
+        delta_close = close_curr - close_prev
+        if m_hist_curr is not None:
+            if delta_close > 0 and m_hist_curr > 0:
+                squeeze_release_dir = "LONG"
+            elif delta_close < 0 and m_hist_curr < 0:
+                squeeze_release_dir = "SHORT"
+            else:
+                squeeze_release_dir = "NEUTRAL"
+        else:
+            squeeze_release_dir = "NEUTRAL"
+    else:
+        squeeze_release_dir = "NONE"
+
+    # Continuous BB/KC ratio (bb_width / kc_width with guard)
+    last_bbu = _safe_float(work["bb_upper"].iloc[-1])
+    last_bbl = _safe_float(work["bb_lower"].iloc[-1])
+    last_kcu = _safe_float(work["kc_upper"].iloc[-1])
+    last_kcl = _safe_float(work["kc_lower"].iloc[-1])
 
     if (
-        plus_di is not None
-        and minus_di is not None
-        and (plus_di + minus_di) > 0
+        last_bbu is not None
+        and last_bbl is not None
+        and last_kcu is not None
+        and last_kcl is not None
     ):
-
-        di_ratio = (
-            (plus_di - minus_di)
-            / (plus_di + minus_di)
-        )
-
+        kc_width = last_kcu - last_kcl
+        bb_width_abs = last_bbu - last_bbl
+        if kc_width > 0:
+            bb_kc_ratio = round(bb_width_abs / kc_width, 4)
+        else:
+            bb_kc_ratio = None
     else:
+        bb_kc_ratio = None
 
+    # CHOP metrics
+    chop_val = _safe_float(work["chop14"].iloc[-1])
+    if chop_val is not None:
+        if chop_val < 38.2:
+            chop_regime = "TRENDING"
+        elif chop_val >= 61.8:
+            chop_regime = "CHOPPY"
+        else:
+            chop_regime = "NEUTRAL"
+    else:
+        chop_regime = "UNKNOWN"
+
+    # --------------------------------------------------------
+    # Last closed candle core values
+    # --------------------------------------------------------
+    last = work.iloc[-1]
+
+    ema20 = _safe_float(last["ema20"])
+    ema50 = _safe_float(last["ema50"])
+    ema200 = _safe_float(last["ema200"])
+
+    if None in (ema20, ema50, ema200):
+        ema_direction = "neutral"
+    elif ema20 > ema50 > ema200:
+        ema_direction = "bullish"
+    elif ema20 < ema50 < ema200:
+        ema_direction = "bearish"
+    else:
+        ema_direction = "mixed"
+
+    rsi = _safe_float(last["rsi14"])
+    adx_value = _safe_float(last["adx14"])
+    plus_di = _safe_float(last["plus_di14"])
+    minus_di = _safe_float(last["minus_di14"])
+    atr_value = _safe_float(last["atr14"])
+    atr_pct = _safe_float(last["atr_pct"])
+    macd_hist = _safe_float(last["macd_hist"])
+    macd_hist_pct = _safe_float(last["macd_hist_pct"])
+
+    if plus_di is not None and minus_di is not None and (plus_di + minus_di) > 0:
+        di_ratio = (plus_di - minus_di) / (plus_di + minus_di)
+    else:
         di_ratio = None
 
-    # --------------------------------------------------------
-    # MACD sign + slope
-    # --------------------------------------------------------
-
     if macd_hist is None:
-
         macd_sign = "unknown"
         macd_slope = "unknown"
-
     else:
-
         if macd_hist > 0:
-
             macd_sign = "positive"
-
         elif macd_hist < 0:
-
             macd_sign = "negative"
-
         else:
-
             macd_sign = "zero"
 
         if len(work) >= 2:
-
-            previous_hist = _safe_float(
-                work[
-                    "macd_hist"
-                ].iloc[-2]
-            )
-
+            previous_hist = _safe_float(work["macd_hist"].iloc[-2])
             if previous_hist is None:
-
                 macd_slope = "unknown"
-
             elif macd_hist > previous_hist:
-
                 macd_slope = "up"
-
             elif macd_hist < previous_hist:
-
                 macd_slope = "down"
-
             else:
-
                 macd_slope = "flat"
-
         else:
-
             macd_slope = "unknown"
 
     return {
+        "_df": work,
         "ema_direction": ema_direction,
         "rsi14": rsi,
         "adx14": adx_value,
@@ -879,11 +623,20 @@ def _calculate_features(
         "macd_hist_pct": macd_hist_pct,
         "macd_sign": macd_sign,
         "macd_slope": macd_slope,
+        "chop_14": chop_val,
+        "chop_percentile": chop_pctile,
+        "chop_regime": chop_regime,
+        "squeeze_on": current_squeeze_on,
+        "squeeze_duration": squeeze_duration,
+        "squeeze_fired": squeeze_fired,
+        "bars_since_fire": bars_since_fire,
+        "squeeze_release_dir": squeeze_release_dir,
+        "bb_kc_ratio": bb_kc_ratio,
     }
 
 
 # ============================================================
-# RESISTANCE
+# RESISTANCE & DIVERGENCE (CAUSAL)
 # ============================================================
 
 def _find_nearest_resistance(
@@ -891,119 +644,133 @@ def _find_nearest_resistance(
     atr: float | None,
     lookback: int,
 ) -> dict:
-    """
-    Ищет ближайший подтверждённый swing-high
-    выше текущей закрытой цены.
-
-    Pivot подтверждается двумя сторонами:
-
-        high[i] >= left highs
-        high[i] >= right highs
-
-    Последние SWING_RIGHT свечей не используются
-    как подтверждённые pivots.
-    """
-
     result = {
         "resistance_price": None,
         "distance_pct": None,
         "distance_atr": None,
     }
 
-    if len(df) < (
-        lookback
-        + SWING_LEFT
-        + SWING_RIGHT
-        + 5
-    ):
+    if len(df) < (lookback + SWING_LEFT + SWING_RIGHT + 5):
         return result
 
-    current_close = float(
-        df["close"].iloc[-1]
-    )
+    current_close = float(df["close"].iloc[-1])
 
-    # Последние right candles нельзя использовать
-    # для pivot confirmation, поэтому исключаем их.
-    work = df.iloc[:-SWING_RIGHT].copy()
+    work = df.iloc[:-SWING_RIGHT].copy().tail(lookback)
 
-    work = work.tail(
-        lookback
-    )
-
-    if len(work) < (
-        SWING_LEFT + SWING_RIGHT + 1
-    ):
+    if len(work) < (SWING_LEFT + SWING_RIGHT + 1):
         return result
 
-    highs = (
-        work["high"]
-        .astype(float)
-        .tolist()
-    )
-
+    highs = work["high"].astype(float).tolist()
     candidates = []
 
-    for i in range(
-        SWING_LEFT,
-        len(highs) - SWING_RIGHT,
-    ):
-
+    for i in range(SWING_LEFT, len(highs) - SWING_RIGHT):
         pivot = highs[i]
+        left = highs[i - SWING_LEFT:i]
+        right = highs[i + 1:i + 1 + SWING_RIGHT]
 
-        left = highs[
-            i - SWING_LEFT:i
-        ]
-
-        right = highs[
-            i + 1:i + 1 + SWING_RIGHT
-        ]
-
-        if (
-            pivot >= max(left)
-            and pivot >= max(right)
-            and pivot > current_close
-        ):
-
-            candidates.append(
-                pivot
-            )
+        if pivot >= max(left) and pivot >= max(right) and pivot > current_close:
+            candidates.append(pivot)
 
     if not candidates:
         return result
 
-    resistance = min(
-        candidates
-    )
-
-    distance_pct = (
-        (
-            resistance
-            - current_close
-        )
-        / current_close
-        * 100.0
-    )
-
+    resistance = min(candidates)
+    distance_pct = (resistance - current_close) / current_close * 100.0
     distance_atr = None
 
     if atr is not None and atr > 0:
+        distance_atr = (resistance - current_close) / atr
 
-        distance_atr = (
-            resistance
-            - current_close
-        ) / atr
+    result["resistance_price"] = resistance
+    result["distance_pct"] = distance_pct
+    result["distance_atr"] = distance_atr
 
-    result[
-        "resistance_price"
-    ] = resistance
+    return result
 
-    result[
-        "distance_pct"
-    ] = distance_pct
 
-    result[
-        "distance_atr"
-    ] = distance_atr
+def _calculate_causal_divergence(
+    df: pd.DataFrame,
+    distance_atr: float | None,
+) -> dict:
+    """
+    Causal Bearish Divergence:
+    - Swing High пивоты (2/2) ищутся вплоть до len(df) - 1 - SWING_RIGHT.
+    - Осцилляторы берутся строго в точке пивота.
+    - Composite warning активируется строго по RSI divergence возле сопротивления.
+    """
+    result = {
+        "bearish_rsi_div": False,
+        "bearish_macd_div": False,
+        "div_price_diff_pct": None,
+        "div_rsi_diff": None,
+        "div_macd_diff": None,
+        "div_bars_between": None,
+        "divergence_at_resistance": False,
+    }
+
+    if len(df) < (DIV_MAX_BARS + SWING_LEFT + SWING_RIGHT + 10):
+        return result
+
+    # Последний допустимый пивот: len(df) - 1 - SWING_RIGHT
+    # Верхняя невключаемая граница для range: len(df) - SWING_RIGHT
+    usable_end = len(df) - SWING_RIGHT
+
+    highs = df["high"].astype(float).tolist()
+    rsi_vals = df["rsi14"].astype(float).tolist()
+    macd_vals = df["macd_hist"].astype(float).tolist()
+
+    confirmed_pivots = []
+
+    start_idx = max(SWING_LEFT, usable_end - DIV_MAX_BARS - SWING_LEFT - 10)
+    for i in range(start_idx, usable_end):
+        pivot_h = highs[i]
+        left = highs[i - SWING_LEFT:i]
+        right = highs[i + 1:i + 1 + SWING_RIGHT]
+
+        if pivot_h >= max(left) and pivot_h >= max(right):
+            confirmed_pivots.append({
+                "idx": i,
+                "high": pivot_h,
+                "rsi": rsi_vals[i],
+                "macd": macd_vals[i],
+            })
+
+    if len(confirmed_pivots) < 2:
+        return result
+
+    p2 = confirmed_pivots[-1]
+    p1 = confirmed_pivots[-2]
+
+    bars_between = p2["idx"] - p1["idx"]
+    if not (DIV_MIN_BARS <= bars_between <= DIV_MAX_BARS):
+        return result
+
+    price_diff_pct = (p2["high"] - p1["high"]) / p1["high"] * 100.0
+    if price_diff_pct < DIV_MIN_PRICE_DIFF_PCT:
+        return result
+
+    result["div_price_diff_pct"] = round(price_diff_pct, 2)
+    result["div_bars_between"] = bars_between
+
+    if math.isfinite(p1["rsi"]) and math.isfinite(p2["rsi"]):
+        rsi_diff = p2["rsi"] - p1["rsi"]
+        result["div_rsi_diff"] = round(rsi_diff, 2)
+        if rsi_diff < 0:
+            result["bearish_rsi_div"] = True
+
+    if math.isfinite(p1["macd"]) and math.isfinite(p2["macd"]):
+        macd_diff = p2["macd"] - p1["macd"]
+        result["div_macd_diff"] = round(macd_diff, 6)
+        if macd_diff < 0:
+            result["bearish_macd_div"] = True
+
+    # Composite Warning (Строго RSI divergence + proximity to resistance)
+    if (
+        result["bearish_rsi_div"]
+        and distance_atr is not None
+        and distance_atr <= DIV_NEAR_RESISTANCE_ATR
+    ):
+        result["divergence_at_resistance"] = True
 
     return result
 
@@ -1016,18 +783,6 @@ def _calculate_breakout_quality(
     df: pd.DataFrame,
     resistance_price: float | None,
 ) -> dict:
-    """
-    Descriptive breakout quality.
-
-    НЕ влияет на TA Direction.
-    НЕ влияет на trading decision.
-
-    Использует:
-        relative volume
-        close location
-        breakout above resistance
-    """
-
     result = {
         "status": "NONE",
         "icon": "⚪",
@@ -1035,259 +790,137 @@ def _calculate_breakout_quality(
         "close_location": None,
     }
 
-    if len(df) < (
-        RELATIVE_VOLUME_WINDOW + 2
-    ):
+    if len(df) < (RELATIVE_VOLUME_WINDOW + 2):
         return result
 
     last = df.iloc[-1]
-
-    close = float(
-        last["close"]
-    )
-
-    high = float(
-        last["high"]
-    )
-
-    low = float(
-        last["low"]
-    )
-
-    volume = float(
-        last["volume"]
-    )
+    close = float(last["close"])
+    high = float(last["high"])
+    low = float(last["low"])
+    volume = float(last["volume"])
 
     previous_volumes = (
-        pd.to_numeric(
-            df["volume"].iloc[:-1],
-            errors="coerce",
-        )
+        pd.to_numeric(df["volume"].iloc[:-1], errors="coerce")
         .dropna()
-        .tail(
-            RELATIVE_VOLUME_WINDOW
-        )
+        .tail(RELATIVE_VOLUME_WINDOW)
     )
 
     if previous_volumes.empty:
         return result
 
-    median_volume = float(
-        previous_volumes.median()
-    )
-
+    median_volume = float(previous_volumes.median())
     if median_volume <= 0:
         return result
 
-    relative_volume = (
-        volume
-        / median_volume
-    )
-
+    relative_volume = volume / median_volume
     candle_range = high - low
 
     if candle_range > 0:
-
-        close_location = (
-            close - low
-        ) / candle_range
-
+        close_location = (close - low) / candle_range
     else:
-
         close_location = None
 
-    result[
-        "relative_volume"
-    ] = relative_volume
-
-    result[
-        "close_location"
-    ] = close_location
+    result["relative_volume"] = relative_volume
+    result["close_location"] = close_location
 
     if resistance_price is None:
         return result
 
-    # --------------------------------------------------------
-    # No breakout.
-    # --------------------------------------------------------
-
     if close <= resistance_price:
-
-        # Если цена уже очень близко к сопротивлению,
-        # помечаем как NEAR, чтобы это было видно
-        # в Telegram.
-        distance_pct = (
-            (
-                resistance_price
-                - close
-            )
-            / close
-            * 100.0
-        )
-
+        distance_pct = (resistance_price - close) / close * 100.0
         if distance_pct <= 0.75:
-
             result["status"] = "NEAR"
             result["icon"] = "🟡"
-
         return result
 
-    # --------------------------------------------------------
-    # Strong breakout.
-    # --------------------------------------------------------
-
     if (
-        relative_volume
-        >= BREAKOUT_VOLUME_STRONG
+        relative_volume >= BREAKOUT_VOLUME_STRONG
         and close_location is not None
-        and close_location
-        >= BREAKOUT_CLOSE_STRONG
+        and close_location >= BREAKOUT_CLOSE_STRONG
     ):
-
         result["status"] = "STRONG"
         result["icon"] = "🟢"
-
         return result
-
-    # --------------------------------------------------------
-    # Good breakout.
-    # --------------------------------------------------------
 
     if (
-        relative_volume
-        >= BREAKOUT_VOLUME_GOOD
+        relative_volume >= BREAKOUT_VOLUME_GOOD
         and close_location is not None
-        and close_location
-        >= BREAKOUT_CLOSE_GOOD
+        and close_location >= BREAKOUT_CLOSE_GOOD
     ):
-
         result["status"] = "GOOD"
         result["icon"] = "🟢"
-
         return result
-
-    # --------------------------------------------------------
-    # Breakout without strong confirmation.
-    # --------------------------------------------------------
 
     result["status"] = "WEAK"
     result["icon"] = "🟡"
-
     return result
 
 
 # ============================================================
-# BTC RELATIVE STRENGTH
+# BTC RELATIVE STRENGTH (P0 GUARDED & ALIGNED)
 # ============================================================
 
 def _calculate_relative_strength(
     coin_df: pd.DataFrame,
     btc_df: pd.DataFrame,
+    timeframe: str,
 ) -> dict:
-    """
-    Relative Strength:
-
-        coin return - BTC return
-
-    Только descriptive context.
-    """
-
-    if (
-        coin_df.empty
-        or btc_df.empty
-    ):
-        return {
-            "rs_pct": None
-        }
-
-    if len(coin_df) < 2:
-        return {
-            "rs_pct": None
-        }
-
-    if len(btc_df) < 2:
-        return {
-            "rs_pct": None
-        }
-
-    coin_close = float(
-        coin_df.iloc[-1]["close"]
-    )
-
-    coin_previous = float(
-        coin_df.iloc[-2]["close"]
-    )
-
-    btc_close = float(
-        btc_df.iloc[-1]["close"]
-    )
-
-    btc_previous = float(
-        btc_df.iloc[-2]["close"]
-    )
-
-    if (
-        coin_previous <= 0
-        or btc_previous <= 0
-    ):
-        return {
-            "rs_pct": None
-        }
-
-    coin_return = (
-        coin_close
-        / coin_previous
-        - 1.0
-    ) * 100.0
-
-    btc_return = (
-        btc_close
-        / btc_previous
-        - 1.0
-    ) * 100.0
-
-    return {
-        "rs_pct": (
-            coin_return
-            - btc_return
-        )
+    result = {
+        "rs_pct": None,
+        "is_stale": False,
+        "latest_common_close_time": None,
     }
+
+    if coin_df.empty or btc_df.empty or len(coin_df) < 2 or len(btc_df) < 2:
+        return result
+
+    merged = (
+        pd.merge(
+            coin_df[["close_time", "close"]].rename(columns={"close": "coin_close"}),
+            btc_df[["close_time", "close"]].rename(columns={"close": "btc_close"}),
+            on="close_time",
+            how="inner",
+        )
+        .dropna(subset=["coin_close", "btc_close"])
+        .drop_duplicates(subset=["close_time"])
+        .sort_values("close_time")
+        .reset_index(drop=True)
+    )
+
+    if len(merged) < 2:
+        return result
+
+    latest_close_time = int(merged["close_time"].iloc[-1])
+    result["latest_common_close_time"] = latest_close_time
+
+    duration_ms = TIMEFRAME_MS.get(timeframe, 60 * 60 * 1000)
+    now_ms = int(time.time() * 1000)
+    if (now_ms - latest_close_time) > (duration_ms * STALE_TIMEFRAME_MULTIPLIER):
+        result["is_stale"] = True
+
+    coin_prev = float(merged["coin_close"].iloc[-2])
+    coin_curr = float(merged["coin_close"].iloc[-1])
+    btc_prev = float(merged["btc_close"].iloc[-2])
+    btc_curr = float(merged["btc_close"].iloc[-1])
+
+    if coin_prev <= 0 or btc_prev <= 0:
+        return result
+
+    coin_return = (coin_curr / coin_prev - 1.0) * 100.0
+    btc_return = (btc_curr / btc_prev - 1.0) * 100.0
+
+    result["rs_pct"] = coin_return - btc_return
+    return result
 
 
 # ============================================================
-# DIRECTIONAL COMPONENTS
+# DIRECTIONAL COMPONENTS (CORE STRENGTH)
 # ============================================================
 
 def _directional_components(
     features: dict,
 ) -> dict:
-    """
-    TA Direction is built from 3 directional blocks.
-
-    The previous implementation gave one independent vote to
-    EMA, DI and MACD.  That over-counted closely related trend
-    information.  We keep the public score range (/15) intact,
-    but aggregate the indicators into blocks:
-
-        Trend    = EMA structure + DI agreement
-        Momentum = MACD sign + MACD histogram slope
-        State    = RSI relative to 50
-
-    Each block contributes at most -1 / 0 / +1 per timeframe.
-
-    ADX / ATR / Bollinger percentiles remain descriptive context;
-    they are deliberately not turned into directional votes here.
-    """
-
-    # --------------------------------------------------------
-    # Trend block: EMA structure + DI direction
-    # --------------------------------------------------------
-
-    ema_direction = features.get(
-        "ema_direction",
-        "neutral",
-    )
-
+    ema_direction = features.get("ema_direction", "neutral")
     if ema_direction == "bullish":
         ema_vote = 1
     elif ema_direction == "bearish":
@@ -1295,12 +928,8 @@ def _directional_components(
     else:
         ema_vote = 0
 
-    plus = features.get(
-        "plus_di14"
-    )
-    minus = features.get(
-        "minus_di14"
-    )
+    plus = features.get("plus_di14")
+    minus = features.get("minus_di14")
 
     if plus is None or minus is None:
         di_vote = 0
@@ -1318,15 +947,7 @@ def _directional_components(
     else:
         trend_score = 0
 
-    # --------------------------------------------------------
-    # Momentum block: MACD sign + histogram slope
-    # --------------------------------------------------------
-
-    macd_sign = features.get(
-        "macd_sign",
-        "unknown",
-    )
-
+    macd_sign = features.get("macd_sign", "unknown")
     if macd_sign == "positive":
         macd_sign_vote = 1
     elif macd_sign == "negative":
@@ -1334,11 +955,7 @@ def _directional_components(
     else:
         macd_sign_vote = 0
 
-    macd_slope = features.get(
-        "macd_slope",
-        "unknown",
-    )
-
+    macd_slope = features.get("macd_slope", "unknown")
     if macd_slope == "up":
         macd_slope_vote = 1
     elif macd_slope == "down":
@@ -1346,26 +963,14 @@ def _directional_components(
     else:
         macd_slope_vote = 0
 
-    if (
-        macd_sign_vote != 0
-        and macd_sign_vote == macd_slope_vote
-    ):
+    if macd_sign_vote != 0 and macd_sign_vote == macd_slope_vote:
         momentum_score = macd_sign_vote
     elif macd_sign_vote == 0 and macd_slope_vote != 0:
         momentum_score = macd_slope_vote
     else:
         momentum_score = 0
 
-    # --------------------------------------------------------
-    # State block: RSI relative to its midpoint.
-    # RSI is not treated as overbought/oversold here; it is only
-    # a broad momentum-state discriminator around 50.
-    # --------------------------------------------------------
-
-    rsi = features.get(
-        "rsi14"
-    )
-
+    rsi = features.get("rsi14")
     if rsi is None:
         rsi_score = 0
     elif rsi > 50.0:
@@ -1382,11 +987,7 @@ def _directional_components(
         "ema": ema_vote,
         "di": di_vote,
         "macd": macd_sign_vote,
-        "raw": (
-            trend_score
-            + momentum_score
-            + rsi_score
-        ),
+        "raw": trend_score + momentum_score + rsi_score,
     }
 
 
@@ -1397,84 +998,35 @@ def _directional_components(
 def _classify_tf_direction(
     features: dict,
 ) -> tuple[str, str]:
-    """
-    Визуальная классификация timeframe на тех же 3 блоках,
-    которые формируют TA Direction score:
-
-        Trend / Momentum / State.
-
-    Это исключает ситуацию, когда Strength рассчитывается по одной
-    логике, а подпись 1H/4H/1D — по другой.
-    """
-
-    components = _directional_components(
-        features
-    )
-
+    components = _directional_components(features)
     directions = (
         components["trend"],
         components["momentum"],
         components["state"],
     )
 
-    bullish_count = sum(
-        value > 0
-        for value in directions
-    )
+    bullish_count = sum(value > 0 for value in directions)
+    bearish_count = sum(value < 0 for value in directions)
 
-    bearish_count = sum(
-        value < 0
-        for value in directions
-    )
-
-    # Полное согласованное направление всех блоков.
     if bullish_count == 3:
-        return (
-            "🟢",
-            "BULLISH",
-        )
+        return ("🟢", "BULLISH")
 
     if bearish_count == 3:
-        return (
-            "🔴",
-            "BEARISH",
-        )
+        return ("🔴", "BEARISH")
 
-    # Структурный тренд против остальных блоков = recovery/weakening.
-    if (
-        components["trend"] < 0
-        and bullish_count > bearish_count
-    ):
-        return (
-            "🟡",
-            "MIXED / RECOVERY",
-        )
+    if components["trend"] < 0 and bullish_count > bearish_count:
+        return ("🟡", "MIXED / RECOVERY")
 
-    if (
-        components["trend"] > 0
-        and bearish_count > bullish_count
-    ):
-        return (
-            "🟡",
-            "MIXED / WEAKENING",
-        )
+    if components["trend"] > 0 and bearish_count > bullish_count:
+        return ("🟡", "MIXED / WEAKENING")
 
     if bullish_count > bearish_count:
-        return (
-            "🟡",
-            "MIXED / BULLISH",
-        )
+        return ("🟡", "MIXED / BULLISH")
 
     if bearish_count > bullish_count:
-        return (
-            "🟡",
-            "MIXED / BEARISH",
-        )
+        return ("🟡", "MIXED / BEARISH")
 
-    return (
-        "🟡",
-        "MIXED",
-    )
+    return ("🟡", "MIXED")
 
 
 # ============================================================
@@ -1484,313 +1036,141 @@ def _classify_tf_direction(
 def get_ta_context(
     bingx_symbol: str,
 ) -> dict | None:
-    """
-    Главная функция.
+    symbol = _normalize_symbol(bingx_symbol)
 
-    Получает УЖЕ РАЗРЕШЁННЫЙ BingX API symbol.
-
-    Пример:
-
-        bingx_client.to_bx_symbol("LIT-USDT")
-            -> LIGHTER-USDT
-
-        get_ta_context("LIGHTER-USDT")
-
-    TA:
-        - не запрашивает contracts;
-        - не занимается mapping;
-        - не меняет trading logic.
-    """
-
-    symbol = _normalize_symbol(
-        bingx_symbol
-    )
-
-    cached = _TA_CACHE.get(
-        symbol
-    )
-
+    cached = _TA_CACHE.get(symbol)
     if cached is not None:
         return cached
 
     try:
-
-        # ----------------------------------------------------
-        # MAIN FEATURE STORAGE
-        # ----------------------------------------------------
-
         features_by_tf = {}
-
-        # ----------------------------------------------------
-        # MARKET CONTEXT
-        # ----------------------------------------------------
-
         market_context = {}
 
-        # ----------------------------------------------------
-        # Fetch all requested TFs.
-        # ----------------------------------------------------
-
         for timeframe in TIMEFRAMES:
+            df = _fetch_klines(symbol, timeframe)
+            features = _calculate_features(df)
+            features_by_tf[timeframe] = features
 
-            df = _fetch_klines(
-                symbol,
-                timeframe,
-            )
+            if timeframe in ("1h", "4h"):
+                raw_df = features["_df"]
 
-            features = (
-                _calculate_features(
-                    df
-                )
-            )
-
-            features_by_tf[
-                timeframe
-            ] = features
-
-            # ------------------------------------------------
-            # Resistance / Breakout / BTC RS
-            #
-            # Только для 1H / 4H.
-            # ------------------------------------------------
-
-            if timeframe in (
-                "1h",
-                "4h",
-            ):
-
-                resistance = (
-                    _find_nearest_resistance(
-                        df=df,
-                        atr=features.get(
-                            "atr14"
-                        ),
-                        lookback=RESISTANCE_LOOKBACK[
-                            timeframe
-                        ],
-                    )
+                resistance = _find_nearest_resistance(
+                    df=raw_df,
+                    atr=features.get("atr14"),
+                    lookback=RESISTANCE_LOOKBACK[timeframe],
                 )
 
-                breakout = (
-                    _calculate_breakout_quality(
-                        df=df,
-                        resistance_price=resistance[
-                            "resistance_price"
-                        ],
-                    )
+                divergence = _calculate_causal_divergence(
+                    df=raw_df,
+                    distance_atr=resistance["distance_atr"],
                 )
 
-                # BTC cache.
-                btc_df = (
-                    _BTC_KLINE_CACHE.get(
-                        timeframe
-                    )
+                breakout = _calculate_breakout_quality(
+                    df=raw_df,
+                    resistance_price=resistance["resistance_price"],
                 )
 
+                btc_df = _BTC_KLINE_CACHE.get(timeframe)
                 if btc_df is None:
+                    btc_df = _fetch_klines("BTC-USDT", timeframe)
+                    _BTC_KLINE_CACHE[timeframe] = btc_df
 
-                    btc_df = _fetch_klines(
-                        "BTC-USDT",
-                        timeframe,
-                    )
-
-                    _BTC_KLINE_CACHE[
-                        timeframe
-                    ] = btc_df
-
-                relative_strength = (
-                    _calculate_relative_strength(
-                        df,
-                        btc_df,
-                    )
+                relative_strength = _calculate_relative_strength(
+                    raw_df,
+                    btc_df,
+                    timeframe,
                 )
 
-                market_context[
-                    timeframe
-                ] = {
+                market_context[timeframe] = {
                     **resistance,
                     **breakout,
-                    "btc_rs_pct": (
-                        relative_strength[
-                            "rs_pct"
-                        ]
-                    ),
+                    "btc_rs_pct": relative_strength["rs_pct"],
+                    "btc_rs_stale": relative_strength["is_stale"],
+                    "btc_latest_common_close": relative_strength["latest_common_close_time"],
+                    "chop_14": features["chop_14"],
+                    "chop_percentile": features["chop_percentile"],
+                    "chop_regime": features["chop_regime"],
+                    "squeeze_on": features["squeeze_on"],
+                    "squeeze_duration": features["squeeze_duration"],
+                    "squeeze_fired": features["squeeze_fired"],
+                    "bars_since_fire": features["bars_since_fire"],
+                    "squeeze_release_dir": features["squeeze_release_dir"],
+                    "bb_kc_ratio": features["bb_kc_ratio"],
+                    **divergence,
                 }
 
-        # ----------------------------------------------------
-        # TA DIRECTION SCORE
-        # ----------------------------------------------------
+        for tf_data in features_by_tf.values():
+            tf_data.pop("_df", None)
 
-        max_score = (
-            sum(
-                TIMEFRAME_WEIGHTS.values()
-            )
-            * 3
-        )
-
+        max_score = sum(TIMEFRAME_WEIGHTS.values()) * 3
         net_score = 0
-
         long_evidence = 0
-
         short_evidence = 0
-
         timeframe_results = {}
 
         for timeframe in TIMEFRAMES:
+            features = features_by_tf[timeframe]
+            components = _directional_components(features)
+            weight = TIMEFRAME_WEIGHTS[timeframe]
 
-            features = (
-                features_by_tf[
-                    timeframe
-                ]
-            )
+            raw_score = components["raw"]
+            weighted_score = raw_score * weight
+            net_score += weighted_score
 
-            components = (
-                _directional_components(
-                    features
-                )
-            )
-
-            weight = (
-                TIMEFRAME_WEIGHTS[
-                    timeframe
-                ]
-            )
-
-            raw_score = components[
-                "raw"
-            ]
-
-            weighted_score = (
-                raw_score
-                * weight
-            )
-
-            net_score += (
-                weighted_score
-            )
-
-            # ------------------------------------------------
-            # LONG / SHORT evidence
-            # ------------------------------------------------
-            # Evidence is counted per block, matching Strength.
-
-            for block in (
-                "trend",
-                "momentum",
-                "state",
-            ):
-
+            for block in ("trend", "momentum", "state"):
                 value = components[block]
-
                 if value > 0:
                     long_evidence += weight
-
                 elif value < 0:
                     short_evidence += weight
 
-            icon, label = (
-                _classify_tf_direction(
-                    features
-                )
-            )
-
-            timeframe_results[
-                timeframe
-            ] = {
+            icon, label = _classify_tf_direction(features)
+            timeframe_results[timeframe] = {
                 "score": weighted_score,
                 "icon": icon,
                 "label": label,
             }
 
-        # ----------------------------------------------------
-        # TA RESULT
-        # ----------------------------------------------------
-
         if net_score > 0:
-
             result_icon = "🟢"
             result_label = "LONG"
-
         elif net_score < 0:
-
             result_icon = "🔴"
             result_label = "SHORT"
-
         else:
-
             result_icon = "🟡"
             result_label = "MIXED"
 
         result = {
             "result_icon": result_icon,
             "result_label": result_label,
-
             "net_score": net_score,
             "max_score": max_score,
-
-            "long_evidence": (
-                long_evidence
-            ),
-
-            "short_evidence": (
-                short_evidence
-            ),
-
-            "timeframes": (
-                timeframe_results
-            ),
-
-            "market_context": (
-                market_context
-            ),
+            "long_evidence": long_evidence,
+            "short_evidence": short_evidence,
+            "timeframes": timeframe_results,
+            "market_context": market_context,
         }
 
-        _TA_CACHE[
-            symbol
-        ] = result
-
+        _TA_CACHE[symbol] = result
         return result
 
     except Exception as exc:
-
-        # TA никогда не ломает основной сигнал.
-        print(
-            f"[TA] {symbol}: "
-            f"technical context unavailable: "
-            f"{exc}"
-        )
-
+        print(f"[TA] {symbol}: technical context unavailable: {exc}")
         return None
 
 
 # ============================================================
-# TELEGRAM: TA DIRECTION
+# TELEGRAM: TA DIRECTION (UNCHANGED)
 # ============================================================
 
 def format_ta_telegram(
     ta_context: dict | None,
 ) -> str:
-    """
-    Финальный компактный блок TA.
-
-    Ровно такой формат:
-
-    ━━━━━━━━━━━━━━━━━━
-    🎯 TA DIRECTION
-    Strength: +5/15 · LONG: 9/15 · SHORT: 4/15
-    1H +3 🟢 BULLISH
-    4H +4 🟡 MIXED / BULLISH
-    1D -2 🟡 MIXED / BEARISH
-    TA RESULT: 🟢 LONG
-    """
-
     if not ta_context:
         return ""
 
-    line = (
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
+    line = "━━━━━━━━━━━━━━━━━━"
     out = [
         line,
         "🎯 TA DIRECTION",
@@ -1808,13 +1188,7 @@ def format_ta_telegram(
     ]
 
     for timeframe in TIMEFRAMES:
-
-        item = (
-            ta_context[
-                "timeframes"
-            ].get(timeframe)
-        )
-
+        item = ta_context["timeframes"].get(timeframe)
         if not item:
             continue
 
@@ -1831,9 +1205,7 @@ def format_ta_telegram(
         f"{ta_context['result_label']}"
     )
 
-    return "\n".join(
-        out
-    )
+    return "\n".join(out)
 
 
 # ============================================================
@@ -1843,143 +1215,83 @@ def format_ta_telegram(
 def format_market_context_telegram(
     ta_context: dict | None,
 ) -> str:
-    """
-    Отдельный descriptive context:
-
-    Resistance
-    Breakout quality
-    Relative Strength vs BTC
-
-    НЕ влияет на TA score.
-    """
-
     if not ta_context:
         return ""
 
-    market = (
-        ta_context.get(
-            "market_context"
-        )
-        or {}
-    )
-
+    market = ta_context.get("market_context") or {}
     if not market:
         return ""
 
-    line = (
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
+    line = "━━━━━━━━━━━━━━━━━━"
     out = [
         line,
         "📍 MARKET CONTEXT",
     ]
 
-    for timeframe in (
-        "1h",
-        "4h",
-    ):
-
-        item = market.get(
-            timeframe
-        )
-
+    for timeframe in ("1h", "4h"):
+        item = market.get(timeframe)
         if not item:
             continue
 
         # ----------------------------------------------------
-        # Resistance
+        # Resistance & Exhaustion Warning
         # ----------------------------------------------------
+        resistance = item.get("resistance_price")
+        distance_atr = item.get("distance_atr")
+        div_warning = item.get("divergence_at_resistance", False)
 
-        resistance = item.get(
-            "resistance_price"
-        )
-
-        distance_atr = item.get(
-            "distance_atr"
-        )
-
-        if (
-            resistance is not None
-            and distance_atr is not None
-        ):
-
-            resistance_text = (
-                f"{distance_atr:.1f} ATR ↑"
-            )
-
+        if resistance is not None and distance_atr is not None:
+            resistance_text = f"{distance_atr:.1f} ATR ↑"
         elif resistance is not None:
-
-            resistance_text = (
-                f"{resistance:.6g} ↑"
-            )
-
+            resistance_text = f"{resistance:.6g} ↑"
         else:
-
             resistance_text = "—"
 
-        out.append(
-            f"{timeframe.upper()} "
-            f"Resistance: "
-            f"{resistance_text}"
-        )
+        if div_warning:
+            resistance_text += " ⚠️ Bearish Div"
+
+        out.append(f"{timeframe.upper()} Resistance: {resistance_text}")
 
         # ----------------------------------------------------
         # Breakout
         # ----------------------------------------------------
-
-        breakout_status = item.get(
-            "status",
-            "NONE",
-        )
-
-        breakout_icon = item.get(
-            "icon",
-            "⚪",
-        )
-
-        relative_volume = item.get(
-            "relative_volume"
-        )
+        breakout_status = item.get("status", "NONE")
+        breakout_icon = item.get("icon", "⚪")
+        relative_volume = item.get("relative_volume")
 
         if relative_volume is not None:
-
-            volume_text = (
-                f" · Vol "
-                f"{relative_volume:.1f}×"
-            )
-
+            volume_text = f" · Vol {relative_volume:.1f}×"
         else:
-
             volume_text = ""
 
-        out.append(
-            f"{timeframe.upper()} "
-            f"Breakout: "
-            f"{breakout_icon} "
-            f"{breakout_status}"
-            f"{volume_text}"
-        )
+        out.append(f"{timeframe.upper()} Breakout: {breakout_icon} {breakout_status}{volume_text}")
+
+        # ----------------------------------------------------
+        # Regime & Volatility
+        # ----------------------------------------------------
+        chop_regime = item.get("chop_regime", "UNKNOWN")
+        squeeze_on = item.get("squeeze_on", False)
+        squeeze_fired = item.get("squeeze_fired", False)
+
+        if squeeze_on:
+            sq_text = f" · 🟡 Squeeze ({item.get('squeeze_duration', 0)}b)"
+        elif squeeze_fired:
+            sq_text = f" · 🟢 Squeeze Fire ({item.get('squeeze_release_dir', 'NONE')})"
+        else:
+            sq_text = ""
+
+        out.append(f"{timeframe.upper()} Regime: {chop_regime}{sq_text}")
 
         # ----------------------------------------------------
         # Relative Strength vs BTC
         # ----------------------------------------------------
-
-        rs = item.get(
-            "btc_rs_pct"
-        )
-
+        rs = item.get("btc_rs_pct")
+        is_stale = item.get("btc_rs_stale", False)
         if rs is not None:
+            stale_mark = " (stale)" if is_stale else ""
+            out.append(f"BTC RS {timeframe.upper()}: {rs:+.2f}%{stale_mark}")
 
-            out.append(
-                f"BTC RS "
-                f"{timeframe.upper()}: "
-                f"{rs:+.2f}%"
-            )
-
-    return "\n".join(
-        out
-    )
+    return "\n".join(out)
 
 
 # ============================================================
@@ -1987,10 +1299,6 @@ def format_market_context_telegram(
 # ============================================================
 
 def clear_cache() -> None:
-    """
-    Для standalone tests.
-    """
-
     _TA_CACHE.clear()
     _BTC_KLINE_CACHE.clear()
 
