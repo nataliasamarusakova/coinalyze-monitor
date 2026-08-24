@@ -26,12 +26,16 @@ WATCHLIST = BASE / "watchlist.json"
 TRADES = BASE / "trades.jsonl"
 CANDIDATES_FILE = BASE / "unentered_candidates.jsonl"
 ANALYSIS_FILE = BASE / "unentered_analysis.jsonl"
+TA_DIRECTION_BLOCKS_FILE = BASE / "ta_direction_blocks.jsonl"
+TA_DIRECTION_ANALYSIS_FILE = BASE / "ta_direction_analysis.jsonl"
 
 CANDIDATES_TTL_DAYS = 7
 ANALYSIS_TTL_DAYS = 90
 MISSED_THRESHOLD_PCT = 5.0
 FINALIZATION_WINDOW_H = 6
 FORWARD_HORIZONS = [60, 120]
+TA_DIRECTION_ANALYSIS_TTL_DAYS = 90
+TA_DIRECTION_BLOCK_TTL_DAYS = 90
 
 
 def now_ts():
@@ -275,6 +279,136 @@ def classify_quality(forward_returns, movement_snaps):
         }
 
 
+def compute_ta_direction_excursion(snaps, detect_ts, entry_price, horizon_min=120):
+    """Calculate max/min price excursion from the exact TA-block snapshot."""
+    try:
+        detect_ts = int(detect_ts)
+        entry_price = float(entry_price)
+    except (TypeError, ValueError):
+        return {
+            "max_excursion_120m_pct": None,
+            "min_excursion_120m_pct": None,
+            "last_price_120m": None,
+            "excursion_samples": 0,
+        }
+
+    end_ts = detect_ts + horizon_min * 60
+    values = []
+    last_price = None
+    for snap in snaps:
+        try:
+            ts = int(snap.get("ts", 0) or 0)
+            price = float(snap.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if ts <= detect_ts or ts > end_ts or price <= 0:
+            continue
+        ret = (price - entry_price) / entry_price * 100.0
+        values.append(ret)
+        last_price = price
+
+    if not values:
+        return {
+            "max_excursion_120m_pct": None,
+            "min_excursion_120m_pct": None,
+            "last_price_120m": None,
+            "excursion_samples": 0,
+        }
+
+    return {
+        "max_excursion_120m_pct": round(max(values), 3),
+        "min_excursion_120m_pct": round(min(values), 3),
+        "last_price_120m": round(last_price, 12),
+        "excursion_samples": len(values),
+    }
+
+
+def analyze_ta_direction_blocks(market_snaps, now=None):
+    """Finalize TA-block events once the full 120m forward window is observable."""
+    now = now or now_ts()
+    blocks = load_jsonl(TA_DIRECTION_BLOCKS_FILE)
+    existing = load_jsonl(TA_DIRECTION_ANALYSIS_FILE)
+    done = {str(r.get("block_key")) for r in existing if r.get("block_key")}
+    trades = load_jsonl(TRADES)
+    created = 0
+
+    for block in blocks:
+        key = str(block.get("block_key") or "")
+        if not key or key in done:
+            continue
+
+        detect_ts = block.get("block_ts")
+        price = block.get("price")
+        sym = block.get("symbol")
+        if detect_ts is None or price in (None, 0) or not sym:
+            continue
+
+        # Wait until the full 120m horizon plus the normal 15m snapshot lag is observable.
+        if now - int(detect_ts) < 135 * 60:
+            continue
+
+        snaps = market_snaps.get(sym, [])
+        forward = compute_forward_returns(snaps, detect_ts, price)
+        if not any(forward.get(f"forward_{h}m_available") for h in FORWARD_HORIZONS):
+            continue
+
+        excursion = compute_ta_direction_excursion(snaps, detect_ts, price, horizon_min=120)
+        forward_values = [
+            forward.get(f"forward_{h}m")
+            for h in FORWARD_HORIZONS
+            if forward.get(f"forward_{h}m") is not None
+        ]
+        best_forward = max(forward_values) if forward_values else None
+
+        later_captured = any(
+            t.get("symbol") == sym
+            and t.get("entry_ts") is not None
+            and int(detect_ts) < int(t.get("entry_ts")) <= int(detect_ts) + 120 * 60
+            for t in trades
+        )
+
+        try:
+            contract = bingx_client.get_contract(sym)
+            asset_class = bingx_client.classify_bingx_contract(contract) if contract else "unknown"
+        except Exception:
+            asset_class = "unknown"
+
+        good_move = best_forward is not None and best_forward >= TRADE_WIN_PCT
+        missed_good = bool(good_move and not later_captured)
+
+        analysis_rec = {
+            "block_key": key,
+            "detect_ts": int(detect_ts),
+            "finalize_ts": now,
+            "symbol": sym,
+            "name": block.get("name", sym),
+            "price_at_detect": price,
+            "state": block.get("state"),
+            "path": block.get("path"),
+            "score": block.get("score"),
+            "reason": block.get("reason"),
+            "ta_direction": block.get("ta_direction"),
+            "gate_version": block.get("gate_version"),
+            "asset_class": asset_class,
+            **forward,
+            **excursion,
+            "best_forward_pct": round(best_forward, 3) if best_forward is not None else None,
+            "later_captured": later_captured,
+            "good_move": good_move,
+            "ta_direction_missed_good": missed_good,
+            "result": (
+                "captured_after_ta_block" if later_captured
+                else "missed_good" if missed_good
+                else "not_good"
+            ),
+        }
+        append_jsonl(TA_DIRECTION_ANALYSIS_FILE, analysis_rec)
+        done.add(key)
+        created += 1
+
+    return created
+
+
 def determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_momentum):
     confidence = (
         "observed"
@@ -359,6 +493,7 @@ def run():
 
     now = now_ts()
     market_snaps = load_market_history_snaps()
+    ta_direction_finalized = analyze_ta_direction_blocks(market_snaps, now=now)
     active_symbols = get_active_symbols()
 
     existing_candidates = load_jsonl(CANDIDATES_FILE)
@@ -555,6 +690,16 @@ def run():
         ANALYSIS_TTL_DAYS,
         "detect_ts",
     )
+    cleanup_jsonl(
+        TA_DIRECTION_BLOCKS_FILE,
+        TA_DIRECTION_BLOCK_TTL_DAYS,
+        "block_ts",
+    )
+    cleanup_jsonl(
+        TA_DIRECTION_ANALYSIS_FILE,
+        TA_DIRECTION_ANALYSIS_TTL_DAYS,
+        "detect_ts",
+    )
 
     pending_count = len(
         [
@@ -567,6 +712,7 @@ def run():
     print(
         f"  новых: {new_candidates} · "
         f"финализировано: {finalized} · "
+        f"TA DIRECTION проанализировано: {ta_direction_finalized} · "
         f"ожидают: {pending_count}"
     )
 
@@ -575,3 +721,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
