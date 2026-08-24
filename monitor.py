@@ -17,11 +17,9 @@ import requests
 
 try:
     from playwright_stealth import stealth_sync
-
     _STEALTH_AVAILABLE = True
 except ImportError:
     _STEALTH_AVAILABLE = False
-
     def stealth_sync(page):
         pass
 
@@ -105,7 +103,7 @@ ENGINE_VERSIONS = {
     "conditions": CONDITIONS_CONFIG,
 }
 HASH_VERSION = "sha256_v1"
-TRADE_TIMEOUT_MIN = 600 
+TRADE_TIMEOUT_MIN = 480 
 BINGX_SKIP_NOTIFY_COOLDOWN_SEC = 4 * 3600
 FEE_PCT = 0.10
 SIGNAL_DECAY_MIN = 90
