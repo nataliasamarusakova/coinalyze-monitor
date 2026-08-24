@@ -24,7 +24,7 @@ except Exception as e:
 
 FIELDS = [
     "symbol", "name", "asset_class", "entry_ts", "entry_price", "exit_price",
-    "strategy_pnl_pct", "gross_pnl_pct", "return_60m", "return_120m", "return_240m", "return_360m",
+    "strategy_pnl_pct", "gross_pnl_pct", "return_60m", "return_120m", "return_240m", "return_360m", "return_480m", "return_600m",
     "hold_min", "exit_reason", "exit_state", "closed_before_60m", "entry_path",
     "entry_pattern", "entry_momentum", "entry_cvd_momentum", "entry_earliness_label",
     "entry_divergence", "entry_market_phase", "max_pnl_pct", "min_pnl_pct",
