@@ -40,6 +40,7 @@ from conditions import (
 
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY_FILE = BASE / "market_history.jsonl"
+TA_DIRECTION_BLOCKS_FILE = BASE / "ta_direction_blocks.jsonl"
 SNAPSHOTS_FILE = BASE / "snapshots.jsonl"
 HEARTBEAT_FILE = BASE / "heartbeat.jsonl"
 WATCHLIST_FILE = BASE / "watchlist.json"
@@ -625,6 +626,52 @@ def _append_execution_event_durable(event):
     except Exception as e:
         log.error(f"Durable execution journal write failed: {e}")
         return False
+
+
+TA_DIRECTION_GATE_VERSION = 1
+TA_DIRECTION_MATCH = "LONG"
+
+
+def ta_direction_allows_long(ta_data):
+    if not isinstance(ta_data, dict):
+        return False, "unavailable"
+    result = str(ta_data.get("result_label") or "").strip().upper()
+    if result == TA_DIRECTION_MATCH:
+        return True, "long"
+    if result == "SHORT":
+        return False, "short"
+    if result == "MIXED":
+        return False, "mixed"
+    return False, "unknown"
+
+
+def _ta_direction_snapshot(ta_data):
+    if not isinstance(ta_data, dict):
+        return None
+    return {
+        "result_label": ta_data.get("result_label"),
+        "result_icon": ta_data.get("result_icon"),
+        "net_score": ta_data.get("net_score"),
+        "max_score": ta_data.get("max_score"),
+        "long_evidence": ta_data.get("long_evidence"),
+        "short_evidence": ta_data.get("short_evidence"),
+        "timeframes": {k: dict(v) for k, v in (ta_data.get("timeframes") or {}).items() if isinstance(v, dict)},
+    }
+
+
+def _record_ta_direction_block(symbol, ts, idea_ts, state, path, price, score, ta_data, reason, name=None):
+    key = f"{symbol}:{int(idea_ts or ts)}"
+    try:
+        if any(str(x.get("block_key")) == key for x in load_jsonl(TA_DIRECTION_BLOCKS_FILE)):
+            return
+    except Exception as e:
+        log.warning(f"[{symbol}] TA block dedup read failed: {e}")
+    append_jsonl(TA_DIRECTION_BLOCKS_FILE, {
+        "block_key": key, "block_ts": int(ts), "idea_first_seen_ts": int(idea_ts or ts),
+        "symbol": symbol, "name": name or symbol, "state": state, "path": path, "price": price,
+        "score": score, "reason": reason, "gate_version": TA_DIRECTION_GATE_VERSION,
+        "ta_direction": _ta_direction_snapshot(ta_data),
+    })
 
 
 def load_jsonl(path):
@@ -3646,53 +3693,40 @@ def run():
                     ta_data = None
                     log.warning(f"[{sym}] TA entry snapshot failed: {e}")
 
-                ta_direction_snapshot = None
+                ta_direction_snapshot = _ta_direction_snapshot(ta_data)
                 market_context_snapshot = None
                 if ta_data:
-                    ta_direction_snapshot = {
-                        "result_label": ta_data.get("result_label"),
-                        "result_icon": ta_data.get("result_icon"),
-                        "net_score": ta_data.get("net_score"),
-                        "max_score": ta_data.get("max_score"),
-                        "long_evidence": ta_data.get("long_evidence"),
-                        "short_evidence": ta_data.get("short_evidence"),
-                        "timeframes": {
-                            k: dict(v) for k, v in (ta_data.get("timeframes") or {}).items()
-                            if isinstance(v, dict)
-                        },
-                    }
                     market_context_snapshot = {
                         k: dict(v) for k, v in (ta_data.get("market_context") or {}).items()
                         if isinstance(v, dict)
                     }
 
-                new_ot = open_trade_record(
-                    r,
-                    ts,
-                    state,
-                    sig["path"],
-                    score,
-                    sig["momentum"],
-                    conf,
-                    sig["early_val"],
-                    sig["early_label"],
-                    sig["pattern"],
-                    derived,
-                    market,
-                    idea_ts,
-                    existing.get("snapshots", 0) + 1,
-                    sig["price"],
-                    history_len=sig["history_len"],
-                    window=sig["window"],
-                    strength=sig["strength"],
-                    shadow=sig["shadow"],
-                    hist=sig["hist"],
-                    ta_direction=ta_direction_snapshot,
-                    market_context=market_context_snapshot,
-                )
-                new_ot["trade_id_full"] = new_tid
-                new_ot["opened_ts"] = ts
-                                
+                ta_direction_allowed, ta_direction_block_reason = ta_direction_allows_long(ta_data)
+                if not ta_direction_allowed:
+                    _record_ta_direction_block(
+                        sym, ts, idea_ts, state, sig["path"], sig["price"], score, ta_data,
+                        ta_direction_block_reason, r.get("name", sym),
+                    )
+                    log.info(
+                        f"[{sym}] ENTRY BLOCKED BY TA DIRECTION: "
+                        f"result={ta_data.get('result_label') if ta_data else 'UNAVAILABLE'} "
+                        f"reason={ta_direction_block_reason}"
+                    )
+                    new_ot = None
+                    new_tid = None
+                else:
+                    new_ot = open_trade_record(
+                        r, ts, state, sig["path"], score, sig["momentum"], conf,
+                        sig["early_val"], sig["early_label"], sig["pattern"], derived, market, idea_ts,
+                        existing.get("snapshots", 0) + 1, sig["price"],
+                        history_len=sig["history_len"], window=sig["window"], strength=sig["strength"],
+                        shadow=sig["shadow"], hist=sig["hist"],
+                        ta_direction=ta_direction_snapshot,
+                        market_context=market_context_snapshot,
+                    )
+                    new_ot["trade_id_full"] = new_tid
+                    new_ot["opened_ts"] = ts
+
                 if ENABLE_BINGX and new_ot is not None:
                     # --------------------------------------------------------
                     # ADAPTIVE PROTECTION MUST BE CALCULATED BEFORE OPEN.
@@ -4289,3 +4323,6 @@ if __name__ == "__main__":
         log.exception(f"Фатал: {e}")
         send_tg(f"⚠️ <b>Monitor</b>\n{esc(str(e)[:500])}")
         sys.exit(1)
+
+
+
