@@ -445,12 +445,12 @@ def compute_adaptive_tp_sl(r: dict, snaps: list) -> tuple[float, list[dict]]:
         {
             "leg": "tp1",
             "pnl_pct": tp1,
-            "close_fraction": 0.10,
+            "close_fraction": 0.20,
         },
         {
             "leg": "tp2",
             "pnl_pct": tp2,
-            "close_fraction": 0.15,
+            "close_fraction": 0.25,
         },
         {
             "leg": "tp3",
