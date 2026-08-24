@@ -9,6 +9,7 @@ WATCHLIST = BASE / "watchlist.json"
 MARKET_HISTORY = BASE / "market_history.jsonl"
 UNENTERED_ANALYSIS = BASE / "unentered_analysis.jsonl"
 UNENTERED_CANDIDATES = BASE / "unentered_candidates.jsonl"
+TA_DIRECTION_ANALYSIS = BASE / "ta_direction_analysis.jsonl"
 OUT = BASE / "docs" / "index.html"
 MISSED_THRESHOLD = 5.0
 
@@ -130,6 +131,47 @@ def load_pending_unentered():
     if bad:
         print(f"WARNING: unentered_candidates.jsonl — {bad} битых строк пропущено")
     return count
+
+def compute_ta_direction_stats(cutoff_h=24):
+    cutoff = time.time() - cutoff_h * 3600
+    if not TA_DIRECTION_ANALYSIS.exists():
+        return {"blocked": 0, "analyzed": 0, "missed_good": 0, "captured_after_ta_block": 0, "good_move": 0, "median_forward_60m": None, "median_forward_120m": None, "median_best_forward": None, "max_excursion": None, "by_reason": {}}
+    rows = []
+    for ln in TA_DIRECTION_ANALYSIS.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("detect_ts", 0) < cutoff or rec.get("asset_class", "crypto") != "crypto":
+            continue
+        rows.append(rec)
+    def med(values):
+        vals = sorted(v for v in values if v is not None)
+        if not vals:
+            return None
+        m = (len(vals) - 1) / 2
+        lo = int(m); hi = min(lo + 1, len(vals) - 1)
+        return round(vals[lo] if lo == hi else vals[lo] + (vals[hi] - vals[lo]) * (m - lo), 3)
+    by_reason = {}
+    for r in rows:
+        reason = r.get("reason", "unknown")
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {
+        "blocked": len(rows),
+        "analyzed": len(rows),
+        "missed_good": sum(1 for r in rows if r.get("ta_direction_missed_good") is True),
+        "captured_after_ta_block": sum(1 for r in rows if r.get("later_captured") is True),
+        "good_move": sum(1 for r in rows if r.get("good_move") is True),
+        "median_forward_60m": med([r.get("forward_60m") for r in rows]),
+        "median_forward_120m": med([r.get("forward_120m") for r in rows]),
+        "median_best_forward": med([r.get("best_forward_pct") for r in rows]),
+        "max_excursion": max((r.get("max_excursion_120m_pct") for r in rows if r.get("max_excursion_120m_pct") is not None), default=None),
+        "by_reason": by_reason,
+    }
+
 
 def compute_capture_rate(trades, unentered, cutoff_h=24):
     now = time.time()
@@ -351,13 +393,14 @@ document.getElementById(elId).innerHTML=have.length?have.map(r=>`<div class="top
 function topDiv(rows){const have=rows.filter(r=>r.return_60m!=null&&r.strategy_pnl_pct!=null).map(r=>({...r,_d:r.return_60m-r.strategy_pnl_pct})).sort((a,b)=>b._d-a._d).slice(0,8);
 document.getElementById('topDiv').innerHTML=have.length?have.map(r=>`<div class="toprow"><span class="nm">${r.symbol} <span class="tag">${r.exit_reason||''}</span></span><span class="meta">r60 <b class="${cls(r.return_60m)}">${pctf(r.return_60m)}</b> → strat <b class="${cls(r.strategy_pnl_pct)}">${pctf(r.strategy_pnl_pct)}</b> · Δ <b class="neg">${r._d>0?'+':''}${r._d.toFixed(1)}%</b></span></div>`).join(''):'<div class="empty">Нет данных</div>';}
 function renderCapture(){const sec=document.getElementById('captureSection');
-if(!CAPTURE||CAPTURE.total===0){sec.innerHTML='<div class="empty">Нет данных за последние 24ч для расчёта коэффициента захвата</div>';return;}
-let html=`<div style="margin-bottom:16px"><div style="font-size:12px;text-transform:uppercase;color:var(--mut-2)">Коэффициент захвата хороших лонгов</div><div style="font-family:var(--display);font-weight:700;font-size:48px;margin:10px 0" class="${CAPTURE.capture_rate>=50?'pos2':'neg'}">${CAPTURE.capture_rate.toFixed(0)}%</div><div style="display:flex;gap:20px;font-family:var(--mono);font-size:13px"><span class="pos2">Поймали: ${CAPTURE.caught}</span><span class="neg">Упустили: ${CAPTURE.missed}</span><span class="neu">Всего хороших: ${CAPTURE.total}</span></div>${PENDING_UNENTERED>0?`<div style="margin-top:12px;font-size:12px;color:var(--amb)">⏳ Ожидают классификации: ${PENDING_UNENTERED} кандидатов</div>`:''}</div>`;
-if(FAIL_POINTS&&FAIL_POINTS.by_condition&&FAIL_POINTS.by_condition.length>0){html+='<h4 style="font-size:13px;margin:20px 0 10px;color:var(--txt)">Топ условий, отсекающих хорошие лонги</h4><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
-FAIL_POINTS.by_condition.slice(0,8).forEach(fp=>{const deficitStr=fp.avg_deficit!=null?`avg deficit: ${fp.avg_deficit.toFixed(2)}`:'deficit: n/a';
-html+=`<div style="background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px"><div style="font-size:11px;text-transform:uppercase;color:var(--mut-2)">${fp.stage}</div><div style="font-family:var(--display);font-weight:600;font-size:15px;margin:4px 0">${fp.condition}</div><div style="font-family:var(--display);font-weight:700;font-size:24px;color:var(--teal)">${fp.count}</div><div style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:4px">${deficitStr}</div></div>`;});
-html+='</div>';if(FAIL_POINTS.by_condition.length<LOW){html+=`<div style="margin-top:14px;font-size:11px;color:var(--amb)">⚠ LOW SAMPLE (${FAIL_POINTS.by_condition.length}<${LOW}) — выводов пока не делать</div>`;}}
-sec.innerHTML=html;}
+ const ta=CAPTURE&&CAPTURE.ta_direction?CAPTURE.ta_direction:null;
+ let html='';
+ if(CAPTURE&&CAPTURE.total>0){html+=`<div style="margin-bottom:16px"><div style="font-size:12px;text-transform:uppercase;color:var(--mut-2)">Коэффициент захвата хороших лонгов</div><div style="font-family:var(--display);font-weight:700;font-size:48px;margin:10px 0" class="${CAPTURE.capture_rate>=50?'pos2':'neg'}">${CAPTURE.capture_rate.toFixed(0)}%</div><div style="display:flex;gap:20px;font-family:var(--mono);font-size:13px"><span class="pos2">Поймали: ${CAPTURE.caught}</span><span class="neg">Упустили: ${CAPTURE.missed}</span><span class="neu">Всего хороших: ${CAPTURE.total}</span></div>${PENDING_UNENTERED>0?`<div style="margin-top:12px;font-size:12px;color:var(--amb)">⏳ Ожидают классификации: ${PENDING_UNENTERED} кандидатов</div>`:''}</div>`;}else{html+='<div class="empty">Нет данных за последние 24ч для расчёта основного коэффициента захвата</div>';}
+ if(ta&&ta.analyzed>0){const r=ta.by_reason||{};html+=`<div style="border-top:1px solid var(--line);padding-top:18px;margin-top:14px"><div style="font-size:12px;text-transform:uppercase;color:var(--mut-2)">TA DIRECTION — последствие фильтра</div><div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:8px;font-family:var(--mono);font-size:13px"><span class="neg">Проанализировано: ${ta.analyzed}</span><span class="neg">Хорошо упущено: ${ta.missed_good}</span><span class="pos2">Хорошее движение: ${ta.good_move}</span><span class="neu">Позже поймано: ${ta.captured_after_ta_block}</span></div><div style="margin-top:8px;font-family:var(--mono);font-size:12px;color:var(--mut)">SHORT ${r.short||0} · MIXED ${r.mixed||0} · unavailable ${r.unavailable||0} · unknown ${r.unknown||0}</div><div style="margin-top:8px;font-family:var(--mono);font-size:12px;color:var(--mut)">median r60 ${pctf(ta.median_forward_60m)} · median r120 ${pctf(ta.median_forward_120m)} · median best ${pctf(ta.median_best_forward)} · max excursion ${pctf(ta.max_excursion)}</div></div>`;}
+ if(FAIL_POINTS&&FAIL_POINTS.by_condition&&FAIL_POINTS.by_condition.length>0){html+='<h4 style="font-size:13px;margin:20px 0 10px;color:var(--txt)">Топ условий, отсекающих хорошие лонги</h4><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
+ FAIL_POINTS.by_condition.slice(0,8).forEach(fp=>{const deficitStr=fp.avg_deficit!=null?`avg deficit: ${fp.avg_deficit.toFixed(2)}`:'deficit: n/a';html+=`<div style="background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px"><div style="font-size:11px;text-transform:uppercase;color:var(--mut-2)">${fp.stage}</div><div style="font-family:var(--display);font-weight:600;font-size:15px;margin:4px 0">${fp.condition}</div><div style="font-family:var(--display);font-weight:700;font-size:24px;color:var(--teal)">${fp.count}</div><div style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:4px">${deficitStr}</div></div>`;});
+ html+='</div>';if(FAIL_POINTS.by_condition.length<LOW){html+=`<div style="margin-top:14px;font-size:11px;color:var(--amb)">⚠ LOW SAMPLE (${FAIL_POINTS.by_condition.length}<${LOW}) — выводов пока не делать</div>`;}}
+ sec.innerHTML=html;}
 function renderAll(){const rows=filtered();const ops=openFiltered();renderLive();renderBento(rows,ops.length);renderDaily(rows);renderCapture();
 barByBucket(rows,'entry_momentum',MOM_B,'chMom');barByBucket(rows,'entry_cvd_momentum',CVD_B,'chCvd');scatter(rows,'chScatter');equity(rows,'chEquity');
 topList(rows,'return_60m','topSig');topList(rows,'strategy_pnl_pct','topStr');topDiv(rows);renderTable(rows);
@@ -373,6 +416,7 @@ def main():
     unentered = load_unentered()
     pending_unentered = load_pending_unentered()
     capture = compute_capture_rate(trades, unentered, cutoff_h=24)
+    capture["ta_direction"] = compute_ta_direction_stats(cutoff_h=24)
     fail_points = aggregate_fail_points(unentered)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     html = (HTML
