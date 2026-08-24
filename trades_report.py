@@ -12,28 +12,18 @@ from collections import defaultdict
 
 
 BASE = Path(__file__).resolve().parent
-
+UNENTERED_CANDIDATES = BASE / "unentered_candidates.jsonl"
+UNENTERED_ANALYSIS = BASE / "unentered_analysis.jsonl"
+MARKET_HISTORY = BASE / "market_history.jsonl"
 TRADES = BASE / "trades.jsonl"
 
-# Финализированные missed candidates.
-UNENTERED_ANALYSIS = BASE / "unentered_analysis.jsonl"
-
-# Только pending / ещё не финализированные candidates.
-UNENTERED_CANDIDATES = BASE / "unentered_candidates.jsonl"
-
-# История рынка для post-exit analysis.
-MARKET_HISTORY = BASE / "market_history.jsonl"
-
-
 WIN_LEVELS = [0.0, 0.5, 1.0, 2.0]
-
 MOMENTUM_BUCKETS = [3, 5, 7]
 CVD_BUCKETS = [0, 3, 6, 10]
 PRICE_BUCKETS = [3, 8, 15]
 
 HORIZONS = [60, 120, 240, 360, 480, 600]
 POST_EXIT_HORIZONS = [30, 60, 120, 240]
-
 LOW_SAMPLE_WARNING = 20
 TOP_N = 10
 
