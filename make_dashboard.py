@@ -16,10 +16,10 @@ MISSED_THRESHOLD = 5.0
 try:
     from monitor import TRADE_TIMEOUT_MIN
 except Exception as e:
-    TRADE_TIMEOUT_MIN = 240 
+    TRADE_TIMEOUT_MIN = 360 
     print(
         f"WARNING: не удалось импортировать timeout settings из monitor.py ({e}); "
-        f"используются fallback: TRADE_TIMEOUT_MIN=240, " 
+        f"используются fallback: TRADE_TIMEOUT_MIN=360, " 
     )
 
 FIELDS = [
