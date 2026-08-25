@@ -2,7 +2,7 @@
 bingx_client.py — BingX USDT-M Perpetual Swap, демо-счёт (VST) / Live.
 """
 
-import os, json, time, hmac, hashlib, math, logging, uuid
+import os, json, time, hmac, hashlib, math, logging, uuid, re
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 import requests
@@ -36,9 +36,243 @@ except json.JSONDecodeError:
 _CONTRACT_CACHE = {
     "ts": 0.0,
     "data": {},
-    "by_display_name": {},
+    "index": {},
 }
 _CONTRACT_TTL = 3600
+
+
+def _clean_ticker(s: str) -> str:
+    """Очищает тикер от разделителей и суффикса USDT/USD/PERP."""
+    if not s:
+        return ""
+    t = str(s).strip().upper().replace("/", "").replace("-", "").replace("_", "")
+    for suffix in ("USDT", "USD", "PERP"):
+        if t.endswith(suffix) and len(t) > len(suffix):
+            t = t[:-len(suffix)]
+            break
+    return t
+
+
+def _strip_multiplier(t: str) -> str:
+    """Удаляет числовые множители (1000, 1000000, 1M, 1K, 10000, 100 и т.д.)."""
+    m = re.match(r"^(1000000|100000|10000|1000|100|1M|1K|M|K)([A-Z0-9]+)$", t)
+    if m:
+        return m.group(2)
+    return t
+
+
+def _clean_and_extract_tokens(raw_str: str) -> set:
+    """
+    Извлекает все варианты тикера из одной строки:
+    - очищенный тикер (FLOKI-USDT -> FLOKI)
+    - содержимое скобок: GOLD(XAU)-USDT -> XAU
+    - имя без скобок: ANTHROPIC(Pre-IPO)-USDT -> ANTHROPIC
+    - биржевые суффиксы акций: AMDUS -> AMD, NOKUS -> NOK
+    """
+    if not raw_str:
+        return set()
+    s = str(raw_str).strip().upper()
+    tokens = set()
+    tokens.add(s)
+
+    clean_basic = _clean_ticker(s)
+    if clean_basic:
+        tokens.add(clean_basic)
+
+    # 1. Извлечение содержимого скобок: GOLD(XAU) -> XAU
+    inside_paren = re.findall(r"\((.*?)\)", s)
+    for p in inside_paren:
+        p_clean = _clean_ticker(p)
+        if p_clean and len(p_clean) >= 2:
+            tokens.add(p_clean)
+
+    # 2. Очистка от скобок: ANTHROPIC(Pre-IPO)-USDT -> ANTHROPIC
+    without_paren = _clean_ticker(re.sub(r"\(.*?\)", "", s))
+    if without_paren:
+        tokens.add(without_paren)
+
+    # 3. Суффиксы акций US: AMDUS -> AMD, NOKUS -> NOK
+    for t in list(tokens):
+        if t.endswith("US") and len(t) > 3:
+            tokens.add(t[:-2])
+
+    return tokens
+
+
+def _index_contract(c: dict, index: dict, exact_data: dict):
+    """
+    Автоматически генерирует полную матрицу ключей для контракта BingX.
+    Гарантирует поиск O(1) для любых форматов Coinalyze/Binance.
+    """
+    sym = str(c.get("symbol", "")).strip().upper()
+    asset = str(c.get("asset", "")).strip().upper()
+    display_name = str(c.get("displayName", "")).strip().upper()
+
+    if sym:
+        exact_data[sym] = c
+
+    keys = set()
+    for raw in (sym, asset, display_name):
+        extracted = _clean_and_extract_tokens(raw)
+        for tok in extracted:
+            base = _strip_multiplier(tok)
+            keys.add(tok)
+            keys.add(f"{tok}-USDT")
+            keys.add(f"{tok}USDT")
+            keys.add(base)
+            keys.add(f"{base}-USDT")
+            keys.add(f"{base}USDT")
+
+            for mult in ("1000", "1000000", "1M", "1K", "10000", "100"):
+                keys.add(f"{mult}{base}")
+                keys.add(f"{mult}{base}-USDT")
+                keys.add(f"{mult}{base}USDT")
+
+    for k in keys:
+        if k not in index:
+            index[k] = c
+
+
+def _refresh_contracts() -> dict:
+    """Загружает все контракты BingX и строит полный динамический индекс."""
+    now = time.time()
+    resp = _request("GET", CONTRACTS_PATH, signed=False)
+
+    if resp.get("code") != 0:
+        err = f"code={resp.get('code')} msg={resp.get('msg')}"
+        log.error(f"contracts refresh failed: {err}")
+        return {"status": "error", "error": err}
+
+    data = {}
+    index = {}
+
+    for c in resp.get("data", []) or []:
+        _index_contract(c, index, data)
+
+    _CONTRACT_CACHE.update({
+        "ts": now,
+        "data": data,
+        "index": index,
+    })
+
+    log.info(f"contracts refresh OK: {len(data)} contracts, {len(index)} indexed keys")
+    return {"status": "ok", "count": len(data)}
+
+
+def _contracts() -> dict:
+    now = time.time()
+    if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
+        return _CONTRACT_CACHE["data"]
+
+    refresh = _refresh_contracts()
+    if refresh.get("status") == "ok":
+        return _CONTRACT_CACHE["data"]
+
+    return _CONTRACT_CACHE["data"]
+
+
+def get_contract(symbol: str) -> dict | None:
+    """
+    Полностью динамический поиск контракта BingX.
+    Автоматически находит FLOKI, 1000PEPE, 1MBABYDOGE, ANTHROPIC, 龙虾 и любые новые листинги.
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+
+    # Опциональный ручной оверрайд из ENV
+    if s in SYMBOL_MAP:
+        mapped = str(SYMBOL_MAP[s]).strip().upper()
+        if mapped:
+            c = _contracts().get(mapped) or _CONTRACT_CACHE.get("index", {}).get(mapped)
+            if c:
+                return c
+
+    _contracts()  # гарантирует актуальность кэша
+    index = _CONTRACT_CACHE.get("index", {})
+
+    # 1. Прямой поиск в авто-индексе
+    if s in index:
+        return index[s]
+
+    clean = _clean_ticker(s)
+    if not clean:
+        return None
+
+    variants = [clean]
+    for sfx in ("CTO", "OLD", "NEW", "2"):
+        if clean.endswith(sfx) and len(clean) > len(sfx) + 2:
+            variants.append(clean[:-len(sfx)])
+
+    for var in variants:
+        base = _strip_multiplier(var)
+        candidates = (
+            var,
+            f"{var}-USDT",
+            f"{var}USDT",
+            base,
+            f"{base}-USDT",
+            f"{base}USDT",
+        )
+        for cand in candidates:
+            if cand in index:
+                return index[cand]
+
+    # 2. Если монета только что залистилась и кэш старше 60с — обновляем
+    if time.time() - _CONTRACT_CACHE["ts"] > 60:
+        refresh = _refresh_contracts()
+        if refresh.get("status") == "ok":
+            index = _CONTRACT_CACHE.get("index", {})
+            for var in variants:
+                base = _strip_multiplier(var)
+                candidates = (
+                    var,
+                    f"{var}-USDT",
+                    f"{var}USDT",
+                    base,
+                    f"{base}-USDT",
+                    f"{base}USDT",
+                )
+                for cand in candidates:
+                    if cand in index:
+                        return index[cand]
+
+    return None
+
+
+def to_bx_symbol(symbol: str) -> str:
+    """Возвращает канонический тикер BingX (например, FLOKI-USDT или 1000PEPE-USDT)."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return symbol
+
+    if s in SYMBOL_MAP:
+        return str(SYMBOL_MAP[s]).strip().upper()
+
+    contract = get_contract(s)
+    if contract:
+        return str(contract.get("symbol", "")).strip().upper()
+
+    clean = _clean_ticker(s)
+    return f"{clean}-USDT" if clean else symbol
+
+
+def classify_bingx_contract(contract: dict | None) -> str:
+    if not contract:
+        return "unknown"
+
+    bx_symbol = str(contract.get("symbol", "")).strip().upper()
+
+    if bx_symbol.startswith(("NCSK", "NCSI")):
+        return "equity"
+
+    if bx_symbol.startswith("NCCO"):
+        return "commodity"
+
+    if bx_symbol.startswith("NCFX"):
+        return "forex"
+
+    return "crypto"
 
 
 def _tp_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
@@ -105,110 +339,6 @@ def _log_event(event: dict):
         log.error(f"bingx_orders.jsonl write failed: {e}")
 
 
-def _refresh_contracts() -> dict:
-    """Force a fresh /quote/contracts snapshot for execution decisions."""
-    now = time.time()
-    resp = _request("GET", CONTRACTS_PATH, signed=False)
-
-    if resp.get("code") != 0:
-        err = f"code={resp.get('code')} msg={resp.get('msg')}"
-        log.error(f"contracts refresh failed: {err}")
-        return {
-            "status": "error",
-            "error": err,
-        }
-
-    data = {}
-    by_display_name = {}
-
-    for c in resp.get("data", []) or []:
-        sym = str(c.get("symbol", "")).strip().upper()
-        display_name = str(c.get("displayName", "")).strip().upper()
-
-        if sym:
-            data[sym] = c
-
-        if display_name:
-            by_display_name[display_name] = c
-
-    _CONTRACT_CACHE.update(
-        {
-            "ts": now,
-            "data": data,
-            "by_display_name": by_display_name,
-        }
-    )
-
-    log.info(f"contracts refresh OK: {len(data)} contracts")
-
-    return {
-        "status": "ok",
-        "count": len(data),
-    }
-
-
-def _contracts() -> dict:
-    now = time.time()
-
-    if _CONTRACT_CACHE["data"] and now - _CONTRACT_CACHE["ts"] < _CONTRACT_TTL:
-        return _CONTRACT_CACHE["data"]
-
-    refresh = _refresh_contracts()
-
-    if refresh.get("status") == "ok":
-        return _CONTRACT_CACHE["data"]
-
-    return _CONTRACT_CACHE["data"]
-
-
-def get_contract(symbol: str) -> dict | None:
-    """Найти контракт BingX по тикеру."""
-    s = (symbol or "").strip().upper()
-
-    if not s:
-        return None
-
-    if s in SYMBOL_MAP:
-        mapped = str(SYMBOL_MAP[s]).strip().upper()
-        if mapped:
-            contract = _contracts().get(mapped)
-            if contract:
-                return contract
-
-    s = s.replace("-", "")
-
-    if s.endswith("USDT"):
-        s = s[:-4]
-
-    target = f"{s}-USDT"
-
-    contracts = _contracts()
-
-    contract = contracts.get(target)
-    if contract:
-        return contract
-
-    return _CONTRACT_CACHE["by_display_name"].get(target)
-
-
-def classify_bingx_contract(contract: dict | None) -> str:
-    if not contract:
-        return "unknown"
-
-    bx_symbol = str(contract.get("symbol", "")).strip().upper()
-
-    if bx_symbol.startswith(("NCSK", "NCSI")):
-        return "equity"
-
-    if bx_symbol.startswith("NCCO"):
-        return "commodity"
-
-    if bx_symbol.startswith("NCFX"):
-        return "forex"
-
-    return "crypto"
-
-
 def _normalize_orders_list(resp: dict) -> list:
     raw = resp.get("data", []) or []
     if isinstance(raw, dict):
@@ -221,29 +351,6 @@ def _normalize_orders_list(resp: dict) -> list:
 # ============================================================
 # SYMBOL / CONTRACT UTILS & QUANTUM ALLOCATION
 # ============================================================
-def to_bx_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-
-    if not s:
-        return symbol
-
-    if s in SYMBOL_MAP:
-        return str(SYMBOL_MAP[s]).strip().upper()
-
-    contract = get_contract(s)
-    if contract:
-        return str(contract.get("symbol", "")).strip().upper()
-
-    s = s.replace("-", "")
-    if s.endswith("USDT"):
-        s = s[:-4]
-
-    if not s:
-        return symbol
-
-    return f"{s}-USDT"
-
-
 def contract_exists(symbol: str) -> bool:
     contract = get_contract(symbol)
 
