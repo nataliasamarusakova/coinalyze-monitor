@@ -56,7 +56,7 @@ LAST_SCRAPE_PAGE_ERRORS = []
 COINALYZE_P_SID = os.environ.get("COINALYZE_P_SID", "")
 COINALYZE_CHAT_SID = os.environ.get("COINALYZE_CHAT_SID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+TG_CHAT_IDS = [chat_id.strip() for chat_id in os.environ.get("TG_CHAT_IDS", "").split(",") if chat_id.strip()]
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "false").lower() == "true"
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "")
@@ -1651,74 +1651,169 @@ def entry_earliness(r):
 
 
 def send_tg(text):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("TG not configured")
+    """
+    Отправка Telegram-сообщения всем получателям из TG_CHAT_IDS.
+
+    Env:
+        TG_BOT_TOKEN
+        TG_CHAT_IDS=123456789,690237815
+
+    Возвращает:
+        True  — все chunks доставлены всем получателям.
+        False — хотя бы один chunk одному получателю не доставлен.
+    """
+    if not TG_BOT_TOKEN:
+        log.warning("TG not configured: TG_BOT_TOKEN is empty")
         return False
+
+    if not TG_CHAT_IDS:
+        log.warning("TG not configured: TG_CHAT_IDS is empty")
+        return False
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+
+    # Telegram message limit + запас.
     chunks = []
-    rem = str(text)
-    while len(rem) > 3800:
-        pos = rem.rfind("\n", 0, 3800)
-        if pos <= 0:
-            pos = 3800
-        chunks.append(rem[:pos])
-        rem = rem[pos:]
-    chunks.append(rem)
+    remaining = str(text)
+
+    while len(remaining) > 3800:
+        split_at = remaining.rfind("\n", 0, 3800)
+
+        if split_at <= 0:
+            split_at = 3800
+
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    chunks.append(remaining)
+
     all_ok = True
-    for chunk in chunks:
-        delivered = False
-        for attempt in range(3):
-            try:
-                r = requests.post(
-                    url,
-                    data={
-                        "chat_id": TG_CHAT_ID,
-                        "text": chunk,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    try:
-                        if r.json().get("ok") is True:
+
+    for chat_id in TG_CHAT_IDS:
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            delivered = False
+
+            # ---------------------------
+            # HTML mode: до 3 попыток
+            # ---------------------------
+            for attempt in range(3):
+                try:
+                    response = requests.post(
+                        url,
+                        data={
+                            "chat_id": chat_id,
+                            "text": chunk,
+                            "parse_mode": "HTML",
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=15,
+                    )
+
+                    if response.status_code == 200:
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            payload = {}
+
+                        if payload.get("ok") is True:
                             delivered = True
                             break
-                    except Exception:
-                        pass
-                log.warning(
-                    f"TG HTML failed attempt={attempt + 1}/3 status={r.status_code}"
-                )
-            except Exception as e:
-                log.error(f"TG HTML exception attempt={attempt + 1}/3: {e}")
-            if attempt < 2:
-                time.sleep(1.0 + attempt)
-        if not delivered:
-            try:
-                fallback = requests.post(
-                    url,
-                    data={
-                        "chat_id": TG_CHAT_ID,
-                        "text": chunk,
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=15,
-                )
-                if fallback.status_code == 200:
-                    try:
-                        delivered = fallback.json().get("ok") is True
-                    except Exception:
-                        delivered = False
-                if not delivered:
-                    log.error(
-                        f"TG fallback failed: status={fallback.status_code} body={fallback.text[:200]}"
+
+                        log.warning(
+                            "Telegram rejected message: "
+                            f"chat_id={chat_id} "
+                            f"chunk={chunk_index}/{len(chunks)} "
+                            f"attempt={attempt + 1}/3 "
+                            f"response={str(payload)[:300]}"
+                        )
+                    else:
+                        log.warning(
+                            "Telegram HTTP error: "
+                            f"chat_id={chat_id} "
+                            f"chunk={chunk_index}/{len(chunks)} "
+                            f"attempt={attempt + 1}/3 "
+                            f"status={response.status_code} "
+                            f"body={response.text[:200]}"
+                        )
+
+                except requests.RequestException as exc:
+                    log.warning(
+                        "Telegram request error: "
+                        f"chat_id={chat_id} "
+                        f"chunk={chunk_index}/{len(chunks)} "
+                        f"attempt={attempt + 1}/3: {exc}"
                     )
-            except Exception as e:
-                log.error(f"TG fallback exception: {e}")
-        if not delivered:
-            all_ok = False
-            log.error("TG message chunk was NOT delivered")
-        time.sleep(0.4)
+
+                except Exception as exc:
+                    log.exception(
+                        "Telegram unexpected error: "
+                        f"chat_id={chat_id} "
+                        f"chunk={chunk_index}/{len(chunks)} "
+                        f"attempt={attempt + 1}/3: {exc}"
+                    )
+
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+
+            # ---------------------------
+            # Fallback: без HTML
+            # ---------------------------
+            if not delivered:
+                try:
+                    response = requests.post(
+                        url,
+                        data={
+                            "chat_id": chat_id,
+                            "text": chunk,
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=15,
+                    )
+
+                    if response.status_code == 200:
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            payload = {}
+
+                        delivered = payload.get("ok") is True
+
+                    if not delivered:
+                        log.error(
+                            "Telegram fallback failed: "
+                            f"chat_id={chat_id} "
+                            f"chunk={chunk_index}/{len(chunks)} "
+                            f"status={response.status_code} "
+                            f"body={response.text[:300]}"
+                        )
+
+                except requests.RequestException as exc:
+                    log.error(
+                        "Telegram fallback request error: "
+                        f"chat_id={chat_id} "
+                        f"chunk={chunk_index}/{len(chunks)}: {exc}"
+                    )
+
+                except Exception as exc:
+                    log.exception(
+                        "Telegram fallback unexpected error: "
+                        f"chat_id={chat_id} "
+                        f"chunk={chunk_index}/{len(chunks)}: {exc}"
+                    )
+
+            if not delivered:
+                all_ok = False
+
+                log.error(
+                    "Telegram delivery failed: "
+                    f"chat_id={chat_id} "
+                    f"chunk={chunk_index}/{len(chunks)}"
+                )
+
+                # Следующий получатель всё равно должен получить сообщение,
+                # даже если текущему доставка не удалась.
+                break
+
     return all_ok
 
 def should_notify_bingx_skip(existing: dict, reason: str, ts: int) -> bool:
