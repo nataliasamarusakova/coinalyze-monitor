@@ -626,13 +626,29 @@ def _append_execution_event_durable(event):
         return False
 
 
-TA_DIRECTION_GATE_VERSION = 1
+TA_DIRECTION_GATE_VERSION = 2
 TA_DIRECTION_MATCH = "LONG"
 
 
-def ta_direction_allows_long(ta_data):
+def ta_direction_allows_long(ta_data: dict | None) -> tuple[bool, str]:
+    """
+    Проверка технического контекста перед открытием LONG:
+    1. Блокирует вход, если на 1H или 4H обнаружена медвежья дивергенция
+       прямо под уровнем сопротивления (divergence_at_resistance == True).
+    2. Проверяет общее направление старших таймфреймов (только LONG).
+    """
     if not isinstance(ta_data, dict):
         return False, "unavailable"
+
+    # 1. ЗАЩИТА: Блокировка при медвежьей RSI-дивергенции прямо у сопротивления
+    market_context = ta_data.get("market_context") or {}
+    if isinstance(market_context, dict):
+        for tf in ("1h", "4h"):
+            tf_ctx = market_context.get(tf) or {}
+            if isinstance(tf_ctx, dict) and tf_ctx.get("divergence_at_resistance") is True:
+                return False, f"divergence_at_resistance_{tf}"
+
+    # 2. ПРОВЕРКА НАПРАВЛЕНИЯ ТРЕНДА
     result = str(ta_data.get("result_label") or "").strip().upper()
     if result == TA_DIRECTION_MATCH:
         return True, "long"
@@ -643,7 +659,8 @@ def ta_direction_allows_long(ta_data):
     return False, "unknown"
 
 
-def _ta_direction_snapshot(ta_data):
+def _ta_direction_snapshot(ta_data: dict | None) -> dict | None:
+    """Сохраняет полный снимок технического анализа и рыночного контекста для аудита."""
     if not isinstance(ta_data, dict):
         return None
     return {
@@ -654,6 +671,7 @@ def _ta_direction_snapshot(ta_data):
         "long_evidence": ta_data.get("long_evidence"),
         "short_evidence": ta_data.get("short_evidence"),
         "timeframes": {k: dict(v) for k, v in (ta_data.get("timeframes") or {}).items() if isinstance(v, dict)},
+        "market_context": {k: dict(v) for k, v in (ta_data.get("market_context") or {}).items() if isinstance(v, dict)},
     }
 
 
