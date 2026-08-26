@@ -2934,16 +2934,16 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
             )
             for o in orphans[:12]
         )
-        send_tg(
-            f"🔺 <b>Сверка: позиции на бирже без учёта в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
-            f"{len(orphans)} шт.\n{lines}\n"
-            + (
-                "<i>Автозакрытие включено.</i>"
-                if RECONCILE_AUTOCLOSE
-                else "<i>Автозакрытие выключено — закрыть вручную или включить "
-                "BINGX_RECONCILE_AUTOCLOSE=true.</i>"
-            )
-        )
+       # send_tg(
+       #     f"🔺 <b>Сверка: позиции на бирже без учёта в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
+       #     f"{len(orphans)} шт.\n{lines}\n"
+       #     + (
+       #         "<i>Автозакрытие включено.</i>"
+       #         if RECONCILE_AUTOCLOSE
+       #         else "<i>Автозакрытие выключено — закрыть вручную или включить "
+       #         "BINGX_RECONCILE_AUTOCLOSE=true.</i>"
+       #     )
+       # )
     for m in missing:
         sym = m["symbol"]
         entry = wl_all.get(sym)
