@@ -11,14 +11,9 @@ from conditions import (
     check_early_move,
     check_accumulation,
     closest_miss_for_confirmed,
-    safe,
 )
 
-try:
-    from monitor import SIGNAL_LOGIC_VERSION, TRADE_WIN_PCT
-except Exception:
-    SIGNAL_LOGIC_VERSION = 1
-    TRADE_WIN_PCT = 1.0
+from monitor import SIGNAL_LOGIC_VERSION, TRADE_WIN_PCT
 
 BASE = Path(__file__).resolve().parent
 MARKET_HISTORY = BASE / "market_history.jsonl"
