@@ -79,11 +79,6 @@ CONFIG = {
     "live_verdict_equals": "v3 (kofn, density_gate, net_change)",
 }
 
-def safe(val, default=0.0):
-    """Оставлено для обратной совместимости. В новых предикатах НЕ применяется
-    к значениям, у которых 0 — осмысленная величина (см. И5)."""
-    return val if val is not None else default
-
 CONFIRMED_A_SNAPS=5; CONFIRMED_A_OI_MIN=5.0; CONFIRMED_A_CVD_MIN=55.0
 CONFIRMED_A_FR_MAX=0.05; CONFIRMED_A_LLS_MAX=40.0
 CONFIRMED_A_PC_TOLERANCE=0.5; CONFIRMED_A_OI_TOLERANCE=1.0; CONFIRMED_A_CVD_TOLERANCE=5.0
@@ -412,7 +407,6 @@ def _closest_fail(result):
 # ═══════════════════════════════════════════════════════════════════════════
 SHADOW_VARIANTS=(
     ("live",      dict(kofn=True,  dense=True,  net=True)),   # текущий боевой = v3
-    ("v1_legacy", dict(kofn=False, dense=False, net=False)),  # устаревший v1
     ("kofn_only", dict(kofn=True,  dense=False, net=False)),  # только И1
     ("dense_only",dict(kofn=False, dense=True,  net=False)),  # только И3
     ("kofn_dense",dict(kofn=True,  dense=True,  net=False)),  # И1+И3

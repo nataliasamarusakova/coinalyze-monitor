@@ -231,10 +231,10 @@ def classify_quality(forward_returns, movement_snaps):
         }
 
     if len(movement_snaps) >= 3:
-        oi_start = safe(movement_snaps[0].get("oi_chg24_pct"))
-        oi_end = safe(movement_snaps[-1].get("oi_chg24_pct"))
-        cvd_start = safe(movement_snaps[0].get("cvd24"))
-        cvd_end = safe(movement_snaps[-1].get("cvd24"))
+        oi_start = (movement_snaps[0].get("oi_chg24_pct") if movement_snaps[0].get("oi_chg24_pct") is not None else 0.0)
+        oi_end = (movement_snaps[-1].get("oi_chg24_pct") if movement_snaps[-1].get("oi_chg24_pct") is not None else 0.0)
+        cvd_start = (movement_snaps[0].get("cvd24") if movement_snaps[0].get("cvd24") is not None else 0.0)
+        cvd_end = (movement_snaps[-1].get("cvd24") if movement_snaps[-1].get("cvd24") is not None else 0.0)
 
         oi_rising = oi_end > oi_start
         cvd_rising = cvd_end > cvd_start
@@ -475,14 +475,14 @@ def determine_fail_point(sym, movement_snaps, lifecycle_state, cvd_momentum):
 def compute_cvd_momentum(snaps):
     if len(snaps) >= 4:
         return (
-            safe(snaps[-1].get("cvd24"))
-            - safe(snaps[-4].get("cvd24"))
+            (snaps[-1].get("cvd24") if snaps[-1].get("cvd24") is not None else 0.0)
+            - (snaps[-4].get("cvd24") if snaps[-4].get("cvd24") is not None else 0.0)
         )
 
     elif len(snaps) >= 2:
         return (
-            safe(snaps[-1].get("cvd24"))
-            - safe(snaps[0].get("cvd24"))
+            (snaps[-1].get("cvd24") if snaps[-1].get("cvd24") is not None else 0.0)
+            - (snaps[0].get("cvd24") if snaps[0].get("cvd24") is not None else 0.0)
         )
 
     return 0.0
@@ -721,4 +721,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-

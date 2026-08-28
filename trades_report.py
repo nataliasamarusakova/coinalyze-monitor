@@ -285,30 +285,11 @@ def first_value(row, *keys):
 
 
 def get_forward_return(row, horizon):
-    """
-    Поддерживает:
-
-        return_60m
-        return_120m
-        return_240m
-
-    Для unentered:
-
-        forward_60m
-        forward_120m
-        forward_240m
-
-    Дополнительные варианты существуют только для
-    исследовательской устойчивости loader-а.
-    """
-
     return first_numeric(
         row,
         f"return_{horizon}m",
         f"forward_{horizon}m",
-        f"forward_return_{horizon}m",
     )
-
 
 def get_mfe(r):
     value = numeric(
@@ -1320,57 +1301,13 @@ def parse_timestamp(value):
 
 
 def history_symbol(row):
-    return (
-        row.get("symbol")
-        or row.get("ticker")
-        or row.get("pair")
-        or row.get("instrument")
-        or row.get("contract")
-    )
-
+    return row.get("symbol")
 
 def history_timestamp(row):
-    for key in (
-        "ts",
-        "timestamp",
-        "time",
-        "timestamp_ms",
-        "ts_ms",
-        "datetime",
-        "date",
-    ):
-        value = row.get(key)
-
-        if value is None:
-            continue
-
-        parsed = parse_timestamp(
-            value
-        )
-
-        if parsed is not None:
-            return parsed
-
-    return None
-
+    return parse_timestamp(row.get("ts"))
 
 def history_price(row):
-    for key in (
-        "price",
-        "close",
-        "last_price",
-        "mark_price",
-        "mid_price",
-    ):
-        value = numeric(
-            row.get(key)
-        )
-
-        if value is not None:
-            return value
-
-    return None
-
+    return numeric(row.get("price"))
 
 def load_market_history(path):
     """
@@ -1581,22 +1518,10 @@ def nearest_history_price(
 
 
 def get_exit_ts(row):
-    return first_numeric(
-        row,
-        "exit_ts",
-        "closed_ts",
-        "close_ts",
-    )
-
+    return first_numeric(row, "exit_ts")
 
 def get_exit_price(row):
-    return first_numeric(
-        row,
-        "exit_price",
-        "close_price",
-        "closed_price",
-    )
-
+    return first_numeric(row, "exit_price")
 
 def analyze_post_exit(rows, history):
     """
@@ -1679,10 +1604,7 @@ def analyze_post_exit(rows, history):
             missing_exit_price += 1
             continue
 
-        symbol = (
-            r.get("symbol")
-            or r.get("ticker")
-        )
+        symbol = r.get("symbol")
 
         if not symbol:
             missing_history += 1
@@ -2175,12 +2097,7 @@ def unentered_detection_ts(row):
 
 
 def unentered_symbol(row):
-    return (
-        row.get("symbol")
-        or row.get("ticker")
-        or "?"
-    )
-
+    return row.get("symbol") or "?"
 
 def unentered_forward_60(row):
     return get_forward_return(
@@ -3320,23 +3237,10 @@ CHURN_INTERVAL_BUCKETS = [30, 60, 120, 240]
 
 
 def get_entry_ts(row):
-    return first_numeric(
-        row,
-        "entry_ts",
-        "open_ts",
-        "opened_ts",
-    )
-
+    return first_numeric(row, "entry_ts")
 
 def get_entry_price(row):
-    return first_numeric(
-        row,
-        "entry_price",
-        "open_price",
-        "opened_price",
-        "price_at_entry",
-    )
-
+    return first_numeric(row, "entry_price")
 
 def history_return_at(history, symbol, base_ts, base_price, minutes):
     if base_ts is None or base_price is None or base_price <= 0:
@@ -3361,8 +3265,7 @@ def history_price_at(history, symbol, ts):
 
 
 def get_symbol(row):
-    return row.get("symbol") or row.get("ticker") or row.get("pair")
-
+    return row.get("symbol")
 
 def analyze_stop_loss_trajectory(rows, history):
     """

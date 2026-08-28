@@ -503,10 +503,6 @@ def _qty_for(c: dict, price: float, leverage: int):
     return qty, prec, min_required_qty
 
 
-def _is_reduce_only(value) -> bool:
-    return value in (True, "true", "TRUE", 1, "1")
-
-
 # ============================================================
 # TRADE ID HASH / CLIENT ORDER ID
 # ============================================================
@@ -530,30 +526,21 @@ def build_tp_client_order_id(leg: str, trade_id: str = None) -> str:
 def parse_tp_client_order_id(client_id: str) -> dict | None:
     if not client_id:
         return None
-    upper_id = client_id.upper()
-    if not upper_id.startswith(TP_CLIENT_ORDER_PREFIX):
-        return None
-    parts = upper_id.split("_")
+    parts = client_id.upper().split("_")
     valid_legs_upper = {leg.upper() for leg in VALID_TP_LEGS}
-    if len(parts) < 4 or parts[0] != "CM" or parts[1] != "TP":
+    if (
+        len(parts) != 4
+        or parts[0] != "CM"
+        or parts[1] != "TP"
+        or not _is_hex8(parts[2])
+        or parts[3] not in valid_legs_upper
+    ):
         return None
-    if len(parts) == 4 and _is_hex8(parts[2]) and parts[3] in valid_legs_upper:
-        return {
-            "trade_id": None,
-            "trade_hash": parts[2].lower(),
-            "leg": parts[3].lower(),
-        }
-    if len(parts) == 5 and _is_hex8(parts[2]) and parts[3] in valid_legs_upper:
-        return {
-            "trade_id": None,
-            "trade_hash": parts[2].lower(),
-            "leg": parts[3].lower(),
-        }
-    if len(parts) >= 6 and parts[4] in valid_legs_upper:
-        return {"trade_id": parts[2], "trade_hash": None, "leg": parts[4].lower()}
-    if parts[3] in valid_legs_upper:
-        return {"trade_id": None, "trade_hash": None, "leg": parts[3].lower()}
-    return None
+    return {
+        "trade_id": None,
+        "trade_hash": parts[2].lower(),
+        "leg": parts[3].lower(),
+    }
 
 
 def build_sl_client_order_id(trade_id: str = None) -> str:
@@ -570,15 +557,15 @@ def build_open_client_order_id(symbol: str, trade_id: str = None) -> str:
 def parse_sl_client_order_id(client_id: str) -> dict | None:
     if not client_id:
         return None
-    upper_id = client_id.upper()
-    if not upper_id.startswith(SL_CLIENT_ORDER_PREFIX):
+    parts = client_id.upper().split("_")
+    if (
+        len(parts) != 3
+        or parts[0] != "CM"
+        or parts[1] != "SL"
+        or not _is_hex8(parts[2])
+    ):
         return None
-    parts = upper_id.split("_")
-    if len(parts) == 3 and parts[0] == "CM" and parts[1] == "SL":
-        return {"trade_hash": parts[2].lower()}
-    if len(parts) == 4 and parts[0] == "CM" and parts[1] == "SL":
-        return {"trade_hash": parts[2].lower()}
-    return None
+    return {"trade_hash": parts[2].lower()}
 
 
 def _sl_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
