@@ -2225,20 +2225,88 @@ def _attempt_exchange_close(ot, symbol):
     bx = ot.get("bingx") or {}
     if bx.get("status") not in ("opened", "already_open"):
         return "not_applicable"
-    qty_to_close = safe(
+    # Before any exchange close, refresh the authoritative position size.
+    # A failed global reconciliation must never cause us to trust stale local
+    # qty_remaining and submit a close for an unknown/incorrect quantity.
+    try:
+        import bingx_client
+        position_check = bingx_client.get_position(symbol)
+    except Exception as e:
+        log.error(f"[{symbol}] EXCHANGE_CLOSE position check exception: {e}")
+        return "unconfirmed"
+
+    position_status = position_check.get("status")
+    if position_status == "error":
+        err = str(position_check.get("error", "position check failed"))[:500]
+        bx["qty_resync_required"] = True
+        bx["qty_resync_error"] = err
+        ot["bingx"] = bx
+        log.error(
+            f"[{symbol}] EXCHANGE_CLOSE blocked: authoritative position check failed: {err}"
+        )
+        return "unconfirmed"
+
+    if position_status == "not_found":
+        bx["qty_remaining"] = 0.0
+        bx["qty_exchange_confirmed"] = True
+        bx.pop("qty_resync_required", None)
+        bx.pop("qty_resync_error", None)
+        ot["bingx"] = bx
+        return "confirmed"
+
+    if position_status != "found":
+        bx["qty_resync_required"] = True
+        bx["qty_resync_error"] = f"unexpected position status={position_status}"
+        ot["bingx"] = bx
+        log.error(
+            f"[{symbol}] EXCHANGE_CLOSE blocked: unexpected position status={position_status}"
+        )
+        return "unconfirmed"
+
+    try:
+        exchange_qty = float(position_check.get("positionAmt", 0) or 0)
+    except (TypeError, ValueError):
+        bx["qty_resync_required"] = True
+        bx["qty_resync_error"] = f"invalid exchange positionAmt={position_check.get('positionAmt')!r}"
+        ot["bingx"] = bx
+        log.error(f"[{symbol}] EXCHANGE_CLOSE blocked: invalid exchange positionAmt")
+        return "unconfirmed"
+
+    if exchange_qty <= 0:
+        bx["qty_remaining"] = 0.0
+        bx["qty_exchange_confirmed"] = True
+        bx.pop("qty_resync_required", None)
+        bx.pop("qty_resync_error", None)
+        ot["bingx"] = bx
+        return "confirmed"
+
+    local_qty = safe(
         bx.get("qty_remaining"),
         safe(bx.get("qty"), 0.0),
     )
-    if not qty_to_close or qty_to_close <= 0:
-        return "confirmed"
-    try:
-        import bingx_client
+    qty_to_close = exchange_qty
+    if local_qty and abs(local_qty - exchange_qty) > 1e-12:
+        log.warning(
+            f"[{symbol}] EXCHANGE_CLOSE qty resync {local_qty} → {exchange_qty}"
+        )
+    bx["qty_remaining"] = exchange_qty
+    bx["qty_exchange_confirmed"] = True
+    bx.pop("qty_resync_required", None)
+    bx.pop("qty_resync_error", None)
+    ot["bingx"] = bx
 
+    try:
+        trade_id = ot.get("trade_id_full")
+        try:
+            close_attempt = max(0, int(ot.get("close_attempt", 0) or 0))
+        except (TypeError, ValueError):
+            close_attempt = 0
         res = bingx_client.close_long(
             symbol,
             qty_to_close,
             cancel_tp=True,
-            trade_id=ot.get("trade_id_full"),
+            trade_id=trade_id,
+            close_attempt=close_attempt,
         )
     except Exception as e:
         log.error(f"[{symbol}] EXCHANGE_CLOSE exception: {e}")
@@ -2290,6 +2358,35 @@ def _attempt_exchange_close(ot, symbol):
             trade_id=ot.get("trade_id_full"),
         )
         return "confirmed"
+
+    if status == "close_retryable":
+        try:
+            next_attempt = int(res.get("next_close_attempt"))
+            if next_attempt <= int(ot.get("close_attempt", 0) or 0):
+                next_attempt = int(ot.get("close_attempt", 0) or 0) + 1
+        except (TypeError, ValueError):
+            next_attempt = int(ot.get("close_attempt", 0) or 0) + 1
+        ot["close_attempt"] = next_attempt
+        log.warning(
+            f"[{symbol}] previous close order is terminal ({res.get('previous_order_status')}); "
+            f"next close attempt will use attempt={next_attempt}"
+        )
+        return "unconfirmed"
+
+    if (
+        status == "close_pending"
+        and res.get("recovery_check") == "position_still_open_after_filled_close"
+        and float(res.get("remaining_qty", 0.0) or 0.0) > 0
+    ):
+        try:
+            ot["close_attempt"] = max(0, int(ot.get("close_attempt", 0) or 0)) + 1
+        except (TypeError, ValueError):
+            ot["close_attempt"] = 1
+        log.warning(
+            f"[{symbol}] previous close order already FILLED but position remains; "
+            f"next close attempt will use a new deterministic clientOrderId "
+            f"attempt={ot['close_attempt']}"
+        )
 
     log.error(
         f"[{symbol}] BingX CLOSE НЕ подтверждён: "
@@ -2348,21 +2445,102 @@ def close_trade(
 
     bx = ot.get("bingx") or {}
     tpf = bx.get("tp_fills") or {}
+    tp_fill_meta = bx.get("tp_fill_meta") or {}
+    slf = bx.get("sl_fills") or {}
+    sl_fill_meta = bx.get("sl_fill_meta") or {}
     qty_initial = safe(bx.get("qty_initial"), safe(bx.get("qty"), 0.0))
     tp_orders = {str(o.get("order_id")): o for o in bx.get("tp_orders", [])}
 
-    if tpf and qty_initial and qty_initial > 0 and ep and ep > 0:
+    # These are immutable entry-time research values captured by
+    # open_trade_record(). close_trade() must read them from the trade state
+    # rather than relying on local variables that only exist in the entry
+    # path. This also guarantees the same values survive restart/recovery.
+    entry_short_liq_share24 = ot.get("entry_short_liq_share24")
+    entry_liq_imbalance = ot.get("entry_liq_imbalance")
+    entry_funding_oi_pressure = ot.get("entry_funding_oi_pressure")
+    entry_liquidation_intensity = ot.get("entry_liquidation_intensity")
+    entry_fr_oiw_zscore = ot.get("entry_fr_oiw_zscore")
+
+    if (tpf or slf) and qty_initial and qty_initial > 0 and ep and ep > 0:
         realized_weighted_pnl = 0.0
         total_closed_qty = 0.0
-        for oid, filled_qty in tpf.items():
-            o = tp_orders.get(str(oid))
-            tp_price = o.get("price") if o else None
-            if not tp_price and o and o.get("pnl_pct"):
-                tp_price = ep * (1.0 + o["pnl_pct"] / 100.0)
-            if tp_price:
-                leg_pnl = (tp_price - ep) / ep * 100.0
+
+        # Durable execution journal is the canonical source for realized
+        # partial fills.  One order can receive multiple partial fills, so
+        # summing cumulative executed_qty/avg_price from the final order
+        # snapshot would double-count earlier fills.  Each durable event
+        # stores the delta quantity and execution-time price separately.
+        journal_events = load_jsonl(EXECUTION_EVENTS_FILE)
+        fill_events = []
+        trade_id = ot.get("trade_id_full")
+        for event in journal_events:
+            if event.get("symbol") != symbol:
+                continue
+            if not trade_id or event.get("trade_id") != trade_id:
+                continue
+            kind = str(event.get("kind", ""))
+            if not (kind.startswith("tp_") and kind.endswith("_filled") or kind in {"sl_filled", "sl_filled_partial"}):
+                continue
+            try:
+                q = float(event.get("executed_qty", 0) or 0)
+                px = event.get("execution_avg_price", event.get("avg_price"))
+                px = float(px) if px is not None else None
+            except (TypeError, ValueError):
+                continue
+            if q <= 0 or px is None or px <= 0:
+                continue
+            fill_events.append((event, q, px))
+
+        if fill_events:
+            for event, filled_qty, fill_price in fill_events:
+                leg_pnl = (fill_price - ep) / ep * 100.0
                 realized_weighted_pnl += (filled_qty / qty_initial) * leg_pnl
                 total_closed_qty += filled_qty
+        else:
+            # Backward-compatible fallback for records created before the
+            # durable execution-price fields existed. For a clean-start
+            # project this path should not be needed, but keeping it prevents
+            # a malformed/missing journal from inventing a zero PnL.
+            for oid, filled_qty in tpf.items():
+                oid = str(oid)
+                meta = tp_fill_meta.get(oid) or {}
+                o = tp_orders.get(oid)
+                try:
+                    filled_qty = float(filled_qty or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if filled_qty <= 0:
+                    continue
+                tp_price = meta.get("delta_avg_price") or meta.get("avg_price")
+                if tp_price is None and o:
+                    tp_price = o.get("price")
+                try:
+                    tp_price = float(tp_price) if tp_price is not None else None
+                except (TypeError, ValueError):
+                    tp_price = None
+                if tp_price and tp_price > 0:
+                    leg_pnl = (tp_price - ep) / ep * 100.0
+                    realized_weighted_pnl += (filled_qty / qty_initial) * leg_pnl
+                    total_closed_qty += filled_qty
+
+            for oid, filled_qty in slf.items():
+                oid = str(oid)
+                meta = sl_fill_meta.get(oid) or {}
+                try:
+                    filled_qty = float(filled_qty or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if filled_qty <= 0:
+                    continue
+                sl_price = meta.get("delta_avg_price") or meta.get("avg_price")
+                try:
+                    sl_price = float(sl_price) if sl_price is not None else None
+                except (TypeError, ValueError):
+                    sl_price = None
+                if sl_price and sl_price > 0:
+                    leg_pnl = (sl_price - ep) / ep * 100.0
+                    realized_weighted_pnl += (filled_qty / qty_initial) * leg_pnl
+                    total_closed_qty += filled_qty
 
         rem_fraction = max(0.0, 1.0 - (total_closed_qty / qty_initial))
         if exit_price and ep and not outcome_unknown:
@@ -2553,10 +2731,19 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
         trade_id = str(trade_id) if trade_id else None
         opened_ts = ot.get("opened_ts", ot.get("entry_ts", 0))
         processed_fills = bx.setdefault("tp_fills", {})
+        filled_legs_state = {
+            str(x).lower()
+            for x in (bx.get("tp_filled_legs") or [])
+            if x
+        }
         qty_initial = safe(bx.get("qty_initial"), safe(bx.get("qty"), 0.0))
         qty_remaining = safe(bx.get("qty_remaining"), qty_initial)
         result = bingx_client.compute_new_tp_fills(
-            symbol, trade_id, opened_ts, processed_fills
+            symbol,
+            trade_id,
+            opened_ts,
+            processed_fills,
+            processed_fill_meta=bx.get("tp_fill_meta") or {},
         )
         if result.get("status") != "ok":
             continue
@@ -2566,9 +2753,40 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
             executed_qty = filled["executed_qty_total"]
             delta_qty = filled["executed_qty_delta"]
             avg_price = filled["avg_price"]
+            delta_avg_price = filled.get("delta_avg_price") or avg_price
             fill_time_ms = filled["fill_time_ms"]
             status = filled["status"]
             new_qty_remaining = max(0.0, qty_remaining - delta_qty)
+            exchange_after_fill = None
+            position_state_unknown = False
+            try:
+                exchange_after_fill = bingx_client.get_position(symbol)
+            except Exception as e:
+                position_state_unknown = True
+                log.warning(
+                    f"[{symbol}] TP {leg}: post-fill position check failed: {e}"
+                )
+
+            if exchange_after_fill and exchange_after_fill.get("status") == "found":
+                try:
+                    new_qty_remaining = float(
+                        exchange_after_fill.get("positionAmt", new_qty_remaining)
+                    )
+                except (TypeError, ValueError):
+                    position_state_unknown = True
+            elif exchange_after_fill and exchange_after_fill.get("status") == "not_found":
+                new_qty_remaining = 0.0
+            elif exchange_after_fill and exchange_after_fill.get("status") == "error":
+                position_state_unknown = True
+
+            # A TP fill is independently confirmed by allOrders, but after a
+            # fill we must not invent the remaining position size when the
+            # authoritative position query failed. Commit the fill journal
+            # and metadata, preserve the last known qty, and force protection
+            # reconciliation to resync the real exchange quantity on the next
+            # pass.
+            if position_state_unknown:
+                new_qty_remaining = qty_remaining
             if fill_time_ms > 0:
                 fill_ts = fill_time_ms / 1000.0
                 fill_time_text = time.strftime(
@@ -2579,8 +2797,8 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 fill_time_text = "unknown"
             entry_price = ot.get("entry_price")
             pnl_pct = (
-                (avg_price - entry_price) / entry_price * 100
-                if avg_price and entry_price
+                (delta_avg_price - entry_price) / entry_price * 100
+                if delta_avg_price and entry_price
                 else None
             )
             remaining_pct = (
@@ -2631,7 +2849,9 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                     executed_qty_total=executed_qty,
                     qty_before=qty_remaining,
                     qty_remaining=new_qty_remaining,
-                    avg_price=avg_price,
+                    avg_price=delta_avg_price,
+                    cumulative_avg_price=avg_price,
+                    execution_avg_price=delta_avg_price,
                     pnl_pct=(round(pnl_pct, 3) if pnl_pct is not None else None),
                     fill_ts=fill_ts,
                     fill_time_ms=fill_time_ms,
@@ -2647,6 +2867,21 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                 )
                 continue
             processed_fills[order_id] = executed_qty
+            if position_state_unknown:
+                bx["execution_status"] = "QTY_UNKNOWN_AFTER_TP_FILL"
+                bx["qty_resync_required"] = True
+            fill_meta = bx.setdefault("tp_fill_meta", {})
+            fill_meta[str(order_id)] = {
+                "leg": str(leg).lower(),
+                "avg_price": avg_price,
+                "delta_avg_price": delta_avg_price,
+                "executed_qty_total": executed_qty,
+                "fill_time_ms": fill_time_ms,
+                "client_order_id": filled.get("client_order_id"),
+            }
+            if filled.get("is_fully_filled"):
+                filled_legs_state.add(str(leg).lower())
+            bx["tp_filled_legs"] = sorted(filled_legs_state)
             qty_remaining = new_qty_remaining
             bx["qty_remaining"] = qty_remaining
             bx["execution_status"] = "PARTIAL_TP"
@@ -2698,11 +2933,13 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                     )
                 }
 
-                all_filled_legs = {leg}
+                all_filled_legs = set(filled_legs_state)
+                if filled.get("is_fully_filled"):
+                    all_filled_legs.add(str(leg).lower())
                 for fid in processed_fills:
                     for o in bx.get("tp_orders", []):
-                        if str(o.get("order_id")) == str(fid):
-                            all_filled_legs.add(o.get("leg"))
+                        if str(o.get("order_id")) == str(fid) and o.get("leg"):
+                            all_filled_legs.add(str(o.get("leg")).lower())
 
                 target_sl_price = None
                 sl_label = ""
@@ -2733,8 +2970,161 @@ def _process_filled_tps(wl_all, ts, price_full, exch):
                             f"[{symbol}] Trailing Stop обновлен: {target_sl_price:.6f} ({sl_label})"
                         ) 
         bx["tp_fills"] = processed_fills
+        bx["tp_fill_meta"] = bx.get("tp_fill_meta", {})
+        bx["tp_filled_legs"] = sorted(filled_legs_state)
         ot["bingx"] = bx
         entry["open_trade"] = ot
+    return changed
+
+
+
+def _process_filled_sls(wl_all, ts):
+    """Persist cumulative/partial SL fills without treating partial fill as full exit."""
+    try:
+        import bingx_client
+    except Exception as e:
+        log.error(f"SL reconcile: bingx_client недоступен: {e}")
+        return False
+
+    changed = False
+    for symbol, entry in wl_all.items():
+        ot = entry.get("open_trade")
+        if not ot:
+            continue
+        bx = ot.get("bingx") or {}
+        if bx.get("status") not in ("opened", "already_open"):
+            continue
+        trade_id = str(ot.get("trade_id_full")) if ot.get("trade_id_full") else None
+        opened_ts = ot.get("opened_ts", ot.get("entry_ts", 0))
+        processed = bx.setdefault("sl_fills", {})
+        meta_store = bx.setdefault("sl_fill_meta", {})
+
+        result = bingx_client.get_filled_sl_orders(
+            symbol, opened_ts=opened_ts, trade_id=trade_id
+        )
+        if result.get("status") != "ok":
+            continue
+
+        for filled in result.get("orders", []):
+            order_id = str(filled.get("order_id") or "")
+            if not order_id:
+                continue
+            executed_total = float(filled.get("executed_qty", 0.0) or 0.0)
+            previous_total = float(processed.get(order_id, 0.0) or 0.0)
+            delta_qty = executed_total - previous_total
+            if delta_qty <= 1e-12:
+                continue
+
+            avg_price = float(filled.get("avg_price", 0.0) or 0.0)
+            previous_meta = meta_store.get(order_id) or {}
+            previous_avg = float(previous_meta.get("avg_price", 0.0) or 0.0)
+            previous_qty = float(previous_meta.get("executed_qty_total", previous_total) or previous_total)
+            delta_avg_price = avg_price
+            if (
+                avg_price > 0
+                and previous_qty > 0
+                and previous_avg > 0
+                and executed_total > previous_qty
+            ):
+                delta_avg_price = (
+                    avg_price * executed_total - previous_avg * previous_qty
+                ) / delta_qty
+                if delta_avg_price <= 0:
+                    delta_avg_price = avg_price
+
+            # A confirmed SL fill changes the real position quantity. Do not
+            # infer the remaining size from local state: ask the exchange.
+            # On an unknown/error response, preserve the last known quantity
+            # and force reconciliation on the next pass.
+            position_state_unknown = False
+            try:
+                exchange_after_fill = bingx_client.get_position(symbol)
+            except Exception as e:
+                exchange_after_fill = {"status": "error", "error": str(e)}
+
+            if exchange_after_fill.get("status") == "found":
+                try:
+                    exchange_qty = float(exchange_after_fill.get("positionAmt", 0) or 0)
+                    if exchange_qty < 0:
+                        position_state_unknown = True
+                    else:
+                        bx["qty_remaining"] = exchange_qty
+                        bx["qty_exchange_confirmed"] = True
+                        bx.pop("qty_resync_required", None)
+                        bx.pop("qty_resync_error", None)
+                        if exchange_after_fill.get("avgPrice") is not None:
+                            bx["bingx_avg_price"] = exchange_after_fill.get("avgPrice")
+                except (TypeError, ValueError):
+                    position_state_unknown = True
+            elif exchange_after_fill.get("status") == "not_found":
+                bx["qty_remaining"] = 0.0
+                bx["qty_exchange_confirmed"] = True
+                bx.pop("qty_resync_required", None)
+                bx.pop("qty_resync_error", None)
+            else:
+                position_state_unknown = True
+                bx["qty_resync_required"] = True
+                bx["qty_resync_error"] = str(
+                    exchange_after_fill.get("error", "position state unknown")
+                )[:300]
+
+            fill_time_ms = int(filled.get("time", 0) or 0)
+            event_id = f"sl:{trade_id or 'unknown'}:{order_id}:{executed_total:.12f}"
+            existing_events = load_jsonl(EXECUTION_EVENTS_FILE)
+            already = any(
+                e.get("event_id") == event_id and e.get("symbol") == symbol
+                for e in existing_events
+            )
+            if not already:
+                ok = log_execution_event(
+                    symbol,
+                    "sl_filled_partial" if not filled.get("is_fully_filled") else "sl_filled",
+                    event_id=event_id,
+                    trade_id=trade_id,
+                    order_id=order_id,
+                    client_order_id=filled.get("client_order_id"),
+                    status=filled.get("status"),
+                    executed_qty=delta_qty,
+                    executed_qty_total=executed_total,
+                    avg_price=delta_avg_price,
+                    cumulative_avg_price=avg_price,
+                    execution_avg_price=delta_avg_price,
+                    fill_ts=(fill_time_ms / 1000.0 if fill_time_ms else None),
+                    fill_time_ms=fill_time_ms,
+                    source="bingx_order_history",
+                )
+                if not ok:
+                    log.error(
+                        f"[{symbol}] CRITICAL: SL fill journal write FAILED "
+                        f"order_id={order_id}; will retry next run"
+                    )
+                    continue
+
+            processed[order_id] = executed_total
+            meta_store[order_id] = {
+                "avg_price": avg_price,
+                "delta_avg_price": delta_avg_price,
+                "executed_qty_total": executed_total,
+                "fill_time_ms": fill_time_ms,
+                "client_order_id": filled.get("client_order_id"),
+                "is_fully_filled": bool(filled.get("is_fully_filled")),
+            }
+            bx["sl_fills"] = processed
+            bx["sl_fill_meta"] = meta_store
+            if filled.get("is_fully_filled"):
+                bx["sl_filled_order_ids"] = sorted(set(bx.get("sl_filled_order_ids", [])) | {order_id})
+                bx["execution_status"] = "FULL_SL_FILL_DETECTED"
+            else:
+                bx["execution_status"] = "PARTIAL_SL"
+            if position_state_unknown:
+                bx["execution_status"] = "QTY_UNKNOWN_AFTER_SL_FILL"
+            changed = True
+
+        bx["sl_fills"] = processed
+        bx["sl_fill_meta"] = meta_store
+        ot["bingx"] = bx
+        entry["open_trade"] = ot
+
     return changed
 
 
@@ -2776,8 +3166,9 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         )
         return {"status": "error", "error": res.get("error")}
     exch = res["positions"]
+    sl_changed = _process_filled_sls(wl_all, ts)
     tp_changed = _process_filled_tps(wl_all, ts, price_full, exch)
-    if tp_changed:
+    if sl_changed or tp_changed:
         save_watchlist(wl_all)
     journal = {}
     for sym, entry in wl_all.items():
@@ -2791,6 +3182,79 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
             "status": bx.get("status"),
             "trade_id": entry.get("trade_id"),
         }
+    # Local zero quantity is only a candidate state. Confirm it per symbol
+    # before removing the trade from persistent watch state.
+    zero_qty_confirmed = []
+    zero_qty_unresolved = []
+    for sym, record in list(journal.items()):
+        try:
+            local_qty = float(record.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            local_qty = 0.0
+        if local_qty > 0:
+            continue
+        entry = wl_all.get(sym)
+        ot = (entry or {}).get("open_trade")
+        if not ot:
+            continue
+        try:
+            pos_check = bingx_client.get_position(sym)
+        except Exception as e:
+            pos_check = {"status": "error", "error": str(e)}
+        status = pos_check.get("status")
+        if status == "error":
+            bx = ot.get("bingx") or {}
+            bx["qty_resync_required"] = True
+            bx["qty_resync_error"] = str(pos_check.get("error", "position check failed"))[:300]
+            ot["bingx"] = bx
+            entry["open_trade"] = ot
+            zero_qty_unresolved.append(sym)
+            continue
+        if status == "found" and float(pos_check.get("positionAmt", 0) or 0) > 0:
+            bx = ot.get("bingx") or {}
+            bx["status"] = "opened"
+            bx["qty_remaining"] = float(pos_check.get("positionAmt") or 0)
+            bx["qty_exchange_confirmed"] = True
+            bx.pop("qty_resync_required", None)
+            bx.pop("qty_resync_error", None)
+            if pos_check.get("avgPrice") is not None:
+                bx["bingx_avg_price"] = pos_check.get("avgPrice")
+            ot["bingx"] = bx
+            entry["open_trade"] = ot
+            zero_qty_unresolved.append(sym)
+            continue
+        if status == "not_found":
+            sl_exit = _detect_sl_exit(ot, sym)
+            if sl_exit:
+                exit_reason, cur, exit_price_source = sl_exit
+                lifecycle_complete = True
+            else:
+                exit_reason = "EXCHANGE_CLOSED"
+                lifecycle_complete = False
+                cur = ot.get("last_price")
+                exit_price_source = "last_seen" if cur else "unknown"
+            close_trade(
+                ot, sym, ts, cur or None, exit_reason, entry.get("state", "UNKNOWN"),
+                price_full, exit_price_source=exit_price_source,
+                exit_candidates=[exit_reason], lifecycle_complete=lifecycle_complete,
+                exchange_close_status="confirmed",
+            )
+            cd = COOLDOWN_BY_EXIT_REASON.get(exit_reason, 60)
+            lrec = lifecycle_state.setdefault(sym, {})
+            lrec["cooldown_until"] = ts + cd * 60
+            lrec["last_exit_reason"] = exit_reason
+            lrec["last_exit_ts"] = ts
+            lrec["last_exit_price"] = cur or ot.get("last_price")
+            lrec.setdefault("idea_first_seen_ts", ot.get("idea_first_seen_ts") or ts)
+            entry.pop("open_trade", None)
+            entry.pop("trade_id", None)
+            zero_qty_confirmed.append(sym)
+            continue
+        zero_qty_unresolved.append(sym)
+
+    if zero_qty_confirmed:
+        save_watchlist(wl_all)
+
     ours = {v["bx_symbol"]: sym for sym, v in journal.items()}
     orphans = []
     missing = []
@@ -2852,16 +3316,17 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         log.error(f"RECONCILE ORPHAN {o['bx_symbol']} qty={o['qty']} — нет в журнале")
         if RECONCILE_AUTOCLOSE:
             try:
-                tp_cancel = bingx_client.cancel_take_profit_orders(o["bx_symbol"])
-                sl_cancel = bingx_client.cancel_stop_loss_orders(o["bx_symbol"])
-                log.info(
-                    f"RECONCILE ORPHAN {o['bx_symbol']} TP/SL cancel: "
-                    f"tp={tp_cancel.get('status')} sl={sl_cancel.get('status')}"
+                # Use the canonical close path exactly once. close_long() owns
+                # TP/SL cancellation, verifies it, then performs the idempotent
+                # MARKET close. Avoid a separate pre-cancel here: it caused
+                # duplicate DELETE calls and an unnecessary state-change window.
+                r = bingx_client.close_long(
+                    o["bx_symbol"],
+                    float(o["qty"]),
+                    cancel_tp=True,
+                    trade_id=None,
                 )
-                r = bingx_client._close_position(o["bx_symbol"], float(o["qty"]))
                 o["autoclose_result"] = r
-                o["tp_cancel_status"] = tp_cancel.get("status")
-                o["sl_cancel_status"] = sl_cancel.get("status")
                 log.info(
                     f"RECONCILE ORPHAN {o['bx_symbol']} автозакрытие: {r.get('status')}"
                 )
@@ -2887,12 +3352,68 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
                 "BINGX_RECONCILE_AUTOCLOSE=true.</i>"
             )
         )
+    missing_confirmed_closed = []
+    missing_unresolved = []
     for m in missing:
         sym = m["symbol"]
         entry = wl_all.get(sym)
         ot = (entry or {}).get("open_trade")
         if not ot:
             continue
+
+        # A successful list_positions() response is not enough to finalize a
+        # single missing position. Confirm absence with the authoritative
+        # per-symbol endpoint before mutating local trade state. This prevents
+        # a transient/incomplete position-list response from closing the local
+        # trade record while the exchange position still exists.
+        try:
+            pos_check = bingx_client.get_position(sym)
+        except Exception as e:
+            pos_check = {"status": "error", "error": str(e)}
+
+        pos_status = pos_check.get("status")
+        if pos_status == "error":
+            m["resolution"] = "unresolved_position_check_error"
+            m["position_check_error"] = str(pos_check.get("error", "unknown"))[:300]
+            missing_unresolved.append(m)
+            log.error(
+                f"RECONCILE MISSING {sym} — per-symbol position check failed; "
+                f"local trade remains OPEN: {m['position_check_error']}"
+            )
+            continue
+
+        if pos_status == "found" and float(pos_check.get("positionAmt", 0) or 0) > 0:
+            # list_positions() omitted a position that get_position() can see.
+            # Treat this as a reconciliation inconsistency, not as a close.
+            m["resolution"] = "position_still_open"
+            m["exchange_qty"] = float(pos_check.get("positionAmt") or 0)
+            missing_unresolved.append(m)
+            bx = ot.get("bingx") or {}
+            bx["status"] = "opened"
+            bx["qty_remaining"] = m["exchange_qty"]
+            bx["qty_exchange_confirmed"] = True
+            if pos_check.get("avgPrice") is not None:
+                bx["bingx_avg_price"] = pos_check.get("avgPrice")
+            ot["bingx"] = bx
+            entry["open_trade"] = ot
+            log.error(
+                f"RECONCILE MISSING {sym} — list_positions omitted live position; "
+                f"get_position confirms qty={m['exchange_qty']}. Trade remains OPEN."
+            )
+            save_watchlist(wl_all)
+            continue
+
+        if pos_status != "not_found":
+            m["resolution"] = f"unexpected_position_status:{pos_status}"
+            missing_unresolved.append(m)
+            log.error(
+                f"RECONCILE MISSING {sym} — unexpected per-symbol status={pos_status}; "
+                f"trade remains OPEN"
+            )
+            continue
+
+        m["resolution"] = "confirmed_not_found"
+        missing_confirmed_closed.append(m)
         sl_exit = _detect_sl_exit(ot, sym)
         if sl_exit:
             exit_reason, cur, exit_price_source = sl_exit
@@ -2934,7 +3455,13 @@ def reconcile_exchange(wl_all, ts, price_full, existing_trade_ids, lifecycle_sta
         entry.pop("open_trade", None)
         entry.pop("trade_id", None)
         save_watchlist(wl_all)
-    unexplained = [m for m in missing if not m.get("sl_explained")]
+    unexplained = [m for m in missing_confirmed_closed if not m.get("sl_explained")]
+    if missing_unresolved:
+        send_tg(
+            f"⚠️ <b>Сверка: позиция не подтверждена как закрытая</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"{len(missing_unresolved)} шт.: {esc(', '.join(m['symbol'] for m in missing_unresolved[:12]))}\n"
+            f"<i>Локальные сделки НЕ закрыты; требуется повторная сверка.</i>"
+        )
     if unexplained:
         send_tg(
             f"🔻 <b>Сверка: позиции нет на бирже, но она была в журнале</b>\n━━━━━━━━━━━━━━━━━━\n"
@@ -3034,135 +3561,380 @@ def _update_shadows(ot, ts, pnl_pct, strength):
         ot["last_signal_strength"] = strength
 
 
-def _retry_failed_exchange_tp(ot, symbol):
+def _exchange_position_snapshot(symbol):
+    """Return exchange-confirmed LONG position data for recovery."""
+    try:
+        import bingx_client
+        pos = bingx_client.get_position(symbol)
+    except Exception as e:
+        log.error(f"[{symbol}] protection recovery: get_position exception: {e}")
+        return None
+    if pos.get("status") != "found":
+        return None
+    try:
+        qty = float(pos.get("positionAmt", 0) or 0)
+        avg_price = float(pos.get("avgPrice", 0) or pos.get("entryPrice", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0 or avg_price <= 0:
+        return None
+    return {"qty": qty, "avg_price": avg_price, "position": pos}
+
+
+def _sync_exchange_position_qty(ot, symbol):
+    """Synchronize local BingX quantity/price from the exchange before protection recovery."""
+    bx = ot.setdefault("bingx", {})
+    snap = _exchange_position_snapshot(symbol)
+    if not snap:
+        return None
+    qty = snap["qty"]
+    avg_price = snap["avg_price"]
+    previous_qty = safe(bx.get("qty_remaining"), safe(bx.get("qty_initial"), safe(bx.get("qty"), 0.0)))
+    previous_avg = bx.get("bingx_avg_price")
+    was_initial_uncertain = bool(bx.get("qty_initial_uncertain"))
+    bx["status"] = "opened"
+    bx["bingx_avg_price"] = avg_price
+
+    # If OPEN was previously persisted with an explicitly uncertain requested
+    # quantity, the first authoritative exchange snapshot must replace that
+    # placeholder.  Otherwise a stale requested qty would remain as
+    # allocation_base_qty and could distort TP sizing and realized PnL after
+    # a restart/recovery.  Once an initial size is exchange-confirmed, keep it
+    # immutable: later partial/external closes must affect only qty_remaining.
+    if was_initial_uncertain or not bx.get("qty_initial"):
+        bx["qty_initial"] = qty
+        bx["qty_initial_uncertain"] = False
+    else:
+        try:
+            bx["qty_initial"] = float(bx["qty_initial"])
+        except (TypeError, ValueError):
+            bx["qty_initial"] = qty
+            bx["qty_initial_uncertain"] = False
+
+    # Exchange is authoritative for the currently open quantity.
+    bx["qty_remaining"] = qty
+    bx["qty_exchange_confirmed"] = True
+    if previous_qty and abs(previous_qty - qty) > 1e-12:
+        log.warning(f"[{symbol}] PROTECTION RECOVERY qty sync: {previous_qty} -> {qty}")
+    if previous_avg and abs(float(previous_avg) - avg_price) > 1e-12:
+        log.warning(f"[{symbol}] PROTECTION RECOVERY avg_price sync: {previous_avg} -> {avg_price}")
+    ot["bingx"] = bx
+    return snap
+
+
+def _retry_exchange_protection(ot, symbol):
+    """Reconcile TP and SL from exchange state; never rely on a prior attempt flag."""
     if not ENABLE_BINGX:
         return False
     bx = ot.get("bingx") or {}
-    if bx.get("execution_status") not in (
-        "TP_FAILED",
-        "OPEN_NO_TP",
-        "PROTECTION_EXCEPTION",
-    ):
-        return False
-    qty = safe(
-        bx.get("qty_remaining"),
-        safe(
-            bx.get("qty_initial"),
-            safe(bx.get("qty"), 0.0),
-        ),
-    )
-    avg_price = bx.get("bingx_avg_price")
-    if not avg_price:
-        avg_price = ot.get("entry_price")
-    if qty <= 0 or not avg_price:
-        log.warning(f"[{symbol}] TP_RETRY skipped: " f"qty={qty} avg_price={avg_price}")
-        return False
-    trade_id = ot.get("trade_id_full")
-    try:
-        import bingx_client
-        _, tp_levels, protection_source = get_trade_protection(ot)
-        existing = bingx_client.get_existing_tp_legs(
-            symbol,
-            tp_levels,
-            trade_id=trade_id,
-        )
-        if existing.get("status") == "error":
-            log.error(
-                f"[{symbol}] TP_RETRY exchange check failed: "
-                f"{existing.get('error')}"
-            )
-            return False
-        if existing.get("all_present"):
-            bx["tp_orders"] = existing.get("orders", [])
-            bx["execution_status"] = "TP_PLACED"
-            ot["bingx"] = bx
-            log.info(f"[{symbol}] TP_RETRY: all TP legs already exist")
-            return True
-        log.info(f"[{symbol}] TP_RETRY: missing legs=" f"{existing.get('missing', [])}")
-        tp_result = bingx_client.place_take_profit_orders(
-            symbol,
-            avg_price,
-            qty,
-            tp_levels,
-            trade_id=trade_id,
-        )
-        status = tp_result.get("status")
-        if status in ("created", "already_exists"):
-            bx["tp_orders"] = tp_result.get("orders", [])
-            bx["execution_status"] = "TP_PLACED"
-            ot["bingx"] = bx
-            log.info(
-                f"[{symbol}] TP_RETRY SUCCESS: "
-                f"status={status} "
-                f"missing={existing.get('missing', [])}"
-            )
-            return True
-        log.error(f"[{symbol}] TP_RETRY FAILED: " f"{tp_result.get('error')}")
-        return False
-    except Exception as e:
-        log.error(f"[{symbol}] TP_RETRY exception: {e}")
+    if bx.get("status") not in ("opened", "already_open"):
         return False
 
+    snap = _sync_exchange_position_qty(ot, symbol)
+    if not snap:
+        log.warning(f"[{symbol}] PROTECTION_RECOVERY skipped: live exchange position not confirmed")
+        return False
 
-def _retry_failed_exchange_sl(ot, symbol):
-    if not ENABLE_BINGX:
-        return False
-    bx = ot.get("bingx") or {}
-    if bx.get("execution_status") != "TP_PLACED":
-        return False
-    if bx.get("sl_order") is not None:
-        return False
-    qty = safe(
-        bx.get("qty_remaining"),
-        safe(
-            bx.get("qty_initial"),
-            safe(bx.get("qty"), 0.0),
-        ),
-    )
-    avg_price = bx.get("bingx_avg_price")
-    if not avg_price:
-        avg_price = ot.get("entry_price")
-    if qty <= 0 or not avg_price:
-        log.warning(f"[{symbol}] SL_RETRY skipped: " f"qty={qty} avg_price={avg_price}")
-        return False
+    qty = snap["qty"]
+    avg_price = snap["avg_price"]
     trade_id = ot.get("trade_id_full")
     try:
-        sl_pct, _, protection_source = get_trade_protection(ot)
+        sl_pct, tp_levels, protection_source = get_trade_protection(ot)
     except Exception as e:
-        log.error(f"[{symbol}] SL_RETRY failed to read trade protection: {e}")
+        log.error(f"[{symbol}] PROTECTION_RECOVERY invalid persisted protection: {e}")
         return False
+
+    changed = False
     try:
         import bingx_client
 
-        existing = bingx_client.get_open_sl_orders(symbol)
-        if existing.get("status") == "ok" and existing.get("count", 0) > 0:
-            sl_orders = existing.get("orders", [])
-            bx["sl_order"] = sl_orders[0]
-            ot["bingx"] = bx
-            log.info(
-                f"[{symbol}] SL_RETRY: SL уже существует на бирже "
-                f"({existing.get('count')} шт.) — восстанавливаем ссылку"
+        expected = {str(tp.get("leg")).lower() for tp in tp_levels if tp.get("leg")}
+
+        # --- TP reconciliation ---
+        tp_existing = bingx_client.get_existing_tp_legs(symbol, tp_levels, trade_id=trade_id)
+        filled_legs = set()
+        filled_qty_by_leg = {}
+        if tp_existing.get("status") == "ok":
+            opened_ts = ot.get("opened_ts", ot.get("entry_ts", 0))
+            filled_res = bingx_client.get_filled_tp_orders(
+                symbol, opened_ts=opened_ts, trade_id=trade_id
             )
-            return True
-        sl_result = bingx_client.place_stop_loss_order(
-            symbol,
-            avg_price,
-            qty,
-            sl_pct,
-            trade_id=trade_id,
+            if filled_res.get("status") == "ok":
+                for filled_order in filled_res.get("orders", []):
+                    leg_name = str(filled_order.get("leg") or "").lower()
+                    if not leg_name:
+                        continue
+                    try:
+                        filled_qty_by_leg[leg_name] = (
+                            filled_qty_by_leg.get(leg_name, 0.0)
+                            + float(filled_order.get("executed_qty", 0.0) or 0.0)
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if filled_order.get("is_fully_filled"):
+                        filled_legs.add(leg_name)
+
+        if tp_existing.get("status") == "error":
+            bx["tp_status"] = "TP_UNKNOWN"
+            log.error(f"[{symbol}] TP_RECOVERY exchange check failed: {tp_existing.get('error')}")
+        else:
+            existing_active_qty = float(tp_existing.get("existing_qty", 0.0) or 0.0)
+            duplicate_tp_legs = [str(x).lower() for x in (tp_existing.get("duplicate_legs") or [])]
+            qty_tolerance = max(qty * 1e-9, 1e-12)
+
+            # Exchange quantity is authoritative. If active TP orders cover
+            # more volume than the live position, OR multiple active orders
+            # exist for the same logical TP leg, the current protection set
+            # must be rebuilt. Keeping duplicate legs can cause multiple
+            # trigger orders to consume the same position quantity.
+            if duplicate_tp_legs or existing_active_qty > qty + qty_tolerance:
+                log.error(
+                    f"[{symbol}] TP_RECOVERY mismatch: active TP qty="
+                    f"{existing_active_qty:.12f} position qty={qty:.12f} "
+                    f"duplicate_legs={duplicate_tp_legs}; rebuilding current TP set"
+                )
+                cancel_res = bingx_client.cancel_take_profit_orders(
+                    symbol, trade_id=trade_id
+                )
+                if cancel_res.get("status") not in ("cancelled", "no_orders"):
+                    bx["tp_status"] = "TP_UNKNOWN"
+                    bx["protection_error"] = (
+                        "cannot rebuild TP after quantity mismatch: "
+                        f"cancel={cancel_res.get('status')} "
+                        f"{cancel_res.get('error', '')}"
+                    )
+                    log.error(
+                        f"[{symbol}] TP_RECOVERY blocked: old TP cancellation "
+                        f"not confirmed ({cancel_res.get('status')})"
+                    )
+                    # The original tp_existing snapshot is now stale and must
+                    # never be used for a second creation attempt in this run.
+                    bx["tp_reconciled_ts"] = now_ts()
+                    bx["execution_status"] = "PROTECTION_DEGRADED"
+                    ot["bingx"] = bx
+                    return changed
+
+                tp_result = bingx_client.place_take_profit_orders(
+                    symbol,
+                    avg_price,
+                    qty,
+                    tp_levels,
+                    trade_id=trade_id,
+                    allocation_base_qty=safe(bx.get("qty_initial"), qty),
+                    completed_legs=filled_legs,
+                    filled_qty_by_leg=filled_qty_by_leg,
+                )
+                if tp_result.get("status") in ("created", "already_exists"):
+                    verify = bingx_client.get_existing_tp_legs(
+                        symbol, tp_levels, trade_id=trade_id
+                    )
+                    if verify.get("status") == "ok":
+                        verify_filled_res = bingx_client.get_filled_tp_orders(
+                            symbol, opened_ts=opened_ts, trade_id=trade_id
+                        )
+                        verify_filled = {
+                            str(o.get("leg")).lower()
+                            for o in (verify_filled_res.get("orders", []) if verify_filled_res.get("status") == "ok" else [])
+                            if o.get("leg") and o.get("is_fully_filled")
+                        }
+                        verify_accounted = {
+                            str(leg).lower()
+                            for leg, present in (verify.get("legs") or {}).items()
+                            if present
+                        } | verify_filled
+                        bx["tp_orders"] = verify.get("orders", [])
+                        bx["tp_filled_legs"] = sorted(verify_filled)
+                        bx["tp_status"] = (
+                            "TP_PLACED"
+                            if verify_accounted >= expected
+                            and float(verify.get("existing_qty", 0.0) or 0.0) <= qty + qty_tolerance
+                            else "TP_PARTIAL"
+                        )
+                        changed = True
+                    else:
+                        bx["tp_status"] = "TP_UNKNOWN"
+                else:
+                    bx["tp_status"] = "TP_FAILED"
+                    bx["protection_error"] = str(tp_result.get("error", "unknown"))[:500]
+
+                # Rebuild used a fresh exchange snapshot. Do not fall through
+                # into the old `missing` branch using pre-rebuild data.
+                bx["tp_reconciled_ts"] = now_ts()
+                ot["bingx"] = bx
+                return changed
+
+            missing = [
+                leg for leg in tp_existing.get("missing", [])
+                if str(leg).lower() not in filled_legs
+            ]
+            accounted = {
+                str(leg).lower()
+                for leg, present in (tp_existing.get("legs") or {}).items()
+                if present
+            } | filled_legs
+            if accounted >= expected:
+                bx["tp_orders"] = tp_existing.get("orders", [])
+                bx["tp_filled_legs"] = sorted(filled_legs)
+                bx["tp_status"] = "TP_PLACED"
+                changed = True
+            elif missing:
+                bx["tp_status"] = "TP_PARTIAL" if tp_existing.get("orders") or filled_legs else "TP_MISSING"
+                log.warning(
+                    f"[{symbol}] TP_RECOVERY missing={missing} filled={sorted(filled_legs)}"
+                )
+                tp_result = bingx_client.place_take_profit_orders(
+                    symbol,
+                    avg_price,
+                    qty,
+                    tp_levels,
+                    trade_id=trade_id,
+                    allocation_base_qty=safe(bx.get("qty_initial"), qty),
+                    completed_legs=filled_legs,
+                    filled_qty_by_leg=filled_qty_by_leg,
+                )
+                if tp_result.get("status") in ("created", "already_exists"):
+                    verify = bingx_client.get_existing_tp_legs(symbol, tp_levels, trade_id=trade_id)
+                    if verify.get("status") == "ok":
+                        verify_filled_res = bingx_client.get_filled_tp_orders(
+                            symbol, opened_ts=opened_ts, trade_id=trade_id
+                        )
+                        verify_filled = {
+                            str(o.get("leg")).lower()
+                            for o in (verify_filled_res.get("orders", []) if verify_filled_res.get("status") == "ok" else [])
+                            if o.get("leg") and o.get("is_fully_filled")
+                        }
+                        verify_accounted = {
+                            str(leg).lower()
+                            for leg, present in (verify.get("legs") or {}).items()
+                            if present
+                        } | verify_filled
+                        if verify_accounted >= expected:
+                            bx["tp_orders"] = verify.get("orders", [])
+                            bx["tp_filled_legs"] = sorted(verify_filled)
+                            bx["tp_status"] = "TP_PLACED"
+                            changed = True
+                        else:
+                            bx["tp_orders"] = verify.get("orders", [])
+                            bx["tp_status"] = "TP_PARTIAL"
+                    else:
+                        bx["tp_status"] = "TP_PARTIAL"
+                else:
+                    bx["tp_status"] = "TP_FAILED"
+                    bx["protection_error"] = str(tp_result.get("error", "unknown"))[:500]
+            else:
+                # No active TP is missing: all absent legs are already confirmed filled.
+                bx["tp_orders"] = tp_existing.get("orders", [])
+                bx["tp_filled_legs"] = sorted(filled_legs)
+                bx["tp_status"] = "TP_PLACED"
+                changed = True
+
+        # --- SL reconciliation, independent from TP state ---
+        sl_existing = bingx_client.get_open_sl_orders(symbol)
+        if sl_existing.get("status") == "ok" and sl_existing.get("count", 0) > 0:
+            owned = []
+            for order in sl_existing.get("orders", []):
+                parsed = bingx_client.parse_sl_client_order_id(str(order.get("clientOrderId", "")))
+                if parsed and (not trade_id or bingx_client._sl_belongs_to_trade(parsed, trade_id)):
+                    owned.append(order)
+            if owned:
+                # There must be exactly one SL for the current trade, and it
+                # must cover the current exchange-confirmed position size.
+                sl_qtys = []
+                for order in owned:
+                    try:
+                        orig_qty = float(order.get("origQty") or order.get("quantity") or 0.0)
+                        executed_qty = float(order.get("executedQty") or 0.0)
+                        sl_qtys.append(max(0.0, orig_qty - executed_qty) if orig_qty > 0 else 0.0)
+                    except (TypeError, ValueError):
+                        sl_qtys.append(0.0)
+                sl_qty_ok = (
+                    len(owned) == 1
+                    and sl_qtys[0] > 0
+                    and abs(sl_qtys[0] - qty) <= max(qty * 1e-9, 1e-12)
+                )
+                if sl_qty_ok:
+                    bx["sl_order"] = owned[0]
+                    bx["sl_status"] = "SL_PLACED"
+                    changed = True
+                else:
+                    log.warning(
+                        f"[{symbol}] SL_RECOVERY quantity/duplicate mismatch: "
+                        f"orders={len(owned)} qtys={sl_qtys} position_qty={qty}; rebuilding SL"
+                    )
+                    cancel_res = bingx_client.cancel_stop_loss_orders(
+                        symbol, trade_id=trade_id
+                    )
+                    if cancel_res.get("status") not in ("cancelled", "no_orders"):
+                        bx["sl_status"] = "SL_UNKNOWN"
+                        bx["protection_error"] = (
+                            "cannot rebuild SL after quantity/duplicate mismatch: "
+                            f"cancel={cancel_res.get('status')} "
+                            f"{cancel_res.get('error', '')}"
+                        )
+                    else:
+                        existing_stops = []
+                        for order in owned:
+                            try:
+                                candidate = float(order.get("stopPrice") or order.get("triggerPrice") or 0.0)
+                            except (TypeError, ValueError):
+                                candidate = 0.0
+                            if candidate > 0:
+                                existing_stops.append(candidate)
+
+                        # LONG protection: preserve the most protective existing stop
+                        # when rebuilding after quantity/duplicate mismatch. Rebuilding
+                        # from the original sl_pct could otherwise move a previously
+                        # trailed SL backwards and weaken protection.
+                        existing_stop = max(existing_stops) if existing_stops else None
+                        sl_result = bingx_client.place_stop_loss_order(
+                            symbol,
+                            avg_price,
+                            qty,
+                            sl_pct,
+                            trade_id=trade_id,
+                            stop_price_override=existing_stop,
+                        )
+                        if sl_result.get("status") == "created":
+                            bx["sl_order"] = sl_result
+                            bx["sl_status"] = "SL_PLACED"
+                            changed = True
+                        else:
+                            bx["sl_status"] = "SL_FAILED"
+                            bx["protection_error"] = str(sl_result.get("error", "unknown"))[:500]
+            else:
+                bx["sl_status"] = "SL_MISSING"
+        elif sl_existing.get("status") == "error":
+            bx["sl_status"] = "SL_UNKNOWN"
+            log.error(f"[{symbol}] SL_RECOVERY exchange check failed: {sl_existing.get('error')}")
+        else:
+            bx["sl_status"] = "SL_MISSING"
+
+        if bx.get("sl_status") in ("SL_MISSING", "SL_FAILED"):
+            sl_result = bingx_client.place_stop_loss_order(
+                symbol, avg_price, qty, sl_pct, trade_id=trade_id
+            )
+            if sl_result.get("status") == "created":
+                bx["sl_order"] = sl_result
+                bx["sl_status"] = "SL_PLACED"
+                changed = True
+            else:
+                bx["sl_status"] = "SL_FAILED"
+                bx["protection_error"] = str(sl_result.get("error", "unknown"))[:500]
+
+        bx["execution_status"] = (
+            "PROTECTED"
+            if bx.get("tp_status") == "TP_PLACED" and bx.get("sl_status") == "SL_PLACED"
+            else "PROTECTION_DEGRADED"
         )
-        if sl_result.get("status") == "created":
-            bx["sl_order"] = sl_result
-            ot["bingx"] = bx
-            log.info(
-                f"[{symbol}] SL_RETRY SUCCESS: "
-                f"stop_price={sl_result.get('stop_price')}"
-            )
-            return True
-        log.error(f"[{symbol}] SL_RETRY FAILED: " f"{sl_result.get('error')}")
-        return False
+        bx["protection_reconciled_ts"] = now_ts()
+        ot["bingx"] = bx
+        return changed
     except Exception as e:
-        log.error(f"[{symbol}] SL_RETRY exception: {e}")
+        bx["execution_status"] = "PROTECTION_EXCEPTION"
+        bx["protection_error"] = str(e)[:500]
+        bx["protection_reconciled_ts"] = now_ts()
+        ot["bingx"] = bx
+        log.error(f"[{symbol}] PROTECTION_RECOVERY exception: {e}")
         return False
 
 
@@ -3177,8 +3949,7 @@ def manage_open_trade(
     symbol_in_current_scrape=True,
     scrape_complete=True,
 ):
-    _retry_failed_exchange_tp(ot, sym)
-    _retry_failed_exchange_sl(ot, sym)
+    _retry_exchange_protection(ot, sym)
     state = (signal or {}).get("state")
     score = (signal or {}).get("score", 0)
     strength = (signal or {}).get("strength")
@@ -3962,37 +4733,50 @@ def run():
                             log.info(
                                 f"[{sym}] Watchlist saved after OPEN (crash-safe point 1)"
                             )
-                            if bx.get("protection_attempted"):
-                                log.warning(
-                                    f"[{sym}] attach_protection ПОВТОРНЫЙ вызов заблокирован — "
-                                    f"protection_attempted уже True. TP/SL НЕ создаются повторно."
-                                )
-                                protection = {
-                                    "tp_result": {"status": "skipped_duplicate_guard"},
-                                    "tp_status": bx.get("execution_status", "UNKNOWN"),
-                                    "tp_orders": bx.get("tp_orders", []),
-                                    "sl_result": bx.get("sl_order")
-                                    or {"status": "skipped_duplicate_guard"},
-                                }
+                            # Persist the open position before touching protection.
+                            # Protection is reconciled against the exchange state, so a
+                            # crash/restart cannot permanently suppress TP/SL recovery.
+                            bx["protection_state"] = "PENDING"
+                            bx["tp_status"] = "TP_UNKNOWN"
+                            bx["sl_status"] = "SL_UNKNOWN"
+                            bx["protection"] = dict(new_ot["protection"])
+                            new_ot["bingx"] = bx
+                            entry_temp["open_trade"] = new_ot
+                            wl_all[sym] = entry_temp
+                            save_watchlist(wl_all)
+                            log.info(f"[{sym}] OPEN state saved before protection reconciliation")
+
+                            protection = bingx_client.attach_protection(
+                                sym,
+                                avg_price,
+                                position_qty,
+                                adaptive_tp_levels,
+                                adaptive_sl_pct,
+                                trade_id=new_tid,
+                            )
+                            bx["tp_orders"] = protection.get("tp_orders", [])
+                            bx["tp_status"] = (
+                                "TP_PLACED"
+                                if protection.get("tp_status") == "TP_PLACED"
+                                else "TP_FAILED"
+                            )
+                            sl_result = protection.get("sl_result") or {}
+                            if sl_result.get("status") == "created":
+                                bx["sl_order"] = sl_result
+                                bx["sl_status"] = "SL_PLACED"
                             else:
-                                bx["protection_attempted"] = True
-                                new_ot["bingx"] = bx
-                                entry_temp["open_trade"] = new_ot
-                                wl_all[sym] = entry_temp
-                                save_watchlist(wl_all)
-                                log.info(
-                                    f"[{sym}] protection_attempted=True сохранён (crash-safe point 2)"
-                                )
-                                protection = bingx_client.attach_protection(
-                                    sym,
-                                    avg_price,
-                                    position_qty,
-                                    adaptive_tp_levels,
-                                    adaptive_sl_pct,
-                                    trade_id=new_tid,
-                                )
-                            bx["tp_orders"] = protection["tp_orders"]
-                            bx["execution_status"] = protection["tp_status"]
+                                bx["sl_order"] = None
+                                bx["sl_status"] = "SL_FAILED"
+                            bx["protection_state"] = (
+                                "PROTECTED"
+                                if bx["tp_status"] == "TP_PLACED" and bx["sl_status"] == "SL_PLACED"
+                                else "DEGRADED"
+                            )
+                            bx["execution_status"] = (
+                                "PROTECTED"
+                                if bx["protection_state"] == "PROTECTED"
+                                else "PROTECTION_DEGRADED"
+                            )
                             new_ot["bingx"] = bx
 
                             if protection["tp_status"] == "TP_PLACED":
@@ -4010,15 +4794,12 @@ def run():
                                     f"Error: {esc(str(protection['tp_result'].get('error'))[:200])}\n"
                                     f"<i>Позиция остается открытой. Retry в следующем прогоне.</i>"
                                 )
-                            sl_result = protection["sl_result"]
                             if sl_result.get("status") == "created":
-                                bx["sl_order"] = sl_result
                                 log.info(
                                     f"[{sym}] SL установлен на бирже: "
                                     f"stop={sl_result.get('stop_price'):.6f}"
                                 )
                             else:
-                                bx["sl_order"] = None
                                 log.error(
                                     f"[{sym}] SL НЕ установлен: {sl_result.get('error')}"
                                 )
@@ -4035,6 +4816,9 @@ def run():
                         log.error(f"[{sym}] BingX OPEN exception: {e}")
                         bx = new_ot.setdefault("bingx", {})
                         bx["execution_status"] = "PROTECTION_EXCEPTION"
+                        bx["protection_state"] = "DEGRADED"
+                        bx["tp_status"] = bx.get("tp_status", "TP_UNKNOWN")
+                        bx["sl_status"] = bx.get("sl_status", "SL_UNKNOWN")
                         bx["protection_error"] = str(e)[:500]
                         bx["protection"] = dict(new_ot["protection"])
 

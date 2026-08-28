@@ -26,6 +26,7 @@ ORDERS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bingx_ord
 TP_CLIENT_ORDER_PREFIX = "CM_TP_"
 SL_CLIENT_ORDER_PREFIX = "CM_SL_"
 OPEN_CLIENT_ORDER_PREFIX = "CM_OPEN_"
+CLOSE_CLIENT_ORDER_PREFIX = "CM_CLOSE_"
 VALID_TP_LEGS = {"tp1", "tp2", "tp3"}
 
 try:
@@ -306,28 +307,186 @@ def _request(
     signed: bool = True,
     retries: int = 2,
 ):
-    params = dict(params or {})
-    if signed:
-        if not API_KEY or not SECRET_KEY:
-            return {
-                "code": -1,
-                "msg": "BINGX_API_KEY / BINGX_SECRET_KEY не заданы в env",
-            }
-        params["timestamp"] = str(int(time.time() * 1000))
-        params["signature"] = _sign(params)
-    headers = {"X-BX-APIKEY": API_KEY} if signed else {}
+    """HTTP helper with retries only for idempotent reads.
+
+    Non-idempotent writes (POST) are executed exactly once per call. If a
+    write response is lost, the caller must reconcile using a stable
+    clientOrderId / exchange state instead of blindly replaying the write.
+    """
+    base_params = dict(params or {})
+    method_upper = str(method).upper()
+    retry_count = max(int(retries), 1) if method_upper in {"GET", "HEAD", "OPTIONS"} else 1
     url = BASE_URL + path
     last_err = "unknown"
-    for attempt in range(retries):
+
+    for attempt in range(retry_count):
+        request_params = dict(base_params)
+        if signed:
+            if not API_KEY or not SECRET_KEY:
+                return {
+                    "code": -1,
+                    "msg": "BINGX_API_KEY / BINGX_SECRET_KEY не заданы в env",
+                }
+            request_params["timestamp"] = str(int(time.time() * 1000))
+            request_params["signature"] = _sign(request_params)
+
+        headers = {"X-BX-APIKEY": API_KEY} if signed else {}
         try:
             resp = requests.request(
-                method, url, headers=headers, params=params, timeout=10
+                method_upper, url, headers=headers, params=request_params, timeout=10
             )
             return resp.json()
         except Exception as e:
             last_err = str(e)
-            time.sleep(1 + attempt)
+            if attempt + 1 < retry_count:
+                time.sleep(1 + attempt)
+
     return {"code": -1, "msg": f"network error: {last_err}"}
+
+
+def _lookup_order_by_client_order_id(
+    bx_symbol: str, client_order_id: str,
+) -> dict:
+    """Tri-state lookup: found / not_found / error. Never collapse API error into absence."""
+    if not client_order_id or not bx_symbol:
+        return {"status": "error", "error": "missing symbol/clientOrderId", "order": None}
+    resp = _request(
+        "GET",
+        "/openApi/swap/v2/trade/allOrders",
+        {"symbol": bx_symbol},
+    )
+    if resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": f"code={resp.get('code')} msg={resp.get('msg', 'unknown')}",
+            "order": None,
+        }
+    wanted = str(client_order_id).upper()
+    for order in _normalize_orders_list(resp):
+        if str(order.get("clientOrderId", "")).upper() == wanted:
+            return {"status": "found", "order": order}
+    return {"status": "not_found", "order": None}
+
+
+def _lookup_order_by_id(bx_symbol: str, order_id: str) -> dict:
+    """Tri-state lookup by exchange orderId."""
+    if not bx_symbol or not order_id:
+        return {"status": "error", "error": "missing symbol/orderId", "order": None}
+    resp = _request(
+        "GET",
+        "/openApi/swap/v2/trade/allOrders",
+        {"symbol": bx_symbol},
+    )
+    if resp.get("code") != 0:
+        return {
+            "status": "error",
+            "error": f"code={resp.get('code')} msg={resp.get('msg', 'unknown')}",
+            "order": None,
+        }
+    wanted = str(order_id)
+    for order in _normalize_orders_list(resp):
+        if str(order.get("orderId", "")) == wanted:
+            return {"status": "found", "order": order}
+    return {"status": "not_found", "order": None}
+
+
+def _delete_order_and_verify(
+    bx_symbol: str,
+    order_id: str,
+    verify_open_orders,
+) -> dict:
+    """Cancel one order and verify the exchange no longer lists it as open.
+
+    DELETE responses can be lost or rejected after the exchange has already
+    processed the cancellation. Never replay DELETE blindly; verification is
+    the source of truth.
+    """
+    order_id = str(order_id or "")
+    if not order_id:
+        return {"status": "invalid", "order_id": order_id}
+
+    resp = _request(
+        "DELETE",
+        ORDER_PATH,
+        {"symbol": bx_symbol, "orderId": order_id},
+    )
+
+    if resp.get("code") == 0:
+        response_status = "acknowledged"
+    else:
+        response_status = "error"
+
+    verify = verify_open_orders()
+    if verify.get("status") != "ok":
+        return {
+            "status": "unknown",
+            "order_id": order_id,
+            "response_status": response_status,
+            "response_error": resp.get("msg"),
+            "verification_error": verify.get("error", "open-order verification failed"),
+        }
+
+    remaining = [
+        o for o in (verify.get("orders") or [])
+        if str(o.get("orderId", "")) == order_id
+    ]
+    if remaining:
+        return {
+            "status": "still_open",
+            "order_id": order_id,
+            "response_status": response_status,
+            "response_error": resp.get("msg"),
+        }
+
+    # Absence from openOrders is not enough to prove cancellation: the order
+    # may have filled between DELETE and the verification request. Query order
+    # history and distinguish a terminal cancellation from a fill.
+    history_lookup = _lookup_order_by_id(bx_symbol, order_id)
+    if history_lookup.get("status") == "error":
+        return {
+            "status": "unknown",
+            "order_id": order_id,
+            "response_status": response_status,
+            "response_error": resp.get("msg"),
+            "verification_error": history_lookup.get("error", "allOrders query failed"),
+        }
+    history_order = history_lookup.get("order")
+    if history_lookup.get("status") == "not_found" or not history_order:
+        return {
+            "status": "unknown",
+            "order_id": order_id,
+            "response_status": response_status,
+            "response_error": resp.get("msg"),
+            "verification_error": "order disappeared from openOrders but was not found in allOrders",
+        }
+
+    history_status = str(history_order.get("status", "")).upper()
+    if history_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+        return {
+            "status": "cancelled",
+            "order_id": order_id,
+            "response_status": response_status,
+            "history_status": history_status,
+        }
+
+    if history_status in {"FILLED", "PARTIALLY_FILLED", "PARTIALLYFILLED"}:
+        return {
+            "status": "filled",
+            "order_id": order_id,
+            "response_status": response_status,
+            "history_status": history_status,
+            "executed_qty": float(history_order.get("executedQty", 0) or 0),
+            "avg_price": float(history_order.get("avgPrice", 0) or 0),
+        }
+
+    return {
+        "status": "unknown",
+        "order_id": order_id,
+        "response_status": response_status,
+        "history_status": history_status,
+        "response_error": resp.get("msg"),
+        "verification_error": "order disappeared from openOrders in a non-terminal/unknown state",
+    }
 
 
 def _log_event(event: dict):
@@ -519,8 +678,12 @@ def _is_hex8(s: str) -> bool:
 
 
 def build_tp_client_order_id(leg: str, trade_id: str = None) -> str:
+    # Protection orders are recreated after partial/manual closes and trailing
+    # updates.  BingX may reject a reused clientOrderId even after the previous
+    # order was cancelled, so every NEW TP submission gets a unique revision.
     key = _trade_id_hash(trade_id) if trade_id else uuid.uuid4().hex[:8]
-    return f"{TP_CLIENT_ORDER_PREFIX}{key}_{leg}"
+    revision = uuid.uuid4().hex[:8]
+    return f"{TP_CLIENT_ORDER_PREFIX}{key}_{leg}_{revision}"
 
 
 def parse_tp_client_order_id(client_id: str) -> dict | None:
@@ -529,23 +692,28 @@ def parse_tp_client_order_id(client_id: str) -> dict | None:
     parts = client_id.upper().split("_")
     valid_legs_upper = {leg.upper() for leg in VALID_TP_LEGS}
     if (
-        len(parts) != 4
+        len(parts) != 5
         or parts[0] != "CM"
         or parts[1] != "TP"
         or not _is_hex8(parts[2])
         or parts[3] not in valid_legs_upper
+        or not _is_hex8(parts[4])
     ):
         return None
     return {
         "trade_id": None,
         "trade_hash": parts[2].lower(),
         "leg": parts[3].lower(),
+        "revision": parts[4].lower(),
     }
 
 
 def build_sl_client_order_id(trade_id: str = None) -> str:
+    # Same uniqueness rule as TP: each new protection order must have its own
+    # clientOrderId because BingX can enforce uniqueness across order history.
     key = _trade_id_hash(trade_id) if trade_id else uuid.uuid4().hex[:8]
-    return f"{SL_CLIENT_ORDER_PREFIX}{key}"
+    revision = uuid.uuid4().hex[:8]
+    return f"{SL_CLIENT_ORDER_PREFIX}{key}_{revision}"
 
 
 def build_open_client_order_id(symbol: str, trade_id: str = None) -> str:
@@ -554,18 +722,43 @@ def build_open_client_order_id(symbol: str, trade_id: str = None) -> str:
     return f"{OPEN_CLIENT_ORDER_PREFIX}{key}"
 
 
+def build_close_client_order_id(
+    symbol: str, trade_id: str = None, attempt: int = 0
+) -> str:
+    """Return a deterministic clientOrderId for one MARKET-close attempt.
+
+    The same attempt keeps the same ID across retries/restarts, preserving
+    idempotency after a lost response. A later attempt for a position that
+    remains open after a previously FILLED close gets a different deterministic
+    ID, so the remainder can be closed without replaying the already-filled
+    order.
+    """
+    try:
+        attempt = max(0, int(attempt))
+    except (TypeError, ValueError):
+        attempt = 0
+    raw_base = f"{symbol}:{trade_id}" if trade_id else f"ORPHAN:{symbol}"
+    raw = f"{raw_base}:close_attempt:{attempt}"
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{CLOSE_CLIENT_ORDER_PREFIX}{key}"
+
+
 def parse_sl_client_order_id(client_id: str) -> dict | None:
     if not client_id:
         return None
     parts = client_id.upper().split("_")
     if (
-        len(parts) != 3
+        len(parts) != 4
         or parts[0] != "CM"
         or parts[1] != "SL"
         or not _is_hex8(parts[2])
+        or not _is_hex8(parts[3])
     ):
         return None
-    return {"trade_hash": parts[2].lower()}
+    return {
+        "trade_hash": parts[2].lower(),
+        "revision": parts[3].lower(),
+    }
 
 
 def _sl_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
@@ -579,10 +772,15 @@ def _sl_belongs_to_trade(parsed: dict | None, trade_id: str = None) -> bool:
 # ============================================================
 # POSITION QUERIES
 # ============================================================
-def _position_amt(bx_symbol: str) -> float:
+def _position_amt(bx_symbol: str) -> float | None:
+    """Return confirmed LONG/BOTH position amount; None means exchange state unknown."""
     resp = _request("GET", POSITION_PATH, {"symbol": bx_symbol})
     if resp.get("code") != 0:
-        return 0.0
+        log.error(
+            f"[{bx_symbol}] position amount query failed: "
+            f"code={resp.get('code')} msg={resp.get('msg')}"
+        )
+        return None
     total = 0.0
     for p in _normalize_orders_list(resp):
         if p.get("positionSide") in ("LONG", "BOTH"):
@@ -617,7 +815,7 @@ def list_positions() -> dict:
     return {"status": "ok", "positions": out}
 
 
-def position_amt(symbol: str) -> float:
+def position_amt(symbol: str) -> float | None:
     return _position_amt(to_bx_symbol(symbol))
 
 
@@ -631,17 +829,37 @@ def get_position(symbol: str) -> dict:
         if p.get("positionSide") in ("LONG", "BOTH"):
             try:
                 amt = float(p.get("positionAmt", 0) or 0)
-                avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
             except (TypeError, ValueError):
                 continue
-            if amt > 0 and avg_price > 0:
-                return {
-                    "status": "found",
-                    "symbol": p.get("symbol", bx_symbol),
-                    "avgPrice": avg_price,
-                    "positionAmt": amt,
-                    "entryPrice": float(p.get("entryPrice", 0) or avg_price),
-                }
+            if amt <= 0:
+                continue
+
+            # Position existence is established by positionAmt alone.
+            # avgPrice may be temporarily absent/zero while the exchange
+            # is still converging after a market fill. Never report such a
+            # live position as NOT_FOUND, because callers use NOT_FOUND as
+            # authoritative proof that a position no longer exists.
+            try:
+                avg_price = float(p.get("avgPrice", 0) or p.get("entryPrice", 0) or 0)
+            except (TypeError, ValueError):
+                avg_price = 0.0
+
+            entry_price = p.get("entryPrice")
+            try:
+                entry_price = float(entry_price) if entry_price is not None else None
+            except (TypeError, ValueError):
+                entry_price = None
+            if not entry_price and avg_price > 0:
+                entry_price = avg_price
+
+            return {
+                "status": "found",
+                "symbol": p.get("symbol", bx_symbol),
+                "avgPrice": avg_price or None,
+                "positionAmt": amt,
+                "entryPrice": entry_price,
+                "price_ready": avg_price > 0,
+            }
     return {"status": "not_found", "symbol": bx_symbol}
 
 
@@ -653,12 +871,19 @@ def wait_for_position_fill(
     while time.time() - start < timeout_sec:
         pos = get_position(symbol)
         if pos.get("status") == "found":
+            if pos.get("price_ready") and pos.get("avgPrice", 0):
+                log.info(
+                    f"[{symbol}] позиция появилась: avgPrice={pos.get('avgPrice')} qty={pos.get('positionAmt')}"
+                )
+                return pos
             log.info(
-                f"[{symbol}] позиция появилась: avgPrice={pos.get('avgPrice')} qty={pos.get('positionAmt')}"
+                f"[{symbol}] позиция уже существует, но avgPrice ещё не готов: "
+                f"qty={pos.get('positionAmt')}"
             )
-            return pos
+        elif pos.get("status") == "error":
+            log.warning(f"[{symbol}] ожидание позиции: exchange state unknown: {pos.get('error')}")
         time.sleep(poll_interval)
-    log.warning(f"[{symbol}] позиция не появилась за {timeout_sec}с")
+    log.warning(f"[{symbol}] позиция не появилась с готовой avgPrice за {timeout_sec}с")
     return {"status": "timeout", "symbol": bx_symbol}
 
 
@@ -709,6 +934,8 @@ def get_filled_tp_orders(
             continue
         if opened_ts and order_time < opened_ts * 1000:
             continue
+        executed_qty = float(o.get("executedQty", 0) or 0)
+        orig_qty = float(o.get("origQty", 0) or o.get("quantity", 0) or 0)
         filled_tp.append(
             {
                 "leg": parsed.get("leg"),
@@ -717,7 +944,10 @@ def get_filled_tp_orders(
                 "order_id": str(o.get("orderId", "")),
                 "client_order_id": client_id,
                 "status": status,
-                "executed_qty": float(o.get("executedQty", 0) or 0),
+                "executed_qty": executed_qty,
+                "orig_qty": orig_qty,
+                "remaining_qty": max(0.0, orig_qty - executed_qty) if orig_qty > 0 else None,
+                "is_fully_filled": status == "FILLED" or (orig_qty > 0 and executed_qty >= orig_qty - 1e-12),
                 "avg_price": float(o.get("avgPrice", 0) or 0),
                 "time": order_time,
             }
@@ -738,6 +968,7 @@ def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> 
             "orders": [],
         }
     existing_legs = {}
+    orders_by_leg = {}
     existing_qty_total = 0.0
     for order in result.get("orders", []):
         parsed = parse_tp_client_order_id(str(order.get("clientOrderId", "")))
@@ -748,7 +979,10 @@ def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> 
         leg = parsed.get("leg")
         if leg:
             existing_legs[leg] = True
-            qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
+            orders_by_leg.setdefault(leg, []).append(order)
+            orig_qty = float(order.get("origQty", 0) or order.get("quantity", 0) or 0)
+            executed_qty = float(order.get("executedQty", 0) or 0)
+            qty = max(0.0, orig_qty - executed_qty) if orig_qty > 0 else 0.0
             existing_qty_total += qty
     legs_status = {}
     missing = []
@@ -758,10 +992,14 @@ def get_existing_tp_legs(symbol: str, tp_levels: list, trade_id: str = None) -> 
         legs_status[leg] = present
         if not present:
             missing.append(leg)
+    duplicate_legs = sorted(
+        leg for leg, orders in orders_by_leg.items() if len(orders) > 1
+    )
     return {
         "legs": legs_status,
         "missing": missing,
-        "all_present": len(missing) == 0,
+        "duplicate_legs": duplicate_legs,
+        "all_present": len(missing) == 0 and not duplicate_legs,
         "existing_qty": existing_qty_total,
         "orders": result.get("orders", []),
     }
@@ -776,6 +1014,9 @@ def place_take_profit_orders(
     position_qty: float,
     tp_levels: list = None,
     trade_id: str = None,
+    allocation_base_qty: float = None,
+    completed_legs: set[str] | None = None,
+    filled_qty_by_leg: dict[str, float] | None = None,
 ) -> dict:
     """Создать сетку BingX TP ордеров через дискретное квантование объёмов."""
     if tp_levels is None:
@@ -836,6 +1077,19 @@ def place_take_profit_orders(
 
     bx_symbol = to_bx_symbol(symbol)
     existing_check = get_existing_tp_legs(symbol, tp_levels, trade_id=trade_id)
+    if existing_check.get("status") == "error":
+        # A failed exchange read must never be interpreted as "no TP orders".
+        # Creating a new TP set while the existing order state is unknown can
+        # create duplicate protection after a transient exchange/API failure.
+        return {
+            "status": "error",
+            "error": (
+                "cannot determine existing TP state before creation: "
+                f"{existing_check.get('error', 'TP query failed')}"
+            ),
+            "orders": [],
+            "state_unknown": True,
+        }
     if existing_check.get("all_present"):
         log.info(f"[{symbol}] все TP legs уже существуют, пропускаем создание")
         return {
@@ -845,7 +1099,25 @@ def place_take_profit_orders(
             "existing_qty": existing_check.get("existing_qty"),
         }
 
-    missing_legs = existing_check.get("missing", [])
+    completed = {str(x).lower() for x in (completed_legs or set()) if x}
+    filled_by_leg = {}
+    for key, value in (filled_qty_by_leg or {}).items():
+        try:
+            filled_by_leg[str(key).lower()] = max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            continue
+    missing_legs = [
+        str(leg) for leg in existing_check.get("missing", [])
+        if str(leg).lower() not in completed
+    ]
+    if not missing_legs:
+        return {
+            "status": "already_exists",
+            "legs": existing_check.get("legs"),
+            "orders": [],
+            "existing_qty": existing_check.get("existing_qty"),
+            "completed_legs": sorted(completed),
+        }
     c = _contracts().get(bx_symbol)
     if not c:
         return {"status": "error", "error": f"контракт {bx_symbol} не найден"}
@@ -853,11 +1125,90 @@ def place_take_profit_orders(
     prec = int(c.get("quantityPrecision") or 0)
     price_prec = int(c.get("pricePrecision") or 4)
 
-    # Дискретное квантованное распределение (все TP >= 1 кванта)
-    allocated_qtys = allocate_tp_quanta(position_qty, tp_levels, prec)
+    # Для первичного OPEN allocation_base_qty == position_qty.
+    # При recovery после частичных TP allocation_base_qty должен быть
+    # исходным exchange-confirmed qty, а position_qty — текущим остатком.
+    # Это позволяет сохранить исходные close_fraction и не перераспределять
+    # уже исполненные legs как новые.
+    allocation_base_qty = float(allocation_base_qty or position_qty)
+    if allocation_base_qty <= 0:
+        return {"status": "error", "error": "allocation_base_qty <= 0", "orders": []}
+
+    existing_qty = float(existing_check.get("existing_qty", 0.0) or 0.0)
+    available_for_missing = max(0.0, float(position_qty) - existing_qty)
+    missing_defs = [
+        tp for tp in tp_levels
+        if str(tp.get("leg", "")).lower() in {str(x).lower() for x in missing_legs}
+    ]
+    desired_missing = {}
+    for tp in missing_defs:
+        leg_name = str(tp.get("leg"))
+        target_qty = max(0.0, allocation_base_qty * float(tp.get("close_fraction", 0.0)))
+        already_executed = filled_by_leg.get(leg_name.lower(), 0.0)
+        desired_missing[leg_name] = max(0.0, target_qty - already_executed)
+    desired_total = sum(desired_missing.values())
+    if desired_total > available_for_missing + 1e-12 and desired_total > 0:
+        scale = available_for_missing / desired_total
+        log.warning(
+            f"[{symbol}] TP_RECOVERY allocation scaled: "
+            f"desired={desired_total:.12f} available={available_for_missing:.12f} scale={scale:.6f}"
+        )
+        desired_missing = {leg: qty * scale for leg, qty in desired_missing.items()}
+
+    allocated_qtys = {}
+    for leg, desired_qty in desired_missing.items():
+        # ROUND_DOWN по шагу: quantity не должна превышать реально доступный остаток.
+        allocated_qtys[leg] = _round_qty(desired_qty, prec)
 
     orders_created = []
     orders_to_rollback = []
+
+    def _rollback_created_tp_orders() -> dict:
+        failed = []
+        filled = []
+        unknown = []
+        for rollback_oid in orders_to_rollback:
+            delete_result = _delete_order_and_verify(
+                bx_symbol,
+                rollback_oid,
+                lambda: get_open_tp_orders(symbol),
+            )
+            if delete_result.get("status") != "cancelled":
+                record = {
+                    "order_id": str(rollback_oid),
+                    "status": delete_result.get("status"),
+                    "error": delete_result.get("response_error") or delete_result.get("verification_error"),
+                }
+                if delete_result.get("status") == "filled":
+                    filled.append(record)
+                else:
+                    failed.append(record)
+                    if delete_result.get("status") == "unknown":
+                        unknown.append(record)
+
+        # Never claim rollback succeeded until the exchange confirms that
+        # none of the newly-created order ids are still open or filled.
+        verify = get_open_tp_orders(symbol)
+        if verify.get("status") != "ok":
+            return {
+                "ok": False,
+                "failed_deletes": failed,
+                "verification_error": verify.get("error", "TP rollback verification failed"),
+            }
+
+        remaining_ids = {
+            str(o.get("orderId", ""))
+            for o in (verify.get("orders") or [])
+            if o.get("orderId")
+        }
+        still_open = [oid for oid in orders_to_rollback if str(oid) in remaining_ids]
+        return {
+            "ok": not failed and not filled and not still_open,
+            "failed_deletes": failed,
+            "filled_during_rollback": filled,
+            "unknown_deletes": unknown,
+            "still_open": [str(x) for x in still_open],
+        }
 
     for i, tp in enumerate(tp_levels):
         leg = tp.get("leg", f"tp{i + 1}")
@@ -871,9 +1222,14 @@ def place_take_profit_orders(
         if tp_qty <= 0:
             err = f"[{symbol}] {leg}: квантованный объём <= 0 (position_qty={position_qty})"
             log.error(err)
-            for rollback_oid in orders_to_rollback:
-                _request("DELETE", ORDER_PATH, {"symbol": bx_symbol, "orderId": rollback_oid})
-            return {"status": "error", "error": err, "failed_leg": leg}
+            rollback = _rollback_created_tp_orders()
+            return {
+                "status": "error",
+                "error": err,
+                "failed_leg": leg,
+                "rolled_back": rollback.get("ok", False),
+                "rollback": rollback,
+            }
 
         client_order_id = build_tp_client_order_id(leg, trade_id)
         params = {
@@ -890,6 +1246,19 @@ def place_take_profit_orders(
         if resp.get("code") == 0:
             order = (resp.get("data") or {}).get("order") or {}
             oid = str(order.get("orderId", ""))
+            if not oid:
+                lookup = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+                if lookup.get("status") == "found":
+                    order = lookup.get("order") or {}
+                    oid = str(order.get("orderId", ""))
+                if not oid:
+                    return {
+                        "status": "error",
+                        "error": "TP creation acknowledged but orderId is missing/unrecoverable",
+                        "state_unknown": True,
+                        "client_order_id": client_order_id,
+                        "orders": orders_created,
+                    }
             orders_created.append(
                 {
                     "leg": leg,
@@ -901,7 +1270,8 @@ def place_take_profit_orders(
                     "trade_id": trade_id,
                 }
             )
-            orders_to_rollback.append(oid)
+            if oid:
+                orders_to_rollback.append(oid)
             _log_event(
                 {
                     "event": "tp_created",
@@ -921,17 +1291,75 @@ def place_take_profit_orders(
             log.info(
                 f"[{symbol}] {leg} создан: orderId={oid} price={tp_price:.6f} qty={tp_qty}"
             )
-        else:
+        elif int(resp.get("code", 0) or 0) == -1:
+            # A transport failure after the TP POST can mean the exchange
+            # accepted/created the order but the response was lost. Reconcile
+            # the exact clientOrderId generated for THIS attempt before
+            # creating anything else or rolling back earlier legs.
+            recovery = _recover_order_after_write_failure(bx_symbol, client_order_id)
+            if recovery.get("status") == "error":
+                err = f"code={resp.get('code')} msg={resp.get('msg')} ; recovery lookup failed: {recovery.get('error')}"
+                return {
+                    "status": "error",
+                    "error": err,
+                    "state_unknown": True,
+                    "client_order_id": client_order_id,
+                    "orders": orders_created,
+                }
+            recovered = recovery.get("order") if recovery.get("status") == "found" else None
+            if recovered:
+                recovered_status = str(recovered.get("status", "")).upper()
+                if recovered_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                    recovered_oid = str(recovered.get("orderId", ""))
+                    recovered_qty = float(
+                        recovered.get("origQty")
+                        or recovered.get("quantity")
+                        or tp_qty
+                        or 0.0
+                    )
+                    recovered_price = float(
+                        recovered.get("stopPrice")
+                        or recovered.get("triggerPrice")
+                        or tp_price
+                    )
+                    recovered_record = {
+                        "leg": leg,
+                        "order_id": recovered_oid,
+                        "client_order_id": client_order_id,
+                        "price": recovered_price,
+                        "pnl_pct": pnl_pct,
+                        "qty": recovered_qty,
+                        "trade_id": trade_id,
+                        "recovered": True,
+                        "exchange_status": recovered_status,
+                    }
+                    orders_created.append(recovered_record)
+                    if recovered_oid:
+                        orders_to_rollback.append(recovered_oid)
+                    _log_event(
+                        {
+                            "event": "tp_recovered_by_client_order_id",
+                            "symbol": symbol,
+                            "bx_symbol": bx_symbol,
+                            "leg": leg,
+                            "order_id": recovered_oid,
+                            "client_order_id": client_order_id,
+                            "trade_id": trade_id,
+                            "status": recovered_status,
+                            "qty": recovered_qty,
+                            "tp_price": recovered_price,
+                        }
+                    )
+                    log.warning(
+                        f"[{symbol}] {leg} POST response lost; recovered existing order "
+                        f"orderId={recovered_oid} status={recovered_status}"
+                    )
+                    continue
             err = f"code={resp.get('code')} msg={resp.get('msg')}"
             log.error(
                 f"[{symbol}] {leg} creation failed: {err}, rolling back {len(orders_to_rollback)} orders"
             )
-            for rollback_oid in orders_to_rollback:
-                _request(
-                    "DELETE",
-                    ORDER_PATH,
-                    {"symbol": bx_symbol, "orderId": rollback_oid},
-                )
+            rollback = _rollback_created_tp_orders()
             _log_event(
                 {
                     "event": "tp_creation_failed",
@@ -944,20 +1372,29 @@ def place_take_profit_orders(
                     "tp_price": tp_price,
                     "qty": tp_qty,
                     "rolled_back_count": len(orders_to_rollback),
+                    "rollback_ok": rollback.get("ok", False),
+                    "rollback_failed_deletes": rollback.get("failed_deletes", []),
+                    "rollback_still_open": rollback.get("still_open", []),
+                    "rollback_verification_error": rollback.get("verification_error"),
                 }
             )
             return {
                 "status": "error",
                 "error": err,
                 "failed_leg": leg,
-                "rolled_back": len(orders_to_rollback),
+                "rolled_back": rollback.get("ok", False),
+                "rollback": rollback,
             }
 
     if len(orders_created) != len(missing_legs):
         err = f"создано {len(orders_created)} из {len(missing_legs)} недостающих TP"
-        for rollback_oid in orders_to_rollback:
-            _request("DELETE", ORDER_PATH, {"symbol": bx_symbol, "orderId": rollback_oid})
-        return {"status": "error", "error": err}
+        rollback = _rollback_created_tp_orders()
+        return {
+            "status": "error",
+            "error": err,
+            "rolled_back": rollback.get("ok", False),
+            "rollback": rollback,
+        }
 
     return {
         "status": "created",
@@ -969,7 +1406,7 @@ def place_take_profit_orders(
     }
 
 
-def cancel_take_profit_orders(symbol: str) -> dict:
+def cancel_take_profit_orders(symbol: str, trade_id: str = None) -> dict:
     bx_symbol = to_bx_symbol(symbol)
     result = get_open_tp_orders(symbol)
     if result.get("status") == "error":
@@ -990,6 +1427,8 @@ def cancel_take_profit_orders(symbol: str) -> dict:
         }
     total_found = len(tp_orders)
     cancelled = 0
+    filled_during_cancel = []
+    unknown_during_cancel = []
     for order in tp_orders:
         oid = order.get("orderId")
         client_oid = str(order.get("clientOrderId", ""))
@@ -1002,32 +1441,48 @@ def cancel_take_profit_orders(symbol: str) -> dict:
                 f"не имеет нашего clientOrderId — НЕ отменяем"
             )
             continue
-        resp = _request(
-            "DELETE",
-            ORDER_PATH,
-            {
-                "symbol": bx_symbol,
-                "orderId": oid,
-            },
+        if trade_id and not _tp_belongs_to_trade(parsed, trade_id):
+            continue
+
+        result = _delete_order_and_verify(
+            bx_symbol,
+            oid,
+            lambda: get_open_tp_orders(symbol),
         )
-        if resp.get("code") == 0:
+        if result.get("status") == "cancelled":
             cancelled += 1
+        elif result.get("status") == "filled":
+            filled_during_cancel.append({
+                "order_id": str(oid),
+                "executed_qty": result.get("executed_qty", 0),
+                "avg_price": result.get("avg_price"),
+            })
+        elif result.get("status") == "unknown":
+            unknown_during_cancel.append({
+                "order_id": str(oid),
+                "error": result.get("verification_error"),
+            })
             _log_event(
                 {
-                    "event": "tp_cancelled",
+                    "event": "tp_cancellation_unknown",
                     "symbol": symbol,
                     "bx_symbol": bx_symbol,
                     "order_id": str(oid),
                     "client_order_id": client_oid,
                     "leg": parsed.get("leg", "unknown"),
-                    "trade_id": parsed.get("trade_id"),
+                    "trade_id": trade_id or parsed.get("trade_id"),
                     "trade_hash": parsed.get("trade_hash"),
                     "type": order.get("type"),
+                    "cancel_response": result.get("response_status"),
+                    "verification_error": result.get("verification_error"),
                 }
             )
-            log.info(f"[{symbol}] TP {parsed.get('leg')} отменён orderId={oid}")
+            log.warning(f"[{symbol}] TP {parsed.get('leg')} cancellation UNKNOWN orderId={oid}")
         else:
-            log.warning(f"[{symbol}] отмена TP {oid} failed: {resp.get('msg')}")
+            log.warning(
+                f"[{symbol}] отмена TP {oid} не подтверждена: "
+                f"status={result.get('status')} error={result.get('response_error') or result.get('verification_error')}"
+            )
 
     verify = get_open_tp_orders(symbol)
     if verify.get("status") == "error":
@@ -1039,7 +1494,33 @@ def cancel_take_profit_orders(symbol: str) -> dict:
             "remaining_count": None,
         }
     remaining_orders = verify.get("orders", []) or []
+    if trade_id:
+        owned_remaining = []
+        for order in remaining_orders:
+            parsed = parse_tp_client_order_id(str(order.get("clientOrderId", "")))
+            if parsed and _tp_belongs_to_trade(parsed, trade_id):
+                owned_remaining.append(order)
+        remaining_orders = owned_remaining
     remaining_count = len(remaining_orders)
+    if filled_during_cancel:
+        return {
+            "status": "filled_during_cancel",
+            "cancelled_count": cancelled,
+            "total_found": total_found,
+            "remaining_count": remaining_count,
+            "filled_orders": filled_during_cancel,
+            "unknown_orders": unknown_during_cancel,
+            "error": "TP order filled during cancellation attempt",
+        }
+    if unknown_during_cancel:
+        return {
+            "status": "unknown",
+            "cancelled_count": cancelled,
+            "total_found": total_found,
+            "remaining_count": remaining_count,
+            "unknown_orders": unknown_during_cancel,
+            "error": "TP cancellation state could not be conclusively verified",
+        }
     if remaining_count == 0:
         return {
             "status": "cancelled",
@@ -1110,18 +1591,28 @@ def get_filled_sl_orders(
             continue
         if opened_ts and order_time < opened_ts * 1000:
             continue
+        executed_qty = float(o.get("executedQty", 0) or 0)
+        orig_qty = float(o.get("origQty", 0) or o.get("quantity", 0) or 0)
         filled_sl.append(
             {
                 "trade_hash": parsed.get("trade_hash"),
                 "order_id": str(o.get("orderId", "")),
                 "client_order_id": client_id,
                 "status": status,
-                "executed_qty": float(o.get("executedQty", 0) or 0),
+                "executed_qty": executed_qty,
+                "orig_qty": orig_qty,
+                "remaining_qty": max(0.0, orig_qty - executed_qty) if orig_qty > 0 else None,
+                "is_fully_filled": status == "FILLED" or (orig_qty > 0 and executed_qty >= orig_qty - 1e-12),
                 "avg_price": float(o.get("avgPrice", 0) or 0),
                 "time": order_time,
             }
         )
     return {"status": "ok", "orders": filled_sl, "count": len(filled_sl)}
+
+
+def _recover_order_after_write_failure(bx_symbol: str, client_order_id: str) -> dict:
+    """Resolve a lost POST response with explicit found/not_found/error state."""
+    return _lookup_order_by_client_order_id(bx_symbol, client_order_id)
 
 
 def place_stop_loss_order(
@@ -1130,6 +1621,7 @@ def place_stop_loss_order(
     qty: float,
     stop_loss_pct: float,
     trade_id: str = None,
+    stop_price_override: float = None,
 ) -> dict:
     bx_symbol = to_bx_symbol(symbol)
     if not avg_price or avg_price <= 0:
@@ -1160,7 +1652,15 @@ def place_stop_loss_order(
     if qty_r <= 0 or (min_qty and qty_r < min_qty):
         return {"status": "error", "error": f"qty={qty_r} < minQty={min_qty}"}
 
-    stop_price = avg_price * (1 - stop_loss_pct / 100)
+    if stop_price_override is not None:
+        try:
+            stop_price = float(stop_price_override)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": f"invalid stop_price_override={stop_price_override}"}
+        if stop_price <= 0:
+            return {"status": "error", "error": f"invalid stop_price_override={stop_price}"}
+    else:
+        stop_price = avg_price * (1 - stop_loss_pct / 100)
     client_order_id = build_sl_client_order_id(trade_id)
     params = {
         "symbol": bx_symbol,
@@ -1176,6 +1676,18 @@ def place_stop_loss_order(
     if resp.get("code") == 0:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
+        if not oid:
+            lookup = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+            if lookup.get("status") == "found":
+                order = lookup.get("order") or {}
+                oid = str(order.get("orderId", ""))
+            if not oid:
+                return {
+                    "status": "error",
+                    "error": "SL creation acknowledged but orderId is missing/unrecoverable",
+                    "state_unknown": True,
+                    "client_order_id": client_order_id,
+                }
         _log_event(
             {
                 "event": "sl_created",
@@ -1201,6 +1713,41 @@ def place_stop_loss_order(
             "qty": qty_r,
         }
 
+    if int(resp.get("code", 0) or 0) == -1:
+        recovery = _recover_order_after_write_failure(bx_symbol, client_order_id)
+        if recovery.get("status") == "error":
+            return {
+                "status": "error",
+                "error": str(recovery.get("error", "order lookup failed")),
+                "state_unknown": True,
+                "client_order_id": client_order_id,
+            }
+        recovered = recovery.get("order") if recovery.get("status") == "found" else None
+        if recovered:
+            recovered_status = str(recovered.get("status", "")).upper()
+            recovered_oid = str(recovered.get("orderId", ""))
+            if recovered_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                recovered_qty = float(recovered.get("origQty") or recovered.get("quantity") or qty_r or 0.0)
+                recovered_stop = float(recovered.get("stopPrice") or recovered.get("triggerPrice") or stop_price)
+                _log_event({
+                    "event": "sl_recovered_by_client_order_id",
+                    "symbol": symbol,
+                    "bx_symbol": bx_symbol,
+                    "order_id": recovered_oid,
+                    "client_order_id": client_order_id,
+                    "trade_id": trade_id,
+                    "status": recovered_status,
+                    "qty": recovered_qty,
+                    "stop_price": recovered_stop,
+                })
+                return {
+                    "status": "created",
+                    "order_id": recovered_oid,
+                    "client_order_id": client_order_id,
+                    "stop_price": recovered_stop,
+                    "qty": recovered_qty,
+                    "recovered": True,
+                }
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
     _log_event(
         {
@@ -1218,7 +1765,7 @@ def place_stop_loss_order(
     return {"status": "error", "error": err}
 
 
-def cancel_stop_loss_orders(symbol: str) -> dict:
+def cancel_stop_loss_orders(symbol: str, trade_id: str = None) -> dict:
     bx_symbol = to_bx_symbol(symbol)
     result = get_open_sl_orders(symbol)
     if result.get("status") == "error":
@@ -1239,6 +1786,8 @@ def cancel_stop_loss_orders(symbol: str) -> dict:
         }
     total_found = len(sl_orders)
     cancelled = 0
+    filled_during_cancel = []
+    unknown_during_cancel = []
     for order in sl_orders:
         oid = order.get("orderId")
         client_oid = str(order.get("clientOrderId", ""))
@@ -1250,27 +1799,47 @@ def cancel_stop_loss_orders(symbol: str) -> dict:
                 f"[{symbol}] SL order {oid} не имеет нашего clientOrderId — НЕ отменяем"
             )
             continue
-        resp = _request(
-            "DELETE",
-            ORDER_PATH,
-            {"symbol": bx_symbol, "orderId": oid},
+        if trade_id and not _sl_belongs_to_trade(parsed, trade_id):
+            continue
+
+        result = _delete_order_and_verify(
+            bx_symbol,
+            oid,
+            lambda: get_open_sl_orders(symbol),
         )
-        if resp.get("code") == 0:
+        if result.get("status") == "cancelled":
             cancelled += 1
+        elif result.get("status") == "filled":
+            filled_during_cancel.append({
+                "order_id": str(oid),
+                "executed_qty": result.get("executed_qty", 0),
+                "avg_price": result.get("avg_price"),
+            })
+        elif result.get("status") == "unknown":
+            unknown_during_cancel.append({
+                "order_id": str(oid),
+                "error": result.get("verification_error"),
+            })
             _log_event(
                 {
-                    "event": "sl_cancelled",
+                    "event": "sl_cancellation_unknown",
                     "symbol": symbol,
                     "bx_symbol": bx_symbol,
                     "order_id": str(oid),
                     "client_order_id": client_oid,
                     "trade_hash": parsed.get("trade_hash"),
+                    "trade_id": trade_id,
                     "type": order.get("type"),
+                    "cancel_response": result.get("response_status"),
+                    "verification_error": result.get("verification_error"),
                 }
             )
-            log.info(f"[{symbol}] SL отменён orderId={oid}")
+            log.warning(f"[{symbol}] SL cancellation UNKNOWN orderId={oid}")
         else:
-            log.warning(f"[{symbol}] отмена SL {oid} failed: {resp.get('msg')}")
+            log.warning(
+                f"[{symbol}] отмена SL {oid} не подтверждена: "
+                f"status={result.get('status')} error={result.get('response_error') or result.get('verification_error')}"
+            )
 
     verify = get_open_sl_orders(symbol)
     if verify.get("status") == "error":
@@ -1282,7 +1851,33 @@ def cancel_stop_loss_orders(symbol: str) -> dict:
             "remaining_count": None,
         }
     remaining_orders = verify.get("orders", []) or []
+    if trade_id:
+        owned_remaining = []
+        for order in remaining_orders:
+            parsed = parse_sl_client_order_id(str(order.get("clientOrderId", "")))
+            if parsed and _sl_belongs_to_trade(parsed, trade_id):
+                owned_remaining.append(order)
+        remaining_orders = owned_remaining
     remaining_count = len(remaining_orders)
+    if filled_during_cancel:
+        return {
+            "status": "filled_during_cancel",
+            "cancelled_count": cancelled,
+            "total_found": total_found,
+            "remaining_count": remaining_count,
+            "filled_orders": filled_during_cancel,
+            "unknown_orders": unknown_during_cancel,
+            "error": "SL order filled during cancellation attempt",
+        }
+    if unknown_during_cancel:
+        return {
+            "status": "unknown",
+            "cancelled_count": cancelled,
+            "total_found": total_found,
+            "remaining_count": remaining_count,
+            "unknown_orders": unknown_during_cancel,
+            "error": "SL cancellation state could not be conclusively verified",
+        }
     if remaining_count == 0:
         return {
             "status": "cancelled",
@@ -1316,12 +1911,33 @@ def update_stop_loss_order(
     if not new_stop_price or new_stop_price <= 0:
         return {"status": "error", "error": "некорректный new_stop_price"}
 
-    cancel_res = cancel_stop_loss_orders(symbol)
-    if cancel_res.get("status") in ("error", "partial_or_failed"):
-        log.warning(
-            f"[{symbol}] update_stop_loss_order: отмена старых SL вернула "
-            f"{cancel_res.get('status')}: {cancel_res.get('error')}"
+    cancel_res = cancel_stop_loss_orders(symbol, trade_id=trade_id)
+    cancel_status = cancel_res.get("status")
+    # A new SL may only be created after the previous SL cancellation is
+    # conclusively confirmed.  `unknown` and `filled_during_cancel` are not
+    # safe states: in both cases the old protection may still exist or may
+    # already have consumed part of the position.
+    if cancel_status not in ("cancelled", "no_orders"):
+        err = (
+            f"не удалось безопасно отменить старый SL перед обновлением: "
+            f"status={cancel_status} error={cancel_res.get('error')}"
         )
+        log.error(f"[{symbol}] {err}")
+        _log_event(
+            {
+                "event": "sl_update_blocked_cancel_failed",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "trade_id": trade_id,
+                "cancel_status": cancel_status,
+                "error": cancel_res.get("error"),
+            }
+        )
+        return {
+            "status": "blocked",
+            "error": err,
+            "cancel_result": cancel_res,
+        }
 
     c = _contracts().get(bx_symbol)
     if not c:
@@ -1350,6 +1966,18 @@ def update_stop_loss_order(
     if resp.get("code") == 0:
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
+        if not oid:
+            lookup = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+            if lookup.get("status") == "found":
+                order = lookup.get("order") or {}
+                oid = str(order.get("orderId", ""))
+            if not oid:
+                return {
+                    "status": "error",
+                    "error": "trailing SL creation acknowledged but orderId is missing/unrecoverable",
+                    "state_unknown": True,
+                    "client_order_id": client_order_id,
+                }
         _log_event(
             {
                 "event": "sl_trailing_updated",
@@ -1373,6 +2001,41 @@ def update_stop_loss_order(
             "qty": qty_r,
         }
 
+    if int(resp.get("code", 0) or 0) == -1:
+        recovery = _recover_order_after_write_failure(bx_symbol, client_order_id)
+        if recovery.get("status") == "error":
+            return {
+                "status": "error",
+                "error": str(recovery.get("error", "order lookup failed")),
+                "state_unknown": True,
+                "client_order_id": client_order_id,
+            }
+        recovered = recovery.get("order") if recovery.get("status") == "found" else None
+        if recovered:
+            recovered_status = str(recovered.get("status", "")).upper()
+            recovered_oid = str(recovered.get("orderId", ""))
+            if recovered_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                recovered_qty = float(recovered.get("origQty") or recovered.get("quantity") or qty_r or 0.0)
+                recovered_stop = float(recovered.get("stopPrice") or recovered.get("triggerPrice") or new_stop_price)
+                _log_event({
+                    "event": "sl_trailing_recovered_by_client_order_id",
+                    "symbol": symbol,
+                    "bx_symbol": bx_symbol,
+                    "order_id": recovered_oid,
+                    "client_order_id": client_order_id,
+                    "trade_id": trade_id,
+                    "status": recovered_status,
+                    "qty": recovered_qty,
+                    "stop_price": recovered_stop,
+                })
+                return {
+                    "status": "created",
+                    "order_id": recovered_oid,
+                    "client_order_id": client_order_id,
+                    "stop_price": recovered_stop,
+                    "qty": recovered_qty,
+                    "recovered": True,
+                }
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
     _log_event(
         {
@@ -1394,7 +2057,11 @@ def update_stop_loss_order(
 # FILL DETECTION HELPERS
 # ============================================================
 def compute_new_tp_fills(
-    symbol: str, trade_id: str, opened_ts: int, processed_fills: dict
+    symbol: str,
+    trade_id: str,
+    opened_ts: int,
+    processed_fills: dict,
+    processed_fill_meta: dict | None = None,
 ) -> dict:
     result = get_filled_tp_orders(symbol, opened_ts=opened_ts, trade_id=trade_id)
     if result.get("status") != "ok":
@@ -1427,6 +2094,33 @@ def compute_new_tp_fills(
             avg_price = float(avg_price)
         except Exception:
             avg_price = None
+
+        # BingX allOrders exposes a cumulative executedQty and cumulative
+        # avgPrice for an order. For a later partial fill, cumulative avgPrice
+        # is NOT the price of the new delta. Recover the incremental execution
+        # price from the previous cumulative quantity/average whenever both
+        # are available:
+        #   p_delta = (p_now*q_now - p_prev*q_prev) / (q_now-q_prev)
+        # This keeps TP PnL correct across multiple partial fills of one leg.
+        delta_avg_price = avg_price
+        previous_meta = (processed_fill_meta or {}).get(order_id) or {}
+        try:
+            prev_meta_qty = float(previous_meta.get("executed_qty_total", 0.0) or 0.0)
+            prev_meta_avg = float(previous_meta.get("avg_price"))
+            if (
+                avg_price is not None
+                and prev_meta_qty > 0
+                and prev_meta_avg > 0
+                and executed_qty > prev_meta_qty
+            ):
+                delta_avg_price = (
+                    avg_price * executed_qty - prev_meta_avg * prev_meta_qty
+                ) / delta_qty
+                if delta_avg_price <= 0:
+                    delta_avg_price = avg_price
+        except (TypeError, ValueError, ZeroDivisionError):
+            delta_avg_price = avg_price
+
         fills.append(
             {
                 "order_id": order_id,
@@ -1436,6 +2130,7 @@ def compute_new_tp_fills(
                 "executed_qty_delta": delta_qty,
                 "executed_qty_total": executed_qty,
                 "avg_price": avg_price,
+                "delta_avg_price": delta_avg_price,
                 "fill_time_ms": int(filled.get("time", 0) or 0),
             }
         )
@@ -1455,7 +2150,19 @@ def get_last_filled_sl(
     orders = result.get("orders", [])
     if not orders:
         return {"status": "ok", "order": None}
-    last = sorted(orders, key=lambda o: int(o.get("time", 0) or 0))[-1]
+
+    # A partially-filled STOP order only proves that part of the position was
+    # closed by the stop. It must not be treated as the cause of a fully
+    # missing position; the remaining quantity may have been closed manually
+    # or by another mechanism.
+    fully_filled = [
+        o for o in orders
+        if bool(o.get("is_fully_filled"))
+    ]
+    if not fully_filled:
+        return {"status": "ok", "order": None}
+
+    last = sorted(fully_filled, key=lambda o: int(o.get("time", 0) or 0))[-1]
     return {"status": "ok", "order": last}
 
 
@@ -1485,26 +2192,64 @@ def _set_leverage(bx_symbol: str, leverage: int) -> bool:
 
 def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
     bx_symbol = to_bx_symbol(symbol)
-    amt = _position_amt(bx_symbol)
-    if amt > 0:
-        log.warning(
-            f"[{symbol}] EXISTING LONG detected: "
-            f"qty={amt}. New entry will NOT adopt this position."
-        )
+
+    # Do not treat an API failure as "no position". Opening a new market
+    # position while the current exchange position is unknown can create an
+    # unintended duplicate/excess position.
+    pos_check = get_position(bx_symbol)
+    if pos_check.get("status") == "error":
+        err = str(pos_check.get("error", "get_position failed"))[:500]
         _log_event(
             {
-                "event": "open_skipped_existing_position",
+                "event": "open_blocked_position_check_failed",
                 "symbol": symbol,
                 "bx_symbol": bx_symbol,
-                "existing_qty": amt,
                 "trade_id": trade_id,
+                "error": err,
             }
         )
+        log.error(f"[{symbol}] OPEN blocked: cannot verify existing position: {err}")
         return {
-            "status": "foreign_position",
-            "order_id": None,
-            "qty": amt,
-            "existing_qty": amt,
+            "status": "error",
+            "error": f"cannot verify existing position: {err}",
+            "symbol": bx_symbol,
+            "trade_id": trade_id,
+        }
+
+    if pos_check.get("status") == "found":
+        try:
+            amt = float(pos_check.get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        if amt > 0:
+            log.warning(
+                f"[{symbol}] EXISTING LONG detected: "
+                f"qty={amt}. New entry will NOT adopt this position."
+            )
+            _log_event(
+                {
+                    "event": "open_skipped_existing_position",
+                    "symbol": symbol,
+                    "bx_symbol": bx_symbol,
+                    "existing_qty": amt,
+                    "trade_id": trade_id,
+                }
+            )
+            return {
+                "status": "foreign_position",
+                "order_id": None,
+                "qty": amt,
+                "existing_qty": amt,
+                "symbol": bx_symbol,
+                "trade_id": trade_id,
+            }
+
+    if pos_check.get("status") != "not_found":
+        err = f"unexpected position check status={pos_check.get('status')}"
+        log.error(f"[{symbol}] OPEN blocked: {err}")
+        return {
+            "status": "error",
+            "error": err,
             "symbol": bx_symbol,
             "trade_id": trade_id,
         }
@@ -1544,7 +2289,28 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
             ),
         }
 
-    _set_leverage(bx_symbol, leverage)
+    leverage_ok = _set_leverage(bx_symbol, leverage)
+    if not leverage_ok:
+        err = f"не удалось установить плечо {leverage}x для {bx_symbol}"
+        _log_event(
+            {
+                "event": "open_blocked_leverage_failed",
+                "symbol": symbol,
+                "bx_symbol": bx_symbol,
+                "leverage": leverage,
+                "trade_id": trade_id,
+                "error": err,
+            }
+        )
+        log.error(f"[{symbol}] OPEN blocked: {err}")
+        return {
+            "status": "error",
+            "error": err,
+            "symbol": bx_symbol,
+            "leverage": leverage,
+            "trade_id": trade_id,
+        }
+
     client_order_id = build_open_client_order_id(bx_symbol, trade_id)
     params = {
         "symbol": bx_symbol,
@@ -1565,6 +2331,49 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
 
     resp = _request("POST", ORDER_PATH, params)
     if resp.get("code") != 0:
+        # IMPORTANT: a network/transport failure after POST can mean the
+        # exchange executed the order but the response never reached us.
+        # Never replay the MARKET POST. Reconcile the stable clientOrderId
+        # first, then fall back to the existing position check in open_position().
+        if int(resp.get("code", 0) or 0) == -1:
+            recovery = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+            if recovery.get("status") == "error":
+                return {
+                    "status": "error",
+                    "error": f"open response lost and order lookup failed: {recovery.get('error')}",
+                    "state_unknown": True,
+                    "symbol": bx_symbol,
+                    "trade_id": trade_id,
+                }
+            recovered = recovery.get("order") if recovery.get("status") == "found" else None
+            if recovered:
+                oid = str(recovered.get("orderId", ""))
+                recovered_qty = float(recovered.get("executedQty") or recovered.get("origQty") or qty or 0.0)
+                recovered_status = str(recovered.get("status", "")).upper()
+                if oid and recovered_status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                    _log_event(
+                        {
+                            "event": "open_recovered_by_client_order_id",
+                            "symbol": symbol,
+                            "bx_symbol": bx_symbol,
+                            "order_id": oid,
+                            "client_order_id": client_order_id,
+                            "exchange_status": recovered_status,
+                            "qty": recovered_qty,
+                            "trade_id": trade_id,
+                        }
+                    )
+                    return {
+                        "status": "opened",
+                        "order_id": oid,
+                        "client_order_id": client_order_id,
+                        "qty": recovered_qty or qty,
+                        "symbol": bx_symbol,
+                        "leverage": leverage,
+                        "margin_usdt": MARGIN_USDT,
+                        "trade_id": trade_id,
+                        "recovered": True,
+                    }
         err_msg = str(resp.get("msg", "")).lower()
         if "positionside" in err_msg or "position side" in err_msg:
             log.error(
@@ -1600,6 +2409,27 @@ def open_long(symbol: str, price: float, trade_id: str = None) -> dict:
 
     order = (resp.get("data") or {}).get("order") or {}
     oid = str(order.get("orderId", ""))
+    if not oid:
+        lookup = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+        if lookup.get("status") == "error":
+            return {
+                "status": "error",
+                "error": f"OPEN acknowledged but orderId missing and lookup failed: {lookup.get('error')}",
+                "state_unknown": True,
+                "symbol": bx_symbol,
+                "trade_id": trade_id,
+            }
+        recovered = lookup.get("order") if lookup.get("status") == "found" else None
+        if recovered:
+            oid = str(recovered.get("orderId", ""))
+        if not oid:
+            return {
+                "status": "error",
+                "error": "OPEN acknowledged but orderId is missing/unrecoverable",
+                "state_unknown": True,
+                "symbol": bx_symbol,
+                "trade_id": trade_id,
+            }
     _log_event(
         {
             "event": "open",
@@ -1680,15 +2510,46 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
                 f"[{symbol}] open_long вернул статус {status} ({open_res.get('error')}), "
                 f"но позиция найдена на бирже (qty={pos_check.get('positionAmt')}). Безопасно подхватываем."
             )
+            confirmed_qty = float(pos_check.get("positionAmt"))
+            confirmed_avg_price = pos_check.get("avgPrice")
+            confirmed_open = dict(open_res)
+            # Exchange independently confirmed a live LONG position.
+            # Normalize the nested execution status so downstream close/TP
+            # reconciliation cannot mistake it for a failed opening.
+            confirmed_open["status"] = "opened"
+            confirmed_open["symbol"] = bx_symbol
+            confirmed_open["qty"] = confirmed_qty
+            if confirmed_avg_price is not None:
+                confirmed_open["avg_price"] = confirmed_avg_price
+
+            # A live position can become visible before the exchange exposes
+            # avgPrice. Treat that exactly like the timeout/recovery path:
+            # preserve the real position, but do not enter the `found` branch
+            # in monitor.py, because that branch immediately calculates TP/SL
+            # from avg_price. The next protection reconciliation will retry
+            # once a usable entry price is available.
+            if not pos_check.get("price_ready") or not confirmed_avg_price:
+                return {
+                    "status": "open_no_tp",
+                    "symbol": bx_symbol,
+                    "asset_class": asset_class,
+                    "open": confirmed_open,
+                    "position": pos_check,
+                    "qty_initial": confirmed_qty,
+                    "qty_remaining": confirmed_qty,
+                    "qty_initial_uncertain": False,
+                    "price_not_ready": True,
+                }
+
             return {
                 "status": "found",
                 "symbol": bx_symbol,
                 "asset_class": asset_class,
-                "open": open_res,
+                "open": confirmed_open,
                 "position": pos_check,
-                "avg_price": pos_check.get("avgPrice"),
-                "qty_initial": float(pos_check.get("positionAmt")),
-                "qty_remaining": float(pos_check.get("positionAmt")),
+                "avg_price": confirmed_avg_price,
+                "qty_initial": confirmed_qty,
+                "qty_remaining": confirmed_qty,
             }
         return {
             "status": "error",
@@ -1701,16 +2562,44 @@ def open_position(symbol: str, price: float, trade_id: str = None, fill_timeout_
         final_pos = get_position(symbol)
         if final_pos.get("status") == "found" and final_pos.get("positionAmt"):
             confirmed_qty = float(final_pos["positionAmt"])
-            log.info(f"[{symbol}] позиция подтверждена после timeout: positionAmt={confirmed_qty}")
+            confirmed_avg_price = final_pos.get("avgPrice")
+            log.info(
+                f"[{symbol}] позиция подтверждена после timeout: "
+                f"positionAmt={confirmed_qty} avgPrice={confirmed_avg_price}"
+            )
+            confirmed_open = dict(open_res)
+            confirmed_open["status"] = "opened"
+            confirmed_open["symbol"] = bx_symbol
+            confirmed_open["qty"] = confirmed_qty
+            if confirmed_avg_price is not None:
+                confirmed_open["avg_price"] = confirmed_avg_price
+
+            # If the exchange confirms a live position but its average price
+            # is not ready yet, keep the position recoverable without inventing
+            # a price for TP/SL. The next protection reconciliation will retry
+            # once the exchange exposes avgPrice.
+            if not final_pos.get("price_ready") or not confirmed_avg_price:
+                return {
+                    "status": "open_no_tp",
+                    "symbol": bx_symbol,
+                    "asset_class": asset_class,
+                    "open": confirmed_open,
+                    "position": final_pos,
+                    "qty_initial": confirmed_qty,
+                    "qty_remaining": confirmed_qty,
+                    "qty_initial_uncertain": False,
+                    "price_not_ready": True,
+                }
+
             return {
                 "status": "found",
                 "symbol": bx_symbol,
                 "asset_class": asset_class,
-                "open": open_res,
+                "open": confirmed_open,
                 "position": final_pos,
-                "avg_price": final_pos.get("avgPrice"),
-                "qty_initial": final_pos.get("positionAmt"),
-                "qty_remaining": final_pos.get("positionAmt"),
+                "avg_price": confirmed_avg_price,
+                "qty_initial": confirmed_qty,
+                "qty_remaining": confirmed_qty,
             }
         qty_opened = float(open_res.get("qty") or 0.0)
         log.warning(
@@ -1772,6 +2661,7 @@ def close_long(
     cancel_tp: bool = True,
     client_order_id: str = None,
     trade_id: str = None,
+    close_attempt: int = 0,
 ) -> dict:
     if not qty or float(qty) <= 0:
         return {
@@ -1779,8 +2669,8 @@ def close_long(
             "error": "qty <= 0",
         }
     if cancel_tp:
-        cancel_result = cancel_take_profit_orders(symbol)
-        cancel_sl_result = cancel_stop_loss_orders(symbol)
+        cancel_result = cancel_take_profit_orders(symbol, trade_id=trade_id)
+        cancel_sl_result = cancel_stop_loss_orders(symbol, trade_id=trade_id)
         cancel_status = cancel_result.get("status")
         cancel_sl_status = cancel_sl_result.get("status")
         if cancel_status not in ("cancelled", "no_orders") or cancel_sl_status not in (
@@ -1817,6 +2707,7 @@ def close_long(
         client_order_id,
         trade_id,
         is_full_close=cancel_tp,
+        close_attempt=close_attempt,
     )
 
 
@@ -1826,8 +2717,40 @@ def _close_position(
     client_order_id: str = None,
     trade_id: str = None,
     is_full_close: bool = False,
+    close_attempt: int = 0,
 ) -> dict:
-    real_amt = _position_amt(bx_symbol)
+    pos = get_position(bx_symbol)
+    if pos.get("status") == "error":
+        err = str(pos.get("error", "get_position failed"))[:500]
+        _log_event({
+            "event": "close_position_check_failed",
+            "bx_symbol": bx_symbol,
+            "qty_requested": float(qty),
+            "trade_id": trade_id,
+            "error": err,
+        })
+        return {
+            "status": "error",
+            "error": f"cannot verify position before close: {err}",
+        }
+    if pos.get("status") == "not_found":
+        return {
+            "status": "already_closed",
+            "error": f"нет LONG позиции для {bx_symbol}",
+        }
+    if pos.get("status") != "found":
+        return {
+            "status": "error",
+            "error": f"unexpected get_position status={pos.get('status')}",
+        }
+
+    try:
+        real_amt = float(pos.get("positionAmt", 0) or 0)
+    except (TypeError, ValueError):
+        return {
+            "status": "error",
+            "error": f"invalid exchange positionAmt={pos.get('positionAmt')!r}",
+        }
     if real_amt <= 0:
         return {
             "status": "already_closed",
@@ -1868,8 +2791,100 @@ def _close_position(
         "type": "MARKET",
         "quantity": _format_qty(qty, prec),
     }
+    if client_order_id is None:
+        client_order_id = build_close_client_order_id(
+            bx_symbol, trade_id, attempt=close_attempt
+        )
     if client_order_id:
         params["clientOrderId"] = client_order_id
+
+    # Never submit a second close order while a previous close with the same
+    # stable clientOrderId is still known to the exchange. This handles a
+    # restart after a lost response without duplicating a MARKET SELL.
+    if client_order_id:
+        existing_lookup = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+        if existing_lookup.get("status") == "error":
+            return {
+                "status": "close_pending",
+                "symbol": bx_symbol,
+                "client_order_id": client_order_id,
+                "recovery_check": "order_lookup_failed",
+                "error": str(existing_lookup.get("error", "order lookup failed"))[:500],
+            }
+        existing = existing_lookup.get("order") if existing_lookup.get("status") == "found" else None
+        if existing:
+            existing_status = str(existing.get("status", "")).upper()
+            existing_oid = str(existing.get("orderId", ""))
+            existing_exec_qty = float(
+                existing.get("executedQty") or existing.get("origQty") or 0.0
+            )
+            if existing_status == "FILLED":
+                remaining_check = get_position(bx_symbol)
+                if remaining_check.get("status") == "error":
+                    return {
+                        "status": "close_pending",
+                        "order_id": existing_oid,
+                        "qty": existing_exec_qty,
+                        "symbol": bx_symbol,
+                        "client_order_id": client_order_id,
+                        "recovery_check": "position_status_unknown",
+                        "error": str(remaining_check.get("error", "position check failed"))[:500],
+                    }
+                if remaining_check.get("status") == "not_found":
+                    return {
+                        "status": "closed",
+                        "order_id": existing_oid,
+                        "qty": existing_exec_qty or qty,
+                        "symbol": bx_symbol,
+                        "avg_price": float(existing.get("avgPrice") or existing.get("price") or 0.0) or None,
+                        "recovered": True,
+                    }
+                if remaining_check.get("status") == "found":
+                    try:
+                        remaining_qty = float(remaining_check.get("positionAmt", 0) or 0)
+                    except (TypeError, ValueError):
+                        remaining_qty = 0.0
+                    # A FILLED close order may have reduced the position only
+                    # partially. Its clientOrderId must never be replayed.
+                    # Wait for the caller/reconciliation to decide whether a
+                    # new close with a new id is required for the remainder.
+                    return {
+                        "status": "close_pending",
+                        "order_id": existing_oid,
+                        "qty": existing_exec_qty,
+                        "remaining_qty": remaining_qty,
+                        "symbol": bx_symbol,
+                        "client_order_id": client_order_id,
+                        "recovered": True,
+                        "recovery_check": "position_still_open_after_filled_close",
+                    }
+                return {
+                    "status": "close_pending",
+                    "order_id": existing_oid,
+                    "qty": existing_exec_qty,
+                    "symbol": bx_symbol,
+                    "client_order_id": client_order_id,
+                    "recovered": True,
+                    "recovery_check": f"unexpected_position_status:{remaining_check.get('status')}",
+                }
+            elif existing_status in {"NEW", "PARTIALLY_FILLED", "PARTIALLYFILLED"}:
+                return {
+                    "status": "close_pending",
+                    "order_id": existing_oid,
+                    "qty": existing_exec_qty,
+                    "symbol": bx_symbol,
+                    "client_order_id": client_order_id,
+                }
+            elif existing_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                return {
+                    "status": "close_retryable",
+                    "order_id": existing_oid,
+                    "qty": existing_exec_qty,
+                    "symbol": bx_symbol,
+                    "client_order_id": client_order_id,
+                    "previous_order_status": existing_status,
+                    "next_close_attempt": close_attempt + 1,
+                }
 
     resp = _request("POST", ORDER_PATH, params)
     msg = str(resp.get("msg", "")).lower()
@@ -1895,23 +2910,143 @@ def _close_position(
         order = (resp.get("data") or {}).get("order") or {}
         oid = str(order.get("orderId", ""))
         avg_p = float(order.get("avgPrice") or order.get("price") or 0.0) or None
-        _log_event(
-            {
-                "event": "close",
+
+        # A successful POST response only proves that BingX accepted the
+        # MARKET order. It does not prove that the position has already
+        # disappeared from the account. Confirm the resulting position state
+        # before marking the trade locally as closed.
+        remaining_check = get_position(bx_symbol)
+        if remaining_check.get("status") == "error":
+            _log_event({
+                "event": "close_accepted_position_unknown",
                 "bx_symbol": bx_symbol,
                 "order_id": oid,
                 "qty": qty,
                 "trade_id": trade_id,
+                "error": remaining_check.get("error"),
+            })
+            return {
+                "status": "close_pending",
+                "order_id": oid,
+                "qty": qty,
+                "symbol": bx_symbol,
+                "avg_price": avg_p,
+                "recovery_check": "position_status_unknown",
+                "error": str(remaining_check.get("error", "position check failed"))[:500],
+            }
+
+        if remaining_check.get("status") == "not_found":
+            _log_event(
+                {
+                    "event": "close",
+                    "bx_symbol": bx_symbol,
+                    "order_id": oid,
+                    "qty": qty,
+                    "trade_id": trade_id,
+                    "avg_price": avg_p,
+                }
+            )
+            return {
+                "status": "closed",
+                "order_id": oid,
+                "qty": qty,
+                "symbol": bx_symbol,
                 "avg_price": avg_p,
             }
-        )
+
+        if remaining_check.get("status") == "found":
+            try:
+                remaining_qty = float(remaining_check.get("positionAmt", 0) or 0)
+            except (TypeError, ValueError):
+                remaining_qty = 0.0
+            return {
+                "status": "close_pending",
+                "order_id": oid,
+                "qty": qty,
+                "remaining_qty": remaining_qty,
+                "symbol": bx_symbol,
+                "avg_price": avg_p,
+            }
+
         return {
-            "status": "closed",
+            "status": "close_pending",
             "order_id": oid,
             "qty": qty,
             "symbol": bx_symbol,
             "avg_price": avg_p,
+            "recovery_check": f"unexpected_position_status:{remaining_check.get('status')}",
         }
+
+    # Transport failure after MARKET SELL: the order may have executed.
+    # Reconcile by the stable clientOrderId before treating the close as failed.
+    if int(resp.get("code", 0) or 0) == -1 and client_order_id:
+        recovery = _lookup_order_by_client_order_id(bx_symbol, client_order_id)
+        if recovery.get("status") == "error":
+            return {
+                "status": "close_pending",
+                "symbol": bx_symbol,
+                "client_order_id": client_order_id,
+                "recovered": False,
+                "recovery_check": "order_lookup_failed",
+                "error": str(recovery.get("error", "order lookup failed"))[:500],
+            }
+        recovered = recovery.get("order") if recovery.get("status") == "found" else None
+        if recovered:
+            recovered_status = str(recovered.get("status", "")).upper()
+            recovered_oid = str(recovered.get("orderId", ""))
+            recovered_qty = float(
+                recovered.get("executedQty") or recovered.get("origQty") or qty or 0.0
+            )
+            if recovered_status == "FILLED":
+                remaining_check = get_position(bx_symbol)
+                if remaining_check.get("status") == "error":
+                    return {
+                        "status": "close_pending",
+                        "order_id": recovered_oid,
+                        "qty": recovered_qty,
+                        "symbol": bx_symbol,
+                        "client_order_id": client_order_id,
+                        "recovered": True,
+                        "recovery_check": "position_status_unknown",
+                        "error": str(remaining_check.get("error", "position check failed"))[:500],
+                    }
+                if remaining_check.get("status") == "not_found":
+                    _log_event({
+                        "event": "close_recovered_by_client_order_id",
+                        "bx_symbol": bx_symbol,
+                        "order_id": recovered_oid,
+                        "client_order_id": client_order_id,
+                        "qty": recovered_qty,
+                        "trade_id": trade_id,
+                    })
+                    return {
+                        "status": "closed",
+                        "order_id": recovered_oid,
+                        "qty": recovered_qty,
+                        "symbol": bx_symbol,
+                        "avg_price": float(recovered.get("avgPrice") or recovered.get("price") or 0.0) or None,
+                        "recovered": True,
+                    }
+            elif recovered_status in {"NEW", "PARTIALLY_FILLED", "PARTIALLYFILLED"}:
+                return {
+                    "status": "close_pending",
+                    "order_id": recovered_oid,
+                    "qty": recovered_qty,
+                    "symbol": bx_symbol,
+                    "client_order_id": client_order_id,
+                    "recovered": True,
+                }
+            elif recovered_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                return {
+                    "status": "close_retryable",
+                    "order_id": recovered_oid,
+                    "qty": recovered_qty,
+                    "symbol": bx_symbol,
+                    "client_order_id": client_order_id,
+                    "recovered": True,
+                    "previous_order_status": recovered_status,
+                    "next_close_attempt": close_attempt + 1,
+                }
 
     err = f"code={resp.get('code')} msg={resp.get('msg')}"
     _log_event(
